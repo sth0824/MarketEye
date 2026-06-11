@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MarketEye — 기업 비교 대시보드</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #21262d;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --green: #3fb950;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --yellow: #d29922;
+    --purple: #bc8cff;
+    --accent: #1f6feb;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
+
+  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 24px; height: 56px; display: flex; align-items: center; gap: 16px; position: sticky; top: 0; z-index: 100; }
+  header h1 { font-size: 18px; font-weight: 700; color: var(--blue); letter-spacing: -0.5px; }
+  header h1 span { color: var(--text); }
+
+  #search-bar { display: flex; gap: 8px; flex: 1; max-width: 600px; margin-left: auto; }
+  #ticker-input { background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-size: 14px; width: 100%; outline: none; transition: border-color .2s; }
+  #ticker-input:focus { border-color: var(--accent); }
+  #ticker-input::placeholder { color: var(--muted); }
+  button { background: var(--accent); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; transition: opacity .2s; white-space: nowrap; }
+  button:hover { opacity: .85; }
+  button.secondary { background: var(--surface2); border: 1px solid var(--border); color: var(--text); font-weight: 400; }
+  button.danger { background: #da3633; }
+
+  #suggestions { position: absolute; top: 100%; left: 0; right: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; z-index: 200; display: none; }
+  #suggestions div { padding: 8px 12px; cursor: pointer; color: var(--muted); font-size: 12px; }
+  #suggestions div:hover { background: var(--surface2); color: var(--text); }
+
+  main { padding: 20px 24px; }
+
+  #loading-bar { height: 3px; background: var(--accent); width: 0%; transition: width .3s; position: fixed; top: 56px; left: 0; z-index: 99; }
+
+  /* 탭 */
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 0; }
+  .tab-btn { background: none; border: none; color: var(--muted); padding: 8px 16px; cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent; margin-bottom: -1px; border-radius: 0; font-weight: 500; }
+  .tab-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
+  .tab-btn:hover { color: var(--text); }
+
+  /* 카드 그리드 */
+  #cards-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .stock-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; position: relative; transition: border-color .2s; }
+  .stock-card:hover { border-color: var(--accent); }
+  .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
+  .card-ticker { font-size: 20px; font-weight: 700; color: var(--blue); }
+  .card-name { font-size: 11px; color: var(--muted); margin-top: 2px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card-price { text-align: right; }
+  .card-price-val { font-size: 22px; font-weight: 700; }
+  .card-change { font-size: 12px; margin-top: 2px; }
+  .up { color: var(--green); }
+  .down { color: var(--red); }
+  .card-remove { position: absolute; top: 10px; right: 10px; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 16px; padding: 2px 6px; border-radius: 4px; }
+  .card-remove:hover { background: var(--surface2); color: var(--red); }
+  .card-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .metric { background: var(--surface2); border-radius: 6px; padding: 8px; }
+  .metric-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .metric-val { font-size: 14px; font-weight: 600; margin-top: 2px; }
+  .mini-chart { height: 50px; margin: 10px 0; }
+
+  /* 비교 테이블 */
+  #compare-section { overflow-x: auto; }
+  .compare-table { width: 100%; border-collapse: collapse; min-width: 600px; }
+  .compare-table th, .compare-table td { padding: 10px 14px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  .compare-table th { background: var(--surface); color: var(--muted); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; position: sticky; top: 0; }
+  .compare-table td:first-child, .compare-table th:first-child { text-align: left; color: var(--muted); font-size: 12px; position: sticky; left: 0; background: var(--bg); min-width: 160px; }
+  .compare-table tr:hover td { background: var(--surface2); }
+  .compare-table tr:hover td:first-child { background: var(--surface2); }
+  .compare-table .best { color: var(--green); font-weight: 700; }
+  .compare-table .worst { color: var(--red); }
+  .ticker-head { color: var(--blue) !important; font-size: 14px !important; font-weight: 700 !important; text-transform: none !important; }
+  .section-header { font-size: 11px; font-weight: 700; color: var(--purple); text-transform: uppercase; letter-spacing: 1px; padding: 14px 14px 4px !important; border-bottom: none !important; background: var(--bg) !important; }
+  .section-header td { border-bottom: none !important; padding: 14px 14px 4px !important; }
+
+  /* 차트 비교 */
+  #charts-section { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+  .chart-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .chart-card h3 { font-size: 13px; color: var(--muted); margin-bottom: 12px; }
+  canvas { width: 100% !important; }
+
+  /* 빈 상태 */
+  #empty-state { text-align: center; padding: 80px 20px; color: var(--muted); }
+  #empty-state h2 { font-size: 24px; margin-bottom: 8px; color: var(--text); }
+  #empty-state p { font-size: 14px; margin-bottom: 24px; }
+  .ticker-chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+  .ticker-chip { background: var(--surface2); border: 1px solid var(--border); color: var(--blue); padding: 6px 14px; border-radius: 20px; cursor: pointer; font-size: 13px; transition: all .2s; }
+  .ticker-chip:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+  #error-toast { position: fixed; bottom: 24px; right: 24px; background: #da3633; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; z-index: 999; display: none; max-width: 300px; }
+
+  .loading-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; min-height: 200px; display: flex; align-items: center; justify-content: center; color: var(--muted); }
+  .spinner { width: 24px; height: 24px; border: 3px solid var(--border); border-top-color: var(--blue); border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 10px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Market<span>Eye</span></h1>
+  <div id="search-bar" style="position:relative">
+    <input id="ticker-input" type="text" placeholder="티커 입력 (예: AAPL, TSLA, 005930.KS)" autocomplete="off">
+    <button onclick="addTicker()">추가</button>
+    <button class="secondary" onclick="clearAll()">전체 삭제</button>
+    <div id="suggestions"></div>
+  </div>
+</header>
+
+<div id="loading-bar"></div>
+
+<main>
+  <div class="tabs">
+    <button class="tab-btn active" onclick="switchTab('overview')">개요</button>
+    <button class="tab-btn" onclick="switchTab('compare')">비교 테이블</button>
+    <button class="tab-btn" onclick="switchTab('charts')">차트</button>
+  </div>
+
+  <div id="tab-overview">
+    <div id="empty-state">
+      <h2>기업을 추가해보세요</h2>
+      <p>티커를 입력하거나 아래 예시 기업을 클릭해 시작하세요</p>
+      <div class="ticker-chips">
+        <span class="ticker-chip" onclick="quickAdd('AAPL')">AAPL · 애플</span>
+        <span class="ticker-chip" onclick="quickAdd('MSFT')">MSFT · 마이크로소프트</span>
+        <span class="ticker-chip" onclick="quickAdd('GOOGL')">GOOGL · 알파벳</span>
+        <span class="ticker-chip" onclick="quickAdd('AMZN')">AMZN · 아마존</span>
+        <span class="ticker-chip" onclick="quickAdd('NVDA')">NVDA · 엔비디아</span>
+        <span class="ticker-chip" onclick="quickAdd('TSLA')">TSLA · 테슬라</span>
+        <span class="ticker-chip" onclick="quickAdd('META')">META · 메타</span>
+        <span class="ticker-chip" onclick="quickAdd('005930.KS')">005930.KS · 삼성전자</span>
+        <span class="ticker-chip" onclick="quickAdd('000660.KS')">000660.KS · SK하이닉스</span>
+        <span class="ticker-chip" onclick="quickAdd('035420.KS')">035420.KS · NAVER</span>
+      </div>
+    </div>
+    <div id="cards-container"></div>
+  </div>
+
+  <div id="tab-compare" style="display:none">
+    <div id="compare-section"><p style="color:var(--muted);padding:20px">기업을 2개 이상 추가하면 비교 테이블이 표시됩니다.</p></div>
+  </div>
+
+  <div id="tab-charts" style="display:none">
+    <div id="charts-section"></div>
+  </div>
+</main>
+
+<div id="error-toast"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script>
+const API = 'http://localhost:5001/api';
+let stocks = {}; // ticker -> data
+let activeTab = 'overview';
+
+const POPULAR = ['AAPL','MSFT','GOOGL','AMZN','NVDA','TSLA','META','NFLX','ORCL','AMD',
+  '005930.KS','000660.KS','035420.KS','035720.KS','068270.KS','207940.KS'];
+
+// ---- 티커 추가 ----
+async function addTicker(ticker) {
+  ticker = (ticker || document.getElementById('ticker-input').value.trim()).toUpperCase();
+  if (!ticker) return;
+  if (stocks[ticker] !== undefined) { showError(`${ticker}은 이미 추가되어 있습니다`); return; }
+  document.getElementById('ticker-input').value = '';
+  document.getElementById('empty-state').style.display = 'none';
+
+  // 로딩 카드
+  stocks[ticker] = null;
+  renderLoadingCard(ticker);
+  setLoadingBar(30);
+
+  try {
+    const res = await fetch(`${API}/stock/${ticker}`);
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error || '데이터 로드 실패');
+    stocks[ticker] = json.data;
+    setLoadingBar(100);
+    renderAll();
+  } catch(e) {
+    delete stocks[ticker];
+    showError(`${ticker}: ${e.message}`);
+    setLoadingBar(0);
+    renderAll();
+    if (Object.keys(stocks).length === 0) document.getElementById('empty-state').style.display = '';
+  }
+}
+
+function quickAdd(t) { addTicker(t); }
+
+function removeTicker(ticker) {
+  delete stocks[ticker];
+  renderAll();
+  if (Object.keys(stocks).length === 0) document.getElementById('empty-state').style.display = '';
+}
+
+function clearAll() {
+  stocks = {};
+  renderAll();
+  document.getElementById('empty-state').style.display = '';
+}
+
+// ---- 렌더 ----
+function renderAll() {
+  if (activeTab === 'overview') renderCards();
+  else if (activeTab === 'compare') renderCompareTable();
+  else renderCharts();
+}
+
+function renderLoadingCard(ticker) {
+  const c = document.getElementById('cards-container');
+  let el = document.getElementById(`card-${ticker}`);
+  if (!el) {
+    el = document.createElement('div');
+    el.id = `card-${ticker}`;
+    el.className = 'loading-card';
+    c.appendChild(el);
+  }
+  el.innerHTML = `<div class="spinner"></div><span>${ticker} 로딩 중...</span>`;
+}
+
+function renderCards() {
+  const c = document.getElementById('cards-container');
+  c.innerHTML = '';
+  Object.entries(stocks).forEach(([ticker, d]) => {
+    if (!d) { renderLoadingCard(ticker); return; }
+    const card = document.createElement('div');
+    card.className = 'stock-card';
+    card.id = `card-${ticker}`;
+    const chg = d.changePercent;
+    const chgCls = chg >= 0 ? 'up' : 'down';
+    const chgSign = chg >= 0 ? '+' : '';
+    card.innerHTML = `
+      <button class="card-remove" onclick="removeTicker('${ticker}')">✕</button>
+      <div class="card-header">
+        <div>
+          <div class="card-ticker">${ticker}</div>
+          <div class="card-name">${d.name}</div>
+          <div style="font-size:10px;color:var(--muted);margin-top:2px">${d.sector}</div>
+        </div>
+        <div class="card-price">
+          <div class="card-price-val ${chgCls}">${fmt(d.price, d.currency)}</div>
+          <div class="card-change ${chgCls}">${chgSign}${pct(chg)}</div>
+        </div>
+      </div>
+      <div class="mini-chart"><canvas id="mini-${ticker}"></canvas></div>
+      <div class="card-metrics">
+        ${metricBlock('PER', d.per, 'x')}
+        ${metricBlock('PBR', d.pbr, 'x')}
+        ${metricBlock('ROE', d.roe, '%', 100)}
+        ${metricBlock('ROA', d.roa, '%', 100)}
+        ${metricBlock('순이익률', d.netMargin, '%', 100)}
+        ${metricBlock('영업이익률', d.operatingMargin, '%', 100)}
+        ${metricBlock('부채비율', d.debtToEquity)}
+        ${metricBlock('배당수익률', d.dividendYield, '%', 100)}
+      </div>
+      <div style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:11px;color:var(--muted)">
+        <span>시총 ${bigNum(d.marketCap)}</span>
+        <span>매출 ${bigNum(d.revenue)}</span>
+        <span>EPS ${d.eps != null ? d.eps.toFixed(2) : '-'}</span>
+        <span>Beta ${d.beta != null ? d.beta.toFixed(2) : '-'}</span>
+      </div>
+      ${d.targetPrice ? `<div style="margin-top:10px;font-size:11px;color:var(--muted)">목표주가 <span style="color:var(--yellow)">${fmt(d.targetPrice, d.currency)}</span> | 의견 <span style="color:var(--yellow)">${d.recommendation}</span></div>` : ''}
+    `;
+    c.appendChild(card);
+    drawMiniChart(ticker, d.history);
+  });
+}
+
+function metricBlock(label, val, unit='', mult=1) {
+  const display = val != null ? `${(val*mult).toFixed(unit==='%'?1:2)}${unit}` : '-';
+  return `<div class="metric"><div class="metric-label">${label}</div><div class="metric-val">${display}</div></div>`;
+}
+
+function drawMiniChart(ticker, history) {
+  if (!history || !history.length) return;
+  setTimeout(() => {
+    const canvas = document.getElementById(`mini-${ticker}`);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const prices = history.map(h => h.close);
+    const labels = history.map(h => h.date);
+    const startPrice = prices[0];
+    const endPrice = prices[prices.length-1];
+    const color = endPrice >= startPrice ? '#3fb950' : '#f85149';
+    new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{ data: prices, borderColor: color, borderWidth: 1.5, pointRadius: 0, fill: true,
+          backgroundColor: ctx => {
+            const g = ctx.chart.ctx.createLinearGradient(0,0,0,50);
+            g.addColorStop(0, color+'44'); g.addColorStop(1, color+'00'); return g;
+          }
+        }]
+      },
+      options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false},tooltip:{enabled:false}}, scales:{x:{display:false},y:{display:false}}, animation:{duration:400} }
+    });
+  }, 50);
+}
+
+// ---- 비교 테이블 ----
+const METRIC_GROUPS = [
+  { label: '가격 정보', rows: [
+    { key: 'price', label: '현재가', fmt: (v,d) => fmt(v, d.currency), higherBetter: null },
+    { key: 'changePercent', label: '등락률', fmt: v => v!=null?`${v>=0?'+':''}${(v).toFixed(2)}%`:'-', higherBetter: true },
+    { key: 'marketCap', label: '시가총액', fmt: v => bigNum(v), higherBetter: null },
+    { key: 'beta', label: 'Beta', fmt: v => v!=null?v.toFixed(2):'-', higherBetter: null },
+  ]},
+  { label: '밸류에이션', rows: [
+    { key: 'per', label: 'PER (TTM)', fmt: v => v!=null?v.toFixed(1)+'x':'-', higherBetter: false },
+    { key: 'forwardPer', label: 'Forward PER', fmt: v => v!=null?v.toFixed(1)+'x':'-', higherBetter: false },
+    { key: 'pbr', label: 'PBR', fmt: v => v!=null?v.toFixed(2)+'x':'-', higherBetter: false },
+    { key: 'psr', label: 'PSR', fmt: v => v!=null?v.toFixed(2)+'x':'-', higherBetter: false },
+    { key: 'evEbitda', label: 'EV/EBITDA', fmt: v => v!=null?v.toFixed(1)+'x':'-', higherBetter: false },
+    { key: 'eps', label: 'EPS', fmt: v => v!=null?v.toFixed(2):'-', higherBetter: true },
+  ]},
+  { label: '수익성', rows: [
+    { key: 'roe', label: 'ROE', fmt: v => pct100(v), higherBetter: true },
+    { key: 'roa', label: 'ROA', fmt: v => pct100(v), higherBetter: true },
+    { key: 'grossMargin', label: '매출총이익률', fmt: v => pct100(v), higherBetter: true },
+    { key: 'operatingMargin', label: '영업이익률', fmt: v => pct100(v), higherBetter: true },
+    { key: 'netMargin', label: '순이익률', fmt: v => pct100(v), higherBetter: true },
+    { key: 'ebitdaMargin', label: 'EBITDA 마진', fmt: v => pct100(v), higherBetter: true },
+  ]},
+  { label: '성장성', rows: [
+    { key: 'revenueGrowth', label: '매출 성장률 (YoY)', fmt: v => pct100(v), higherBetter: true },
+    { key: 'earningsGrowth', label: '이익 성장률 (YoY)', fmt: v => pct100(v), higherBetter: true },
+    { key: 'earningsQuarterlyGrowth', label: '분기 이익 성장률', fmt: v => pct100(v), higherBetter: true },
+  ]},
+  { label: '재무 건전성', rows: [
+    { key: 'debtToEquity', label: '부채/자기자본', fmt: v => v!=null?v.toFixed(1):'-', higherBetter: false },
+    { key: 'currentRatio', label: '유동비율', fmt: v => v!=null?v.toFixed(2):'-', higherBetter: true },
+    { key: 'quickRatio', label: '당좌비율', fmt: v => v!=null?v.toFixed(2):'-', higherBetter: true },
+    { key: 'totalCash', label: '현금', fmt: v => bigNum(v), higherBetter: null },
+    { key: 'totalDebt', label: '총부채', fmt: v => bigNum(v), higherBetter: null },
+    { key: 'freeCashflow', label: 'Free Cash Flow', fmt: v => bigNum(v), higherBetter: true },
+  ]},
+  { label: '배당', rows: [
+    { key: 'dividendYield', label: '배당수익률', fmt: v => pct100(v), higherBetter: true },
+    { key: 'dividendRate', label: '주당배당금', fmt: (v,d) => v!=null?`${d.currency} ${v.toFixed(2)}`:'-', higherBetter: null },
+    { key: 'payoutRatio', label: '배당성향', fmt: v => pct100(v), higherBetter: null },
+  ]},
+  { label: '애널리스트', rows: [
+    { key: 'targetPrice', label: '목표주가', fmt: (v,d) => fmt(v, d.currency), higherBetter: null },
+    { key: 'recommendation', label: '투자의견', fmt: v => v||'-', higherBetter: null },
+    { key: 'numberOfAnalysts', label: '커버리지 수', fmt: v => v!=null?v:'-', higherBetter: null },
+  ]},
+];
+
+function renderCompareTable() {
+  const tickers = Object.keys(stocks).filter(t => stocks[t]);
+  const section = document.getElementById('compare-section');
+  if (tickers.length < 1) { section.innerHTML = '<p style="color:var(--muted);padding:20px">기업을 1개 이상 추가하면 비교 테이블이 표시됩니다.</p>'; return; }
+
+  let html = `<table class="compare-table"><thead><tr><th>지표</th>`;
+  tickers.forEach(t => html += `<th class="ticker-head">${t}</th>`);
+  html += `</tr></thead><tbody>`;
+
+  METRIC_GROUPS.forEach(group => {
+    html += `<tr><td class="section-header" colspan="${tickers.length+1}">${group.label}</td></tr>`;
+    group.rows.forEach(row => {
+      const vals = tickers.map(t => stocks[t][row.key]);
+      const numVals = vals.map(v => typeof v === 'number' ? v : null);
+      const defined = numVals.filter(v => v !== null);
+      let bestIdx = -1, worstIdx = -1;
+      if (row.higherBetter !== null && defined.length > 1) {
+        const best = row.higherBetter ? Math.max(...defined) : Math.min(...defined);
+        const worst = row.higherBetter ? Math.min(...defined) : Math.max(...defined);
+        bestIdx = numVals.indexOf(best);
+        worstIdx = numVals.indexOf(worst);
+      }
+      html += `<tr><td>${row.label}</td>`;
+      tickers.forEach((t, i) => {
+        const d = stocks[t];
+        const display = row.fmt(d[row.key], d);
+        const cls = i === bestIdx ? 'best' : (i === worstIdx ? 'worst' : '');
+        html += `<td class="${cls}">${display}</td>`;
+      });
+      html += `</tr>`;
+    });
+  });
+
+  html += `</tbody></table>`;
+  section.innerHTML = html;
+}
+
+// ---- 차트 ----
+let barCharts = {};
+
+function renderCharts() {
+  const tickers = Object.keys(stocks).filter(t => stocks[t]);
+  const section = document.getElementById('charts-section');
+  section.innerHTML = '';
+  if (!tickers.length) { section.innerHTML = '<p style="color:var(--muted)">기업을 추가하면 차트가 표시됩니다.</p>'; return; }
+
+  const BAR_METRICS = [
+    { title: 'PER (배수)', key: 'per', unit: 'x' },
+    { title: 'PBR (배수)', key: 'pbr', unit: 'x' },
+    { title: 'ROE (%)', key: 'roe', mult: 100, unit: '%' },
+    { title: 'ROA (%)', key: 'roa', mult: 100, unit: '%' },
+    { title: '순이익률 (%)', key: 'netMargin', mult: 100, unit: '%' },
+    { title: '영업이익률 (%)', key: 'operatingMargin', mult: 100, unit: '%' },
+    { title: '매출 성장률 YoY (%)', key: 'revenueGrowth', mult: 100, unit: '%' },
+    { title: '부채/자기자본', key: 'debtToEquity', unit: '' },
+  ];
+
+  const COLORS = ['#58a6ff','#3fb950','#d29922','#bc8cff','#f85149','#79c0ff','#56d364','#e3b341'];
+
+  BAR_METRICS.forEach((m, idx) => {
+    const card = document.createElement('div');
+    card.className = 'chart-card';
+    const canvasId = `chart-${m.key}`;
+    card.innerHTML = `<h3>${m.title}</h3><canvas id="${canvasId}" height="200"></canvas>`;
+    section.appendChild(card);
+
+    setTimeout(() => {
+      const canvas = document.getElementById(canvasId);
+      if (!canvas) return;
+      const labels = tickers;
+      const data = tickers.map(t => {
+        const v = stocks[t][m.key];
+        return v != null ? +(v * (m.mult||1)).toFixed(2) : null;
+      });
+      new Chart(canvas.getContext('2d'), {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [{
+            data,
+            backgroundColor: tickers.map((_,i) => COLORS[i % COLORS.length] + 'cc'),
+            borderColor: tickers.map((_,i) => COLORS[i % COLORS.length]),
+            borderWidth: 1.5,
+            borderRadius: 4,
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => `${ctx.parsed.y}${m.unit}` } } },
+          scales: {
+            x: { ticks: { color: '#8b949e' }, grid: { color: '#30363d' } },
+            y: { ticks: { color: '#8b949e' }, grid: { color: '#30363d' } }
+          }
+        }
+      });
+    }, 50);
+  });
+
+  // 가격 추이 라인 차트
+  const lineCard = document.createElement('div');
+  lineCard.className = 'chart-card';
+  lineCard.style.gridColumn = '1 / -1';
+  lineCard.innerHTML = `<h3>주가 추이 (최근 1년, 정규화 기준 100)</h3><canvas id="chart-history" height="100"></canvas>`;
+  section.appendChild(lineCard);
+
+  setTimeout(() => {
+    const canvas = document.getElementById('chart-history');
+    if (!canvas) return;
+    const allDates = [...new Set(tickers.flatMap(t => (stocks[t].history||[]).map(h=>h.date)))].sort();
+    const datasets = tickers.map((t, i) => {
+      const hist = stocks[t].history || [];
+      const priceMap = Object.fromEntries(hist.map(h => [h.date, h.close]));
+      const base = hist.length ? hist[0].close : 1;
+      return {
+        label: t,
+        data: allDates.map(d => priceMap[d] != null ? +((priceMap[d]/base)*100).toFixed(2) : null),
+        borderColor: COLORS[i % COLORS.length],
+        backgroundColor: 'transparent',
+        borderWidth: 2,
+        pointRadius: 0,
+        spanGaps: true,
+      };
+    });
+    new Chart(canvas.getContext('2d'), {
+      type: 'line',
+      data: { labels: allDates, datasets },
+      options: {
+        responsive: true,
+        plugins: { legend: { labels: { color: '#e6edf3' } } },
+        scales: {
+          x: { ticks: { color: '#8b949e', maxRotation: 0 }, grid: { color: '#30363d' } },
+          y: { ticks: { color: '#8b949e', callback: v => v+'%' }, grid: { color: '#30363d' } }
+        }
+      }
+    });
+  }, 100);
+}
+
+// ---- 탭 전환 ----
+function switchTab(tab) {
+  activeTab = tab;
+  ['overview','compare','charts'].forEach(t => {
+    document.getElementById(`tab-${t}`).style.display = t === tab ? '' : 'none';
+    document.querySelectorAll('.tab-btn').forEach((btn, i) => {
+      btn.classList.toggle('active', ['overview','compare','charts'][i] === tab);
+    });
+  });
+  renderAll();
+}
+
+// ---- 유틸 ----
+function fmt(v, currency='USD') {
+  if (v == null) return '-';
+  return new Intl.NumberFormat('ko-KR', { style:'currency', currency: currency||'USD', maximumFractionDigits: 2 }).format(v);
+}
+function pct(v) { return v != null ? `${v.toFixed(2)}%` : '-'; }
+function pct100(v) { return v != null ? `${(v*100).toFixed(2)}%` : '-'; }
+function bigNum(v) {
+  if (v == null) return '-';
+  if (Math.abs(v) >= 1e12) return (v/1e12).toFixed(2)+'T';
+  if (Math.abs(v) >= 1e9) return (v/1e9).toFixed(2)+'B';
+  if (Math.abs(v) >= 1e6) return (v/1e6).toFixed(2)+'M';
+  return v.toFixed(0);
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-toast');
+  el.textContent = msg;
+  el.style.display = 'block';
+  setTimeout(() => el.style.display = 'none', 4000);
+}
+
+function setLoadingBar(pct) {
+  const bar = document.getElementById('loading-bar');
+  bar.style.width = pct + '%';
+  if (pct >= 100) setTimeout(() => bar.style.width = '0%', 500);
+}
+
+// 자동완성
+const input = document.getElementById('ticker-input');
+input.addEventListener('keydown', e => { if (e.key === 'Enter') addTicker(); });
+input.addEventListener('input', () => {
+  const v = input.value.toUpperCase();
+  const sug = document.getElementById('suggestions');
+  if (!v) { sug.style.display = 'none'; return; }
+  const matches = POPULAR.filter(t => t.startsWith(v) && !stocks[t]).slice(0,5);
+  if (!matches.length) { sug.style.display = 'none'; return; }
+  sug.innerHTML = matches.map(t => `<div onclick="quickAdd('${t}');document.getElementById('suggestions').style.display='none'">${t}</div>`).join('');
+  sug.style.display = 'block';
+});
+document.addEventListener('click', e => { if (!e.target.closest('#search-bar')) document.getElementById('suggestions').style.display='none'; });
+</script>
+</body>
+</html>
