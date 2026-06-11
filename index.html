@@ -171,7 +171,9 @@ const POPULAR = ['AAPL','MSFT','GOOGL','AMZN','NVDA','TSLA','META','NFLX','ORCL'
 
 // ---- 티커 추가 ----
 async function addTicker(ticker) {
-  ticker = (ticker || document.getElementById('ticker-input').value.trim()).toUpperCase();
+  let raw = (ticker || document.getElementById('ticker-input').value.trim()).trim();
+  // 순수 숫자면 한국 종목코드 → .KS 붙이기
+  ticker = /^\d{5,6}$/.test(raw) ? raw + '.KS' : raw.toUpperCase();
   if (!ticker) return;
   if (stocks[ticker] !== undefined) { showError(`${ticker}은 이미 추가되어 있습니다`); return; }
   document.getElementById('ticker-input').value = '';
@@ -544,34 +546,12 @@ const sug = document.getElementById('suggestions');
 let searchTimer = null;
 let selectedIdx = -1;
 
-// 한국어 → 영어 검색어 매핑 (야후가 한국어 직접 검색을 잘 못 받는 경우 대비)
-const KO_MAP = {
-  '삼성전자': 'samsung electronics', '삼성': 'samsung electronics',
-  '하이닉스': 'sk hynix', 'sk하이닉스': 'sk hynix', '에스케이하이닉스': 'sk hynix',
-  '네이버': 'naver', '카카오': 'kakao', '카카오뱅크': 'kakaobank',
-  'lg전자': 'lg electronics', '엘지전자': 'lg electronics',
-  'lg화학': 'lg chem', '엘지화학': 'lg chem',
-  '현대차': 'hyundai motor', '현대자동차': 'hyundai motor',
-  '기아': 'kia', '기아차': 'kia',
-  '셀트리온': 'celltrion', '삼성바이오': 'samsung biologics',
-  '포스코': 'posco', '롯데': 'lotte', 'sk이노베이션': 'sk innovation',
-  '카카오페이': 'kakaopay', '토스': 'viva republica',
-  '애플': 'apple', '구글': 'google', '알파벳': 'alphabet',
-  '아마존': 'amazon', '테슬라': 'tesla', '엔비디아': 'nvidia',
-  '메타': 'meta', '넷플릭스': 'netflix', '마이크로소프트': 'microsoft',
-};
-
-function resolveQuery(v) {
-  const lower = v.trim().toLowerCase();
-  return KO_MAP[lower] || v;
-}
-
 async function fetchSuggestions(raw) {
-  const query = resolveQuery(raw);
-  if (!query) { hideSug(); return; }
+  // 검색어 그대로 서버에 전달 — KRX 로컬 DB로 한국어 검색, 영문은 야후 파이낸스
+  let results = [];
   try {
-    const res = await fetch(`${API}/search?q=${encodeURIComponent(query)}`);
-    const results = await res.json();
+    const res = await fetch(`${API}/search?q=${encodeURIComponent(raw.trim())}`);
+    results = await res.json();
     if (!results.length) { hideSug(); return; }
     selectedIdx = -1;
     sug.innerHTML = results.map((r, i) => {

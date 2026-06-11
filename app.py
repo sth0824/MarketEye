@@ -3,9 +3,99 @@ from flask_cors import CORS
 import yfinance as yf
 import requests
 import traceback
+import json
+import io
+import unicodedata
 
 app = Flask(__name__)
 CORS(app)
+
+# ── KRX 전체 상장 종목 캐시 ──────────────────────────────
+_krx_stocks = []   # [{'code': '005930', 'ticker': '005930.KS', 'name': '삼성전자', 'market': 'KOSPI'}]
+
+def _load_krx():
+    """KRX 상장 종목 전체를 가져와 캐싱 (KOSPI + KOSDAQ 통합)"""
+    global _krx_stocks
+    try:
+        from html.parser import HTMLParser
+        url = 'https://kind.krx.co.kr/corpgeneral/corpList.do'
+        params = {'method': 'download', 'searchType': '13'}
+        headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://kind.krx.co.kr/'}
+        res = requests.get(url, params=params, headers=headers, timeout=15)
+        res.encoding = 'euc-kr'
+
+        class TblParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.in_cell = False
+                self.rows, self.cur, self.cell = [], [], ''
+            def handle_starttag(self, tag, attrs):
+                if tag == 'tr': self.cur = []
+                elif tag in ('td', 'th'): self.in_cell = True; self.cell = ''
+            def handle_endtag(self, tag):
+                if tag in ('td', 'th'):
+                    self.in_cell = False
+                    self.cur.append(self.cell.strip())
+                elif tag == 'tr':
+                    if self.cur: self.rows.append(self.cur)
+            def handle_data(self, data):
+                if self.in_cell: self.cell += data.strip()
+
+        p = TblParser()
+        p.feed(res.text)
+        rows = p.rows
+        if not rows:
+            print('KRX: no rows parsed')
+            return
+
+        header = rows[0]
+        code_idx = next((i for i,h in enumerate(header) if '종목코드' in h), None)
+        name_idx = next((i for i,h in enumerate(header) if '회사명' in h), None)
+        mkt_idx  = next((i for i,h in enumerate(header) if '시장구분' in h), None)
+
+        if code_idx is None or name_idx is None:
+            print('KRX: header parse failed', header)
+            return
+
+        results = []
+        for row in rows[1:]:
+            if len(row) <= max(code_idx, name_idx): continue
+            code = row[code_idx].strip().zfill(6)
+            name = row[name_idx].strip()
+            mkt_raw = row[mkt_idx].strip() if mkt_idx is not None else ''
+            if not code or not name or len(code) > 7: continue
+            # 코스닥이면 .KQ, 나머지(코스피 등)는 .KS
+            suffix = 'KQ' if '코스닥' in mkt_raw else 'KS'
+            market = 'KOSDAQ' if suffix == 'KQ' else 'KOSPI'
+            results.append({'code': code, 'ticker': f'{code}.{suffix}', 'name': name, 'market': market})
+
+        _krx_stocks = results
+        print(f'KRX stocks loaded: {len(_krx_stocks)}')
+    except Exception as e:
+        print('KRX load error:', e)
+        traceback.print_exc()
+
+def _normalize(s):
+    """검색용 정규화: 소문자 + 공백/특수문자 제거"""
+    return unicodedata.normalize('NFC', s).lower().replace(' ', '').replace('(', '').replace(')', '').replace(',', '')
+
+def _search_krx(query, limit=10):
+    q = _normalize(query)
+    exact, starts, contains = [], [], []
+    for s in _krx_stocks:
+        n = _normalize(s['name'])
+        c = s['code']
+        if n == q or c == q or s['ticker'].lower() == q:
+            exact.append(s)
+        elif n.startswith(q) or c.startswith(q):
+            starts.append(s)
+        elif q in n:
+            contains.append(s)
+    return (exact + starts + contains)[:limit]
+
+# 앱 시작 시 비동기로 KRX 로드
+import threading
+threading.Thread(target=_load_krx, daemon=True).start()
 
 
 def safe_val(val):
@@ -22,30 +112,48 @@ def safe_val(val):
         return None
 
 
+def _yahoo_search(query):
+    url = 'https://query1.finance.yahoo.com/v1/finance/search'
+    params = {'q': query, 'lang': 'en-US', 'region': 'US',
+              'quotesCount': 10, 'newsCount': 0, 'enableFuzzyQuery': True, 'enableCb': False}
+    headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
+    res = requests.get(url, params=params, headers=headers, timeout=5)
+    return res.json().get('quotes', [])
+
+
+def _is_korean(s):
+    return any('가' <= c <= '힣' or 'ᄀ' <= c <= 'ᇿ' for c in s)
+
+
 @app.route('/api/search')
 def search_ticker():
     query = request.args.get('q', '').strip()
     if not query:
         return jsonify([])
     try:
-        url = 'https://query1.finance.yahoo.com/v1/finance/search'
-        params = {'q': query, 'lang': 'ko-KR', 'region': 'KR', 'quotesCount': 10, 'newsCount': 0, 'enableFuzzyQuery': True, 'enableCb': False}
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, params=params, headers=headers, timeout=5)
-        data = res.json()
+        seen = set()
         results = []
-        for q in data.get('quotes', []):
-            qtype = q.get('quoteType', '')
-            if qtype not in ('EQUITY', 'ETF', 'INDEX'):
-                continue
-            results.append({
-                'ticker': q.get('symbol', ''),
-                'name': q.get('longname') or q.get('shortname') or q.get('symbol'),
-                'exchange': q.get('exchange', ''),
-                'type': qtype,
-            })
-        return jsonify(results)
+
+        def add(ticker, name, exchange, typ='EQUITY'):
+            if ticker and ticker not in seen:
+                seen.add(ticker)
+                results.append({'ticker': ticker, 'name': name, 'exchange': exchange, 'type': typ})
+
+        # 1차: KRX 로컬 검색 (한국어/종목코드 모두 커버)
+        for s in _search_krx(query, limit=8):
+            add(s['ticker'], s['name'], s['market'])
+
+        # 2차: 한국어가 아니면 야후 글로벌 검색으로 해외 종목 추가
+        if not _is_korean(query) and len(results) < 10:
+            for q in _yahoo_search(query):
+                qtype = q.get('quoteType', '')
+                if qtype not in ('EQUITY', 'ETF', 'INDEX'):
+                    continue
+                add(q.get('symbol',''), q.get('longname') or q.get('shortname') or '', q.get('exchange',''), qtype)
+
+        return jsonify(results[:10])
     except Exception as e:
+        traceback.print_exc()
         return jsonify([])
 
 
