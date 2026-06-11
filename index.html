@@ -23,6 +23,10 @@
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
 
   header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 24px; height: 56px; display: flex; align-items: center; gap: 16px; position: sticky; top: 0; z-index: 100; }
+  #refresh-info { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  #refresh-info span { color: var(--green); }
+  .refreshing { animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
   header h1 { font-size: 18px; font-weight: 700; color: var(--blue); letter-spacing: -0.5px; }
   header h1 span { color: var(--text); }
 
@@ -112,8 +116,9 @@
 
 <header>
   <h1>Market<span>Eye</span></h1>
+  <div id="refresh-info">자동새로고침 <span id="refresh-countdown">30s</span> · <span id="last-updated">-</span></div>
   <div id="search-bar" style="position:relative">
-    <input id="ticker-input" type="text" placeholder="티커 입력 (예: AAPL, TSLA, 005930.KS)" autocomplete="off">
+    <input id="ticker-input" type="text" placeholder="티커 입력 (예: AAPL, 삼성전자, 하이닉스)" autocomplete="off">
     <button onclick="addTicker()">추가</button>
     <button class="secondary" onclick="clearAll()">전체 삭제</button>
     <div id="suggestions"></div>
@@ -202,6 +207,53 @@ async function addTicker(ticker) {
 
 function quickAdd(t) { addTicker(t); }
 
+// ---- 가격 자동 새로고침 (30초마다 가격·등락률만 갱신) ----
+const REFRESH_SEC = 30;
+let refreshTimer = null;
+let countdown = REFRESH_SEC;
+
+async function refreshPrices() {
+  const tickers = Object.keys(stocks).filter(t => stocks[t]);
+  if (!tickers.length) return;
+
+  document.getElementById('last-updated').textContent = '새로고침 중...';
+  document.getElementById('last-updated').style.color = 'var(--yellow)';
+
+  await Promise.all(tickers.map(async ticker => {
+    try {
+      const res = await fetch(`${API}/stock/${ticker}`);
+      const json = await res.json();
+      if (json.success) {
+        // 가격 관련 필드만 덮어씀 (재무지표는 유지)
+        const PRICE_KEYS = ['price','change','changePercent','open','prevClose','dayLow','dayHigh','volume','history'];
+        PRICE_KEYS.forEach(k => { stocks[ticker][k] = json.data[k]; });
+      }
+    } catch(e) {}
+  }));
+
+  const now = new Date();
+  document.getElementById('last-updated').textContent =
+    `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')} 기준`;
+  document.getElementById('last-updated').style.color = 'var(--green)';
+
+  if (activeTab === 'overview') renderCards();
+}
+
+function startRefreshLoop() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  countdown = REFRESH_SEC;
+  refreshTimer = setInterval(() => {
+    countdown--;
+    document.getElementById('refresh-countdown').textContent = countdown + 's';
+    if (countdown <= 0) {
+      countdown = REFRESH_SEC;
+      refreshPrices();
+    }
+  }, 1000);
+}
+
+startRefreshLoop();
+
 function removeTicker(ticker) {
   delete stocks[ticker];
   renderAll();
@@ -259,7 +311,7 @@ function renderCards() {
       </div>
       <div class="mini-chart"><canvas id="mini-${ticker}"></canvas></div>
       <div class="card-metrics">
-        ${metricBlock('PER', d.per, 'x')}
+        ${metricBlock('PER (TTM)', d.per, 'x')}
         ${metricBlock('PBR', d.pbr, 'x')}
         ${metricBlock('ROE', d.roe, '%', 100)}
         ${metricBlock('ROA', d.roa, '%', 100)}

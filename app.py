@@ -158,7 +158,12 @@ def search_ticker():
 
 
 def _calc_per_pbr(info, t):
-    """yfinance가 PER/PBR을 제공하지 않는 종목(주로 한국 주식)은 재무제표에서 직접 계산"""
+    """
+    PER/PBR 계산.
+    yfinance 제공값 우선, 없으면 분기 재무제표로 TTM 직접 계산.
+    TTM EPS = 최근 4개 분기 순이익 합 / 발행주식수
+    BPS     = 최근 분기 자기자본 / 발행주식수
+    """
     per = safe_val(info.get('trailingPE'))
     pbr = safe_val(info.get('priceToBook'))
     eps = safe_val(info.get('trailingEps'))
@@ -166,22 +171,31 @@ def _calc_per_pbr(info, t):
     price = safe_val(info.get('currentPrice') or info.get('regularMarketPrice'))
     shares = safe_val(info.get('sharesOutstanding') or info.get('impliedSharesOutstanding'))
 
-    if (per is None or pbr is None or eps is None or bps is None) and shares and price:
+    if (per is None or pbr is None) and shares and price:
         try:
-            fin = t.financials
-            bs  = t.balance_sheet
-            if fin is not None and not fin.empty:
-                ni_key = next((k for k in fin.index if 'Net Income' in k and 'Minority' not in k), None)
-                if ni_key and eps is None:
-                    ni = safe_val(fin.loc[ni_key].iloc[0])
-                    if ni and shares:
-                        eps = ni / shares
-            if bs is not None and not bs.empty:
-                eq_key = next((k for k in bs.index if k in ('Common Stock Equity', 'Stockholders Equity', 'Total Equity Gross Minority Interest')), None)
-                if eq_key and bps is None:
-                    eq = safe_val(bs.loc[eq_key].iloc[0])
+            NI_KEYS = ('Net Income From Continuing And Discontinued Operation',
+                       'Net Income', 'Net Income Common Stockholders')
+            EQ_KEYS = ('Common Stock Equity', 'Stockholders Equity',
+                       'Total Equity Gross Minority Interest')
+
+            # 분기 재무제표로 TTM 계산
+            qfin = t.quarterly_financials
+            qbs  = t.quarterly_balance_sheet
+
+            if eps is None and qfin is not None and not qfin.empty:
+                ni_key = next((k for k in NI_KEYS if k in qfin.index), None)
+                if ni_key:
+                    ttm_ni = safe_val(qfin.loc[ni_key].iloc[:4].sum())
+                    if ttm_ni and shares:
+                        eps = ttm_ni / shares
+
+            if bps is None and qbs is not None and not qbs.empty:
+                eq_key = next((k for k in EQ_KEYS if k in qbs.index), None)
+                if eq_key:
+                    eq = safe_val(qbs.loc[eq_key].iloc[0])
                     if eq and shares:
                         bps = eq / shares
+
         except Exception:
             pass
 
@@ -206,7 +220,17 @@ def get_stock(ticker):
         low52 = safe_val(info.get('fiftyTwoWeekLow'))
         high52 = safe_val(info.get('fiftyTwoWeekHigh'))
 
-        # PER / PBR 계산 (yfinance 미제공 시 재무제표에서 직접 계산)
+        # fast_info로 실시간에 가까운 가격 보완
+        try:
+            fi = t.fast_info
+            if fi.last_price:
+                info['currentPrice'] = fi.last_price
+            if fi.previous_close:
+                info['regularMarketPreviousClose'] = fi.previous_close
+        except Exception:
+            pass
+
+        # PER / PBR 계산 (yfinance 미제공 시 분기 TTM 재무제표로 직접 계산)
         per, pbr, eps_calc, bps_calc = _calc_per_pbr(info, t)
 
         # 최근 1년 종가 히스토리 (차트용 - 월별)
