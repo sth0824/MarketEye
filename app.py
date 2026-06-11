@@ -157,6 +157,42 @@ def search_ticker():
         return jsonify([])
 
 
+def _calc_per_pbr(info, t):
+    """yfinance가 PER/PBR을 제공하지 않는 종목(주로 한국 주식)은 재무제표에서 직접 계산"""
+    per = safe_val(info.get('trailingPE'))
+    pbr = safe_val(info.get('priceToBook'))
+    eps = safe_val(info.get('trailingEps'))
+    bps = safe_val(info.get('bookValue'))
+    price = safe_val(info.get('currentPrice') or info.get('regularMarketPrice'))
+    shares = safe_val(info.get('sharesOutstanding') or info.get('impliedSharesOutstanding'))
+
+    if (per is None or pbr is None or eps is None or bps is None) and shares and price:
+        try:
+            fin = t.financials
+            bs  = t.balance_sheet
+            if fin is not None and not fin.empty:
+                ni_key = next((k for k in fin.index if 'Net Income' in k and 'Minority' not in k), None)
+                if ni_key and eps is None:
+                    ni = safe_val(fin.loc[ni_key].iloc[0])
+                    if ni and shares:
+                        eps = ni / shares
+            if bs is not None and not bs.empty:
+                eq_key = next((k for k in bs.index if k in ('Common Stock Equity', 'Stockholders Equity', 'Total Equity Gross Minority Interest')), None)
+                if eq_key and bps is None:
+                    eq = safe_val(bs.loc[eq_key].iloc[0])
+                    if eq and shares:
+                        bps = eq / shares
+        except Exception:
+            pass
+
+    if per is None and price and eps and eps > 0:
+        per = price / eps
+    if pbr is None and price and bps and bps > 0:
+        pbr = price / bps
+
+    return per, pbr, eps, bps
+
+
 @app.route('/api/stock/<ticker>')
 def get_stock(ticker):
     try:
@@ -169,6 +205,9 @@ def get_stock(ticker):
         # 52주 범위
         low52 = safe_val(info.get('fiftyTwoWeekLow'))
         high52 = safe_val(info.get('fiftyTwoWeekHigh'))
+
+        # PER / PBR 계산 (yfinance 미제공 시 재무제표에서 직접 계산)
+        per, pbr, eps_calc, bps_calc = _calc_per_pbr(info, t)
 
         # 최근 1년 종가 히스토리 (차트용 - 월별)
         hist = t.history(period='1y', interval='1mo')
@@ -202,9 +241,9 @@ def get_stock(ticker):
             'avgVolume': safe_val(info.get('averageVolume')),
 
             # 밸류에이션
-            'per': safe_val(info.get('trailingPE')),
+            'per': per,
             'forwardPer': safe_val(info.get('forwardPE')),
-            'pbr': safe_val(info.get('priceToBook')),
+            'pbr': pbr,
             'psr': safe_val(info.get('priceToSalesTrailing12Months')),
             'evEbitda': safe_val(info.get('enterpriseToEbitda')),
             'evRevenue': safe_val(info.get('enterpriseToRevenue')),
@@ -235,9 +274,9 @@ def get_stock(ticker):
             'enterpriseValue': safe_val(info.get('enterpriseValue')),
             'revenue': safe_val(info.get('totalRevenue')),
             'ebitda': safe_val(info.get('ebitda')),
-            'eps': safe_val(info.get('trailingEps')),
+            'eps': eps_calc or safe_val(info.get('trailingEps')),
             'forwardEps': safe_val(info.get('forwardEps')),
-            'bookValue': safe_val(info.get('bookValue')),
+            'bookValue': bps_calc or safe_val(info.get('bookValue')),
 
             # 배당
             'dividendYield': safe_val(info.get('dividendYield')),
