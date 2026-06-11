@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import yfinance as yf
+import requests
 import traceback
 
 app = Flask(__name__)
@@ -19,6 +20,33 @@ def safe_val(val):
         return f
     except (TypeError, ValueError):
         return None
+
+
+@app.route('/api/search')
+def search_ticker():
+    query = request.args.get('q', '').strip()
+    if not query:
+        return jsonify([])
+    try:
+        url = 'https://query1.finance.yahoo.com/v1/finance/search'
+        params = {'q': query, 'lang': 'ko-KR', 'region': 'KR', 'quotesCount': 10, 'newsCount': 0, 'enableFuzzyQuery': True, 'enableCb': False}
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, params=params, headers=headers, timeout=5)
+        data = res.json()
+        results = []
+        for q in data.get('quotes', []):
+            qtype = q.get('quoteType', '')
+            if qtype not in ('EQUITY', 'ETF', 'INDEX'):
+                continue
+            results.append({
+                'ticker': q.get('symbol', ''),
+                'name': q.get('longname') or q.get('shortname') or q.get('symbol'),
+                'exchange': q.get('exchange', ''),
+                'type': qtype,
+            })
+        return jsonify(results)
+    except Exception as e:
+        return jsonify([])
 
 
 @app.route('/api/stock/<ticker>')

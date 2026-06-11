@@ -35,9 +35,13 @@
   button.secondary { background: var(--surface2); border: 1px solid var(--border); color: var(--text); font-weight: 400; }
   button.danger { background: #da3633; }
 
-  #suggestions { position: absolute; top: 100%; left: 0; right: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; z-index: 200; display: none; }
-  #suggestions div { padding: 8px 12px; cursor: pointer; color: var(--muted); font-size: 12px; }
-  #suggestions div:hover { background: var(--surface2); color: var(--text); }
+  #suggestions { position: absolute; top: calc(100% + 4px); left: 0; right: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; z-index: 200; display: none; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+  .sug-item { display: flex; align-items: center; gap: 8px; padding: 9px 12px; cursor: pointer; transition: background .1s; }
+  .sug-item:hover, .sug-selected { background: var(--surface2); }
+  .sug-dim { opacity: .4; cursor: default; }
+  .sug-ticker { font-size: 13px; font-weight: 700; color: var(--blue); min-width: 100px; }
+  .sug-name { font-size: 12px; color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sug-exch { font-size: 10px; color: var(--muted); background: var(--surface2); padding: 2px 6px; border-radius: 4px; }
 
   main { padding: 20px 24px; }
 
@@ -534,19 +538,85 @@ function setLoadingBar(pct) {
   if (pct >= 100) setTimeout(() => bar.style.width = '0%', 500);
 }
 
-// 자동완성
+// 자동완성 — 야후 파이낸스 실시간 검색
 const input = document.getElementById('ticker-input');
-input.addEventListener('keydown', e => { if (e.key === 'Enter') addTicker(); });
-input.addEventListener('input', () => {
-  const v = input.value.toUpperCase();
-  const sug = document.getElementById('suggestions');
-  if (!v) { sug.style.display = 'none'; return; }
-  const matches = POPULAR.filter(t => t.startsWith(v) && !stocks[t]).slice(0,5);
-  if (!matches.length) { sug.style.display = 'none'; return; }
-  sug.innerHTML = matches.map(t => `<div onclick="quickAdd('${t}');document.getElementById('suggestions').style.display='none'">${t}</div>`).join('');
-  sug.style.display = 'block';
+const sug = document.getElementById('suggestions');
+let searchTimer = null;
+let selectedIdx = -1;
+
+// 한국어 → 영어 검색어 매핑 (야후가 한국어 직접 검색을 잘 못 받는 경우 대비)
+const KO_MAP = {
+  '삼성전자': 'samsung electronics', '삼성': 'samsung electronics',
+  '하이닉스': 'sk hynix', 'sk하이닉스': 'sk hynix', '에스케이하이닉스': 'sk hynix',
+  '네이버': 'naver', '카카오': 'kakao', '카카오뱅크': 'kakaobank',
+  'lg전자': 'lg electronics', '엘지전자': 'lg electronics',
+  'lg화학': 'lg chem', '엘지화학': 'lg chem',
+  '현대차': 'hyundai motor', '현대자동차': 'hyundai motor',
+  '기아': 'kia', '기아차': 'kia',
+  '셀트리온': 'celltrion', '삼성바이오': 'samsung biologics',
+  '포스코': 'posco', '롯데': 'lotte', 'sk이노베이션': 'sk innovation',
+  '카카오페이': 'kakaopay', '토스': 'viva republica',
+  '애플': 'apple', '구글': 'google', '알파벳': 'alphabet',
+  '아마존': 'amazon', '테슬라': 'tesla', '엔비디아': 'nvidia',
+  '메타': 'meta', '넷플릭스': 'netflix', '마이크로소프트': 'microsoft',
+};
+
+function resolveQuery(v) {
+  const lower = v.trim().toLowerCase();
+  return KO_MAP[lower] || v;
+}
+
+async function fetchSuggestions(raw) {
+  const query = resolveQuery(raw);
+  if (!query) { hideSug(); return; }
+  try {
+    const res = await fetch(`${API}/search?q=${encodeURIComponent(query)}`);
+    const results = await res.json();
+    if (!results.length) { hideSug(); return; }
+    selectedIdx = -1;
+    sug.innerHTML = results.map((r, i) => {
+      const already = stocks[r.ticker] !== undefined;
+      return `<div class="sug-item ${already ? 'sug-dim' : ''}" data-ticker="${r.ticker}" data-idx="${i}">
+        <span class="sug-ticker">${r.ticker}</span>
+        <span class="sug-name">${r.name}</span>
+        <span class="sug-exch">${r.exchange}</span>
+      </div>`;
+    }).join('');
+    sug.querySelectorAll('.sug-item:not(.sug-dim)').forEach(el => {
+      el.addEventListener('click', () => {
+        quickAdd(el.dataset.ticker);
+        input.value = '';
+        hideSug();
+      });
+    });
+    sug.style.display = 'block';
+  } catch(e) { hideSug(); }
+}
+
+function hideSug() { sug.style.display = 'none'; selectedIdx = -1; }
+
+input.addEventListener('keydown', e => {
+  const items = sug.querySelectorAll('.sug-item:not(.sug-dim)');
+  if (e.key === 'ArrowDown') { e.preventDefault(); selectedIdx = Math.min(selectedIdx+1, items.length-1); highlightSug(items); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); selectedIdx = Math.max(selectedIdx-1, -1); highlightSug(items); }
+  else if (e.key === 'Enter') {
+    if (selectedIdx >= 0 && items[selectedIdx]) { quickAdd(items[selectedIdx].dataset.ticker); input.value = ''; hideSug(); }
+    else addTicker();
+  } else if (e.key === 'Escape') hideSug();
 });
-document.addEventListener('click', e => { if (!e.target.closest('#search-bar')) document.getElementById('suggestions').style.display='none'; });
+
+function highlightSug(items) {
+  items.forEach((el, i) => el.classList.toggle('sug-selected', i === selectedIdx));
+}
+
+input.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  const v = input.value.trim();
+  if (!v) { hideSug(); return; }
+  searchTimer = setTimeout(() => fetchSuggestions(v), 250);
+});
+
+document.addEventListener('click', e => { if (!e.target.closest('#search-bar')) hideSug(); });
 </script>
 </body>
 </html>
