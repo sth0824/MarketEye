@@ -5,10 +5,28 @@ import requests
 import traceback
 import json
 import io
+import os
+import time
+import threading
 import unicodedata
 
 app = Flask(__name__)
 CORS(app)
+
+# ── 간단한 TTL 캐시 (Yahoo 레이트리밋 방지) ──────────────
+_cache = {}
+_cache_lock = threading.Lock()
+
+def _cache_get(key, ttl):
+    with _cache_lock:
+        e = _cache.get(key)
+        if e and time.time() - e[0] < ttl:
+            return e[1]
+    return None
+
+def _cache_set(key, val):
+    with _cache_lock:
+        _cache[key] = (time.time(), val)
 
 # ── KRX 전체 상장 종목 캐시 ──────────────────────────────
 _krx_stocks = []   # [{'code': '005930', 'ticker': '005930.KS', 'name': '삼성전자', 'market': 'KOSPI'}]
@@ -93,9 +111,16 @@ def _search_krx(query, limit=10):
             contains.append(s)
     return (exact + starts + contains)[:limit]
 
-# 앱 시작 시 비동기로 KRX 로드
-import threading
-threading.Thread(target=_load_krx, daemon=True).start()
+# 앱 시작 시 비동기로 KRX 로드 (실패 시 재시도)
+def _krx_loader():
+    for _ in range(5):
+        _load_krx()
+        if _krx_stocks:
+            return
+        time.sleep(5)
+    print('KRX: gave up after retries')
+
+threading.Thread(target=_krx_loader, daemon=True).start()
 
 
 def safe_val(val):
@@ -207,43 +232,47 @@ def _calc_per_pbr(info, t):
     return per, pbr, eps, bps
 
 
-@app.route('/api/stock/<ticker>')
-def get_stock(ticker):
+def _fetch_stock(ticker):
+    """yfinance에서 종목 데이터를 조회해 dict로 반환 (실패 시 예외)."""
+    t = yf.Ticker(ticker.upper())
+    info = t.info
+
+    # fast_info로 실시간에 가까운 가격 보완 (price 계산 전에 먼저 반영)
     try:
-        t = yf.Ticker(ticker.upper())
-        info = t.info
+        fi = t.fast_info
+        if fi.last_price:
+            info['currentPrice'] = fi.last_price
+        if fi.previous_close:
+            info['regularMarketPreviousClose'] = fi.previous_close
+    except Exception:
+        pass
 
-        # 현재가
-        price = safe_val(info.get('currentPrice') or info.get('regularMarketPrice'))
+    # 현재가 (fast_info 보완 후 계산)
+    price = safe_val(info.get('currentPrice') or info.get('regularMarketPrice'))
 
-        # 52주 범위
-        low52 = safe_val(info.get('fiftyTwoWeekLow'))
-        high52 = safe_val(info.get('fiftyTwoWeekHigh'))
+    # 52주 범위
+    low52 = safe_val(info.get('fiftyTwoWeekLow'))
+    high52 = safe_val(info.get('fiftyTwoWeekHigh'))
 
-        # fast_info로 실시간에 가까운 가격 보완
-        try:
-            fi = t.fast_info
-            if fi.last_price:
-                info['currentPrice'] = fi.last_price
-            if fi.previous_close:
-                info['regularMarketPreviousClose'] = fi.previous_close
-        except Exception:
-            pass
+    # PER / PBR 계산 (yfinance 미제공 시 분기 TTM 재무제표로 직접 계산)
+    per, pbr, eps_calc, bps_calc = _calc_per_pbr(info, t)
 
-        # PER / PBR 계산 (yfinance 미제공 시 분기 TTM 재무제표로 직접 계산)
-        per, pbr, eps_calc, bps_calc = _calc_per_pbr(info, t)
+    # 배당수익률: 최신 yfinance는 퍼센트 숫자(0.36 = 0.36%)로 반환 → 비율(fraction)로 정규화
+    div_yield = safe_val(info.get('dividendYield'))
+    if div_yield is not None:
+        div_yield = div_yield / 100
 
-        # 최근 1년 종가 히스토리 (차트용 - 월별)
-        hist = t.history(period='1y', interval='1mo')
-        history = []
-        if not hist.empty:
-            for dt, row in hist.iterrows():
-                history.append({
-                    'date': dt.strftime('%Y-%m'),
-                    'close': round(float(row['Close']), 2)
-                })
+    # 최근 1년 종가 히스토리 (차트용 - 월별)
+    hist = t.history(period='1y', interval='1mo')
+    history = []
+    if not hist.empty:
+        for dt, row in hist.iterrows():
+            history.append({
+                'date': dt.strftime('%Y-%m'),
+                'close': round(float(row['Close']), 2)
+            })
 
-        data = {
+    data = {
             'ticker': ticker.upper(),
             'name': info.get('longName') or info.get('shortName') or ticker.upper(),
             'sector': info.get('sector', '-'),
@@ -303,7 +332,7 @@ def get_stock(ticker):
             'bookValue': bps_calc or safe_val(info.get('bookValue')),
 
             # 배당
-            'dividendYield': safe_val(info.get('dividendYield')),
+            'dividendYield': div_yield,
             'dividendRate': safe_val(info.get('dividendRate')),
             'payoutRatio': safe_val(info.get('payoutRatio')),
             'exDividendDate': info.get('exDividendDate'),
@@ -323,7 +352,55 @@ def get_stock(ticker):
             'shortRatio': safe_val(info.get('shortRatio')),
 
             'history': history,
+    }
+    return data
+
+
+# 전체 데이터 TTL (초). 환경변수로 조정 가능.
+STOCK_TTL = int(os.environ.get('STOCK_TTL', '60'))
+PRICE_TTL = int(os.environ.get('PRICE_TTL', '15'))
+
+
+@app.route('/api/stock/<ticker>')
+def get_stock(ticker):
+    key = ticker.upper()
+    cached = _cache_get(('stock', key), STOCK_TTL)
+    if cached is not None:
+        return jsonify({'success': True, 'data': cached})
+    try:
+        data = _fetch_stock(ticker)
+        _cache_set(('stock', key), data)
+        return jsonify({'success': True, 'data': data})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/price/<ticker>')
+def get_price(ticker):
+    """가격·등락률만 빠르게 반환 (fast_info). 자동 새로고침용 경량 엔드포인트."""
+    key = ticker.upper()
+    cached = _cache_get(('price', key), PRICE_TTL)
+    if cached is not None:
+        return jsonify({'success': True, 'data': cached})
+    try:
+        t = yf.Ticker(key)
+        fi = t.fast_info
+        last = safe_val(fi.last_price)
+        prev = safe_val(fi.previous_close)
+        change = (last - prev) if (last is not None and prev) else None
+        change_pct = (change / prev * 100) if (change is not None and prev) else None
+        data = {
+            'price': last,
+            'change': change,
+            'changePercent': change_pct,
+            'open': safe_val(fi.open),
+            'prevClose': prev,
+            'dayLow': safe_val(fi.day_low),
+            'dayHigh': safe_val(fi.day_high),
+            'volume': safe_val(fi.last_volume),
         }
+        _cache_set(('price', key), data)
         return jsonify({'success': True, 'data': data})
     except Exception as e:
         traceback.print_exc()
@@ -332,17 +409,32 @@ def get_stock(ticker):
 
 @app.route('/api/batch')
 def get_batch():
+    """여러 종목을 병렬로 조회."""
     tickers = request.args.get('tickers', '')
     ticker_list = [t.strip() for t in tickers.split(',') if t.strip()]
     results = {}
-    for ticker in ticker_list:
+    lock = threading.Lock()
+
+    def work(ticker):
+        key = ticker.upper()
+        cached = _cache_get(('stock', key), STOCK_TTL)
         try:
-            resp = get_stock(ticker)
-            results[ticker.upper()] = resp.get_json()
+            data = cached if cached is not None else _fetch_stock(ticker)
+            if cached is None:
+                _cache_set(('stock', key), data)
+            payload = {'success': True, 'data': data}
         except Exception as e:
-            results[ticker.upper()] = {'success': False, 'error': str(e)}
+            payload = {'success': False, 'error': str(e)}
+        with lock:
+            results[key] = payload
+
+    threads = [threading.Thread(target=work, args=(t,)) for t in ticker_list]
+    for th in threads: th.start()
+    for th in threads: th.join()
     return jsonify(results)
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    debug = os.environ.get('FLASK_DEBUG', '0') == '1'
+    port = int(os.environ.get('PORT', '5001'))
+    app.run(debug=debug, port=port)

@@ -174,11 +174,22 @@ let activeTab = 'overview';
 const POPULAR = ['AAPL','MSFT','GOOGL','AMZN','NVDA','TSLA','META','NFLX','ORCL','AMD',
   '005930.KS','000660.KS','035420.KS','035720.KS','068270.KS','207940.KS'];
 
+// 한국 종목코드(숫자)를 KRX 검색으로 .KS/.KQ 정확히 해석
+async function resolveKrTicker(code) {
+  try {
+    const res = await fetch(`${API}/search?q=${encodeURIComponent(code)}`);
+    const list = await res.json();
+    const hit = list.find(r => r.ticker.startsWith(code + '.'));
+    if (hit) return hit.ticker;
+  } catch(e) {}
+  return code + '.KS'; // 폴백
+}
+
 // ---- 티커 추가 ----
 async function addTicker(ticker) {
   let raw = (ticker || document.getElementById('ticker-input').value.trim()).trim();
-  // 순수 숫자면 한국 종목코드 → .KS 붙이기
-  ticker = /^\d{5,6}$/.test(raw) ? raw + '.KS' : raw.toUpperCase();
+  // 순수 숫자면 한국 종목코드 → KRX에서 .KS/.KQ 해석
+  ticker = /^\d{5,6}$/.test(raw) ? await resolveKrTicker(raw) : raw.toUpperCase();
   if (!ticker) return;
   if (stocks[ticker] !== undefined) { showError(`${ticker}은 이미 추가되어 있습니다`); return; }
   document.getElementById('ticker-input').value = '';
@@ -194,6 +205,7 @@ async function addTicker(ticker) {
     const json = await res.json();
     if (!json.success) throw new Error(json.error || '데이터 로드 실패');
     stocks[ticker] = json.data;
+    saveState();
     setLoadingBar(100);
     renderAll();
   } catch(e) {
@@ -221,13 +233,10 @@ async function refreshPrices() {
 
   await Promise.all(tickers.map(async ticker => {
     try {
-      const res = await fetch(`${API}/stock/${ticker}`);
+      // 경량 엔드포인트: 가격·등락률만 (재무지표·히스토리는 유지)
+      const res = await fetch(`${API}/price/${ticker}`);
       const json = await res.json();
-      if (json.success) {
-        // 가격 관련 필드만 덮어씀 (재무지표는 유지)
-        const PRICE_KEYS = ['price','change','changePercent','open','prevClose','dayLow','dayHigh','volume','history'];
-        PRICE_KEYS.forEach(k => { stocks[ticker][k] = json.data[k]; });
-      }
+      if (json.success) Object.assign(stocks[ticker], json.data);
     } catch(e) {}
   }));
 
@@ -243,6 +252,7 @@ function startRefreshLoop() {
   if (refreshTimer) clearInterval(refreshTimer);
   countdown = REFRESH_SEC;
   refreshTimer = setInterval(() => {
+    if (document.hidden) return; // 백그라운드 탭에서는 폴링 정지
     countdown--;
     document.getElementById('refresh-countdown').textContent = countdown + 's';
     if (countdown <= 0) {
@@ -253,17 +263,34 @@ function startRefreshLoop() {
 }
 
 startRefreshLoop();
+restoreState();
 
 function removeTicker(ticker) {
   delete stocks[ticker];
+  saveState();
   renderAll();
   if (Object.keys(stocks).length === 0) document.getElementById('empty-state').style.display = '';
 }
 
 function clearAll() {
   stocks = {};
+  saveState();
   renderAll();
   document.getElementById('empty-state').style.display = '';
+}
+
+// ---- 상태 저장/복원 (localStorage) ----
+const STORAGE_KEY = 'marketeye_tickers';
+function saveState() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(Object.keys(stocks))); } catch(e) {}
+}
+function restoreState() {
+  let saved = [];
+  try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch(e) {}
+  if (saved.length) {
+    document.getElementById('empty-state').style.display = 'none';
+    saved.forEach(t => addTicker(t));
+  }
 }
 
 // ---- 렌더 ----
@@ -300,9 +327,9 @@ function renderCards() {
       <button class="card-remove" onclick="removeTicker('${ticker}')">✕</button>
       <div class="card-header">
         <div>
-          <div class="card-ticker">${ticker}</div>
-          <div class="card-name">${d.name}</div>
-          <div style="font-size:10px;color:var(--muted);margin-top:2px">${d.sector}</div>
+          <div class="card-ticker">${esc(ticker)}</div>
+          <div class="card-name">${esc(d.name)}</div>
+          <div style="font-size:10px;color:var(--muted);margin-top:2px">${esc(d.sector)}</div>
         </div>
         <div class="card-price">
           <div class="card-price-val ${chgCls}">${fmt(d.price, d.currency)}</div>
@@ -326,7 +353,7 @@ function renderCards() {
         <span>EPS ${d.eps != null ? d.eps.toFixed(2) : '-'}</span>
         <span>Beta ${d.beta != null ? d.beta.toFixed(2) : '-'}</span>
       </div>
-      ${d.targetPrice ? `<div style="margin-top:10px;font-size:11px;color:var(--muted)">목표주가 <span style="color:var(--yellow)">${fmt(d.targetPrice, d.currency)}</span> | 의견 <span style="color:var(--yellow)">${d.recommendation}</span></div>` : ''}
+      ${d.targetPrice ? `<div style="margin-top:10px;font-size:11px;color:var(--muted)">목표주가 <span style="color:var(--yellow)">${fmt(d.targetPrice, d.currency)}</span> | 의견 <span style="color:var(--yellow)">${esc(d.recommendation)}</span></div>` : ''}
     `;
     c.appendChild(card);
     drawMiniChart(ticker, d.history);
@@ -379,7 +406,7 @@ const METRIC_GROUPS = [
     { key: 'pbr', label: 'PBR', fmt: v => v!=null?v.toFixed(2)+'x':'-', higherBetter: false },
     { key: 'psr', label: 'PSR', fmt: v => v!=null?v.toFixed(2)+'x':'-', higherBetter: false },
     { key: 'evEbitda', label: 'EV/EBITDA', fmt: v => v!=null?v.toFixed(1)+'x':'-', higherBetter: false },
-    { key: 'eps', label: 'EPS', fmt: v => v!=null?v.toFixed(2):'-', higherBetter: true },
+    { key: 'eps', label: 'EPS', fmt: v => v!=null?v.toFixed(2):'-', higherBetter: true, money: true },
   ]},
   { label: '수익성', rows: [
     { key: 'roe', label: 'ROE', fmt: v => pct100(v), higherBetter: true },
@@ -400,7 +427,7 @@ const METRIC_GROUPS = [
     { key: 'quickRatio', label: '당좌비율', fmt: v => v!=null?v.toFixed(2):'-', higherBetter: true },
     { key: 'totalCash', label: '현금', fmt: v => bigNum(v), higherBetter: null },
     { key: 'totalDebt', label: '총부채', fmt: v => bigNum(v), higherBetter: null },
-    { key: 'freeCashflow', label: 'Free Cash Flow', fmt: v => bigNum(v), higherBetter: true },
+    { key: 'freeCashflow', label: 'Free Cash Flow', fmt: v => bigNum(v), higherBetter: true, money: true },
   ]},
   { label: '배당', rows: [
     { key: 'dividendYield', label: '배당수익률', fmt: v => pct100(v), higherBetter: true },
@@ -409,7 +436,7 @@ const METRIC_GROUPS = [
   ]},
   { label: '애널리스트', rows: [
     { key: 'targetPrice', label: '목표주가', fmt: (v,d) => fmt(v, d.currency), higherBetter: null },
-    { key: 'recommendation', label: '투자의견', fmt: v => v||'-', higherBetter: null },
+    { key: 'recommendation', label: '투자의견', fmt: v => esc(v||'-'), higherBetter: null },
     { key: 'numberOfAnalysts', label: '커버리지 수', fmt: v => v!=null?v:'-', higherBetter: null },
   ]},
 ];
@@ -419,8 +446,12 @@ function renderCompareTable() {
   const section = document.getElementById('compare-section');
   if (tickers.length < 1) { section.innerHTML = '<p style="color:var(--muted);padding:20px">기업을 1개 이상 추가하면 비교 테이블이 표시됩니다.</p>'; return; }
 
+  // 통화가 섞여 있으면 금액성 지표는 단순 비교가 무의미 → 하이라이트 생략
+  const currencies = tickers.map(t => stocks[t].currency || 'USD');
+  const mixedCurrency = new Set(currencies).size > 1;
+
   let html = `<table class="compare-table"><thead><tr><th>지표</th>`;
-  tickers.forEach(t => html += `<th class="ticker-head">${t}</th>`);
+  tickers.forEach(t => html += `<th class="ticker-head">${esc(t)}<div style="font-size:10px;color:var(--muted);font-weight:400">${esc(stocks[t].currency||'')}</div></th>`);
   html += `</tr></thead><tbody>`;
 
   METRIC_GROUPS.forEach(group => {
@@ -430,7 +461,7 @@ function renderCompareTable() {
       const numVals = vals.map(v => typeof v === 'number' ? v : null);
       const defined = numVals.filter(v => v !== null);
       let bestIdx = -1, worstIdx = -1;
-      if (row.higherBetter !== null && defined.length > 1) {
+      if (row.higherBetter !== null && defined.length > 1 && !(row.money && mixedCurrency)) {
         const best = row.higherBetter ? Math.max(...defined) : Math.min(...defined);
         const worst = row.higherBetter ? Math.min(...defined) : Math.max(...defined);
         bestIdx = numVals.indexOf(best);
@@ -565,6 +596,10 @@ function switchTab(tab) {
 }
 
 // ---- 유틸 ----
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 function fmt(v, currency='USD') {
   if (v == null) return '-';
   return new Intl.NumberFormat('ko-KR', { style:'currency', currency: currency||'USD', maximumFractionDigits: 2 }).format(v);
@@ -608,10 +643,10 @@ async function fetchSuggestions(raw) {
     selectedIdx = -1;
     sug.innerHTML = results.map((r, i) => {
       const already = stocks[r.ticker] !== undefined;
-      return `<div class="sug-item ${already ? 'sug-dim' : ''}" data-ticker="${r.ticker}" data-idx="${i}">
-        <span class="sug-ticker">${r.ticker}</span>
-        <span class="sug-name">${r.name}</span>
-        <span class="sug-exch">${r.exchange}</span>
+      return `<div class="sug-item ${already ? 'sug-dim' : ''}" data-ticker="${esc(r.ticker)}" data-idx="${i}">
+        <span class="sug-ticker">${esc(r.ticker)}</span>
+        <span class="sug-name">${esc(r.name)}</span>
+        <span class="sug-exch">${esc(r.exchange)}</span>
       </div>`;
     }).join('');
     sug.querySelectorAll('.sug-item:not(.sug-dim)').forEach(el => {
