@@ -87,6 +87,9 @@ def _load_krx():
             market = 'KOSDAQ' if suffix == 'KQ' else 'KOSPI'
             results.append({'code': code, 'ticker': f'{code}.{suffix}', 'name': name, 'market': market})
 
+        if not results:
+            print('KRX: parsed 0 valid stocks, keeping existing data')
+            return
         _krx_stocks = results
         print(f'KRX stocks loaded: {len(_krx_stocks)}')
     except Exception as e:
@@ -111,14 +114,26 @@ def _search_krx(query, limit=10):
             contains.append(s)
     return (exact + starts + contains)[:limit]
 
-# 앱 시작 시 비동기로 KRX 로드 (실패 시 재시도)
+def _load_krx_bundle():
+    """저장소에 포함된 krx_stocks.json을 로드 (KRX 사이트 접근 불가한 환경용 폴백)."""
+    global _krx_stocks
+    try:
+        path = os.path.join(os.path.dirname(__file__), 'krx_stocks.json')
+        with open(path, encoding='utf-8') as f:
+            _krx_stocks = json.load(f)
+        print(f'KRX bundle loaded: {len(_krx_stocks)}')
+        return True
+    except Exception as e:
+        print('KRX bundle load failed:', e)
+        return False
+
+# 앱 시작 시 KRX 로드: 번들 먼저(즉시 검색 가능) → 라이브 갱신 시도(되면 최신화)
 def _krx_loader():
-    for _ in range(5):
-        _load_krx()
-        if _krx_stocks:
-            return
-        time.sleep(5)
-    print('KRX: gave up after retries')
+    _load_krx_bundle()           # 항상 동작하는 기본값 (해외 IP에서도 OK)
+    try:
+        _load_krx()              # KRX 사이트 접근 가능하면 최신 목록으로 교체
+    except Exception:
+        pass                     # 실패해도 번들 데이터 유지
 
 threading.Thread(target=_krx_loader, daemon=True).start()
 
