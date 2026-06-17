@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 import yfinance as yf
 import requests
@@ -434,7 +434,13 @@ def get_batch():
     return jsonify(results)
 
 
+# 프론트엔드(index.html) 서빙 — API와 같은 서버에서 제공
+@app.route('/')
+def index():
+    return send_file(os.path.join(os.path.dirname(__file__), 'index.html'))
+
+
 if __name__ == '__main__':
     debug = os.environ.get('FLASK_DEBUG', '0') == '1'
     port = int(os.environ.get('PORT', '5001'))
-    app.run(debug=debug, port=port)
+    app.run(debug=debug, host='0.0.0.0', port=port)
