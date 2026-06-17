@@ -167,8 +167,10 @@
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
-// 파일로 직접 열면 로컬 서버를, 서버가 서빙하면 같은 출처(/api)를 사용
-const API = (location.protocol === 'file:') ? 'http://localhost:5001/api' : '/api';
+// 로컬(파일/localhost)에서는 Flask(:5001)를, 배포 환경에서는 같은 출처(/api)를 사용
+const _isLocal = location.protocol === 'file:'
+  || ['localhost', '127.0.0.1', ''].includes(location.hostname);
+const API = _isLocal ? 'http://localhost:5001/api' : '/api';
 let stocks = {}; // ticker -> data
 let activeTab = 'overview';
 
