@@ -589,7 +589,9 @@ def signal(ticker):
             if p > 5:  return 55
             return 25
 
-        per = sv('trailingPE'); pbr = sv('priceToBook')
+        # PER/PBR: yfinance 미제공(한국 종목 등) 시 분기 재무제표로 TTM 직접 계산
+        # — 개요 카드와 동일한 폴백 로직을 재사용해 '-'로 비는 문제를 막는다.
+        per, pbr, _, _ = _calc_per_pbr(info, t)
         roe = sv('returnOnEquity'); debt = sv('debtToEquity')
         margin = sv('profitMargins')
 
