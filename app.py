@@ -207,10 +207,16 @@ def search_ticker():
 
 def _calc_per_pbr(info, t):
     """
-    PER/PBR 계산.
-    yfinance 제공값 우선, 없으면 분기 재무제표로 TTM 직접 계산.
-    TTM EPS = 최근 4개 분기 순이익 합 / 발행주식수
-    BPS     = 최근 분기 자기자본 / 발행주식수
+    PER/PBR 계산. yfinance 제공값 우선, 없으면 분기 재무제표로 TTM 직접 계산.
+
+    EPS(TTM) 우선순위:
+      1) info['trailingEps'] (야후 제공)
+      2) 분기 EPS(Diluted→Basic) 최근 4개 합 — 가중평균·희석이 이미 반영돼 가장 정확
+      3) 최근 4개 분기 '지배주주 순이익' 합 ÷ 발행주식수 (근사)
+    BPS:
+      1) info['bookValue']
+      2) 최근 분기 보통주 자기자본 ÷ 발행주식수
+    정확도를 위해 분기가 4개 미만이거나 결측이면 계산하지 않고 None을 반환한다.
     """
     per = safe_val(info.get('trailingPE'))
     pbr = safe_val(info.get('priceToBook'))
@@ -219,10 +225,14 @@ def _calc_per_pbr(info, t):
     price = safe_val(info.get('currentPrice') or info.get('regularMarketPrice'))
     shares = safe_val(info.get('sharesOutstanding') or info.get('impliedSharesOutstanding'))
 
-    if (per is None or pbr is None) and shares and price:
+    if (per is None or pbr is None) and price:
         try:
-            NI_KEYS = ('Net Income From Continuing And Discontinued Operation',
-                       'Net Income', 'Net Income Common Stockholders')
+            # 분기 EPS 직접 합산용 (가장 정확). 보통주 귀속 EPS.
+            EPS_KEYS = ('Diluted EPS', 'Basic EPS')
+            # 순이익 폴백: 지배주주(보통주) 귀속분을 우선해 EPS 정의에 맞춤
+            NI_KEYS = ('Net Income Common Stockholders',
+                       'Net Income From Continuing And Discontinued Operation',
+                       'Net Income')
             EQ_KEYS = ('Common Stock Equity', 'Stockholders Equity',
                        'Total Equity Gross Minority Interest')
 
@@ -231,17 +241,23 @@ def _calc_per_pbr(info, t):
             qbs  = t.quarterly_balance_sheet
 
             if eps is None and qfin is not None and not qfin.empty:
-                ni_key = next((k for k in NI_KEYS if k in qfin.index), None)
-                if ni_key:
-                    ttm_ni = safe_val(qfin.loc[ni_key].iloc[:4].sum())
-                    if ttm_ni and shares:
-                        eps = ttm_ni / shares
+                # 1순위: 분기 EPS 4개 합 (min_count=4 → 4분기 모두 있어야 계산)
+                eps_key = next((k for k in EPS_KEYS if k in qfin.index), None)
+                if eps_key:
+                    eps = safe_val(qfin.loc[eps_key].iloc[:4].sum(min_count=4))
+                # 2순위: 지배주주 순이익 TTM ÷ 발행주식수 (분기 EPS가 없을 때만)
+                if eps is None and shares:
+                    ni_key = next((k for k in NI_KEYS if k in qfin.index), None)
+                    if ni_key:
+                        ttm_ni = safe_val(qfin.loc[ni_key].iloc[:4].sum(min_count=4))
+                        if ttm_ni is not None:
+                            eps = ttm_ni / shares
 
-            if bps is None and qbs is not None and not qbs.empty:
+            if bps is None and shares and qbs is not None and not qbs.empty:
                 eq_key = next((k for k in EQ_KEYS if k in qbs.index), None)
                 if eq_key:
                     eq = safe_val(qbs.loc[eq_key].iloc[0])
-                    if eq and shares:
+                    if eq:
                         bps = eq / shares
 
         except Exception:
