@@ -289,6 +289,15 @@ def _fetch_stock(ticker):
     # 현재가 (fast_info 보완 후 계산)
     price = safe_val(info.get('currentPrice') or info.get('regularMarketPrice'))
 
+    # 등락률: 가격을 fast_info로 최신화했으므로 등락도 같은 기준(최신가-전일종가)으로
+    # 재계산해 표시 가격과 일치시킨다. 전일종가가 없으면 야후 제공값을 사용.
+    prev_close = safe_val(info.get('regularMarketPreviousClose'))
+    change = safe_val(info.get('regularMarketChange'))
+    change_pct = safe_val(info.get('regularMarketChangePercent'))
+    if price is not None and prev_close:
+        change = price - prev_close
+        change_pct = change / prev_close * 100
+
     # 52주 범위
     low52 = safe_val(info.get('fiftyTwoWeekLow'))
     high52 = safe_val(info.get('fiftyTwoWeekHigh'))
@@ -321,8 +330,8 @@ def _fetch_stock(ticker):
 
             # 가격
             'price': price,
-            'change': safe_val(info.get('regularMarketChange')),
-            'changePercent': safe_val(info.get('regularMarketChangePercent')),
+            'change': change,
+            'changePercent': change_pct,
             'open': safe_val(info.get('regularMarketOpen')),
             'prevClose': safe_val(info.get('regularMarketPreviousClose')),
             'dayLow': safe_val(info.get('regularMarketDayLow')),
@@ -562,6 +571,14 @@ def signal(ticker):
 
         # ── 펀더멘털 ──
         info = t.info
+        # PER/PBR 직접 계산 시 분자(가격)를 최신값으로: fast_info의 실시간 근접가 주입
+        # (개요 카드와 동일하게 맞춰 가장 최신 가격 기준으로 산출)
+        try:
+            fi = t.fast_info
+            if fi.last_price:
+                info['currentPrice'] = fi.last_price
+        except Exception:
+            pass
         def sv(k): return info.get(k)
 
         def s_per(v):
