@@ -579,8 +579,8 @@ function signalBadgeHtml(ticker) {
   const t = scoreLabel(sig.tech_score);
   const f = scoreLabel(sig.fund_score);
   return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
-    <div class="signal-badge ${t.cls}" style="margin-top:0">📈 기술 ${sig.tech_score} ${t.emoji}</div>
-    <div class="signal-badge ${f.cls}" style="margin-top:0">💰 펀더 ${sig.fund_score} ${f.emoji}</div>
+    <div class="signal-badge ${t.cls}" style="margin-top:0">📈 차트 ${sig.tech_score} ${t.emoji}</div>
+    <div class="signal-badge ${f.cls}" style="margin-top:0">💰 가치 ${sig.fund_score} ${f.emoji}</div>
   </div>`;
 }
 
