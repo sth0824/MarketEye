@@ -129,6 +129,11 @@
   .signal-score-ring { text-align: center; }
   .signal-score-num { font-size: 32px; font-weight: 800; }
   .signal-score-label { font-size: 10px; color: var(--muted); }
+  .signal-block { margin-bottom: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+  .signal-block:first-of-type { border-top: none; padding-top: 0; }
+  .signal-block-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 8px; flex-wrap: wrap; }
+  .signal-block-title { font-size: 13px; font-weight: 700; color: var(--text); }
+  .signal-block-score { display: inline-flex; align-items: center; }
   .signal-bars { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
   .signal-bar-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
   .signal-bar-label { color: var(--muted); width: 90px; flex-shrink: 0; }
@@ -555,15 +560,11 @@ async function fetchSignal(ticker) {
   } catch(e) {}
 }
 
-function signalClass(label) {
-  if (label === '매수 고려') return 'buy';
-  if (label === '관망') return 'wait';
-  return 'warn';
-}
-function signalEmoji(label) {
-  if (label === '매수 고려') return '✅';
-  if (label === '관망') return '⏳';
-  return '⚠️';
+// 점수 → 등급 라벨 (기술/펀더멘털 각각 독립 평가)
+function scoreLabel(s) {
+  if (s >= 68) return { text: '매수 고려', cls: 'buy',  emoji: '✅' };
+  if (s >= 48) return { text: '관망',      cls: 'wait', emoji: '⏳' };
+  return            { text: '주의',      cls: 'warn', emoji: '⚠️' };
 }
 function scoreColor(s) {
   if (s >= 68) return 'var(--green)';
@@ -571,12 +572,16 @@ function scoreColor(s) {
   return 'var(--red)';
 }
 
-// 카드 innerHTML에 직접 넣는 배지 (카드가 다시 그려져도 유지됨)
+// 카드 innerHTML에 직접 넣는 배지 — 기술/펀더멘털 따로 표시 (카드 재렌더에도 유지됨)
 function signalBadgeHtml(ticker) {
   const sig = signals[ticker];
   if (!sig) return '';
-  const cls = signalClass(sig.signal);
-  return `<div class="signal-badge ${cls}">${signalEmoji(sig.signal)} ${sig.signal} <span style="opacity:.7;font-weight:400">${sig.combined}점</span></div>`;
+  const t = scoreLabel(sig.tech_score);
+  const f = scoreLabel(sig.fund_score);
+  return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
+    <div class="signal-badge ${t.cls}" style="margin-top:0">📈 기술 ${sig.tech_score} ${t.emoji}</div>
+    <div class="signal-badge ${f.cls}" style="margin-top:0">💰 펀더 ${sig.fund_score} ${f.emoji}</div>
+  </div>`;
 }
 
 // 이미 그려진 카드에 배지만 갱신 (신호가 가격보다 늦게 도착한 경우)
@@ -608,19 +613,24 @@ function renderSignalCard(ticker) {
   }
   const ind = sig.indicators;
   const fund = sig.fundamentals;
-  const cls = signalClass(sig.signal);
-
-  function bar(label, score) {
-    const color = score >= 68 ? 'var(--green)' : score >= 48 ? 'var(--yellow)' : 'var(--red)';
-    return `<div class="signal-bar-row">
-      <span class="signal-bar-label">${label}</span>
-      <div class="signal-bar-track"><div class="signal-bar-fill" style="width:${score}%;background:${color}"></div></div>
-      <span class="signal-bar-val">${score}점</span>
-    </div>`;
-  }
 
   function indItem(key, val) {
     return `<div class="signal-ind-item"><div class="signal-ind-key">${key}</div><div class="signal-ind-val">${val}</div></div>`;
+  }
+
+  // 한 분석 축(기술/펀더멘털)을 독립 블록으로 렌더
+  function block(title, score, itemsHtml) {
+    const lb = scoreLabel(score);
+    return `<div class="signal-block">
+      <div class="signal-block-head">
+        <span class="signal-block-title">${title}</span>
+        <span class="signal-block-score">
+          <span class="signal-badge ${lb.cls}" style="margin-top:0">${lb.emoji} ${lb.text}</span>
+          <b style="color:${scoreColor(score)};font-size:18px;margin-left:6px">${score}</b><span style="color:var(--muted);font-size:11px">/100</span>
+        </span>
+      </div>
+      <div class="signal-indicators">${itemsHtml}</div>
+    </div>`;
   }
 
   const maStatus = (() => {
@@ -630,32 +640,27 @@ function renderSignalCard(ticker) {
     return '혼조';
   })();
 
+  const techItems =
+    indItem('RSI (14)', `${ind.rsi} ${ind.rsi < 30 ? '📉 과매도' : ind.rsi > 70 ? '📈 과매수' : ''}`) +
+    indItem('이동평균', maStatus) +
+    indItem('MACD', ind.macd_cross ? '🔔 골든크로스' : ind.macd > ind.macd_signal ? '상승세' : '하락세') +
+    indItem('볼린저 위치', `${ind.bb_pct}% ${ind.bb_pct < 25 ? '🔵 하단' : ind.bb_pct > 75 ? '🔴 상단' : '중립'}`);
+
+  const fundItems =
+    indItem('PER', fund.per != null ? fund.per.toFixed(1)+'x' : '-') +
+    indItem('PBR', fund.pbr != null ? fund.pbr.toFixed(2)+'x' : '-') +
+    indItem('ROE', fund.roe != null ? (fund.roe*100).toFixed(1)+'%' : '-') +
+    indItem('순이익률', fund.margin != null ? (fund.margin*100).toFixed(1)+'%' : '-');
+
   return `<div class="signal-card">
     <div class="signal-card-header">
       <div>
         <div class="signal-name">${esc(name)}</div>
         <div class="signal-ticker-label">${esc(ticker)}</div>
-        <div class="signal-badge ${cls}" style="margin-top:6px">${signalEmoji(sig.signal)} ${sig.signal}</div>
-      </div>
-      <div class="signal-score-ring">
-        <div class="signal-score-num" style="color:${scoreColor(sig.combined)}">${sig.combined}</div>
-        <div class="signal-score-label">종합점수 / 100</div>
       </div>
     </div>
-    <div class="signal-bars">
-      ${bar('기술적 분석', sig.tech_score)}
-      ${bar('밸류에이션', sig.fund_score)}
-    </div>
-    <div class="signal-indicators">
-      ${indItem('RSI (14)', `${ind.rsi} ${ind.rsi < 30 ? '📉 과매도' : ind.rsi > 70 ? '📈 과매수' : ''}`)}
-      ${indItem('이동평균', maStatus)}
-      ${indItem('MACD', ind.macd_cross ? '🔔 골든크로스' : ind.macd > ind.macd_signal ? '상승세' : '하락세')}
-      ${indItem('볼린저 위치', `${ind.bb_pct}% ${ind.bb_pct < 25 ? '🔵 하단' : ind.bb_pct > 75 ? '🔴 상단' : '중립'}`)}
-      ${indItem('PER', fund.per != null ? fund.per.toFixed(1)+'x' : '-')}
-      ${indItem('PBR', fund.pbr != null ? fund.pbr.toFixed(2)+'x' : '-')}
-      ${indItem('ROE', fund.roe != null ? (fund.roe*100).toFixed(1)+'%' : '-')}
-      ${indItem('순이익률', fund.margin != null ? (fund.margin*100).toFixed(1)+'%' : '-')}
-    </div>
+    ${block('📈 기술적 분석 (차트)', sig.tech_score, techItems)}
+    ${block('💰 펀더멘털 (가치)', sig.fund_score, fundItems)}
   </div>`;
 }
 
