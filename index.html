@@ -694,7 +694,7 @@ function renderCompareTable() {
   const mixedCurrency = new Set(currencies).size > 1;
 
   let html = `<table class="compare-table"><thead><tr><th>지표</th>`;
-  tickers.forEach(t => html += `<th class="ticker-head">${esc(t)}<div style="font-size:10px;color:var(--muted);font-weight:400">${esc(stocks[t].currency||'')}</div></th>`);
+  tickers.forEach(t => html += `<th class="ticker-head">${esc(stocks[t].name || t)}<div style="font-size:10px;color:var(--muted);font-weight:400">${esc(t)}</div></th>`);
   html += `</tr></thead><tbody>`;
 
   METRIC_GROUPS.forEach(group => {
@@ -757,7 +757,7 @@ function renderCharts() {
     setTimeout(() => {
       const canvas = document.getElementById(canvasId);
       if (!canvas) return;
-      const labels = tickers;
+      const labels = tickers.map(t => stocks[t].name || t);
       const data = tickers.map(t => {
         const v = stocks[t][m.key];
         return v != null ? +(v * (m.mult||1)).toFixed(2) : null;
@@ -802,7 +802,7 @@ function renderCharts() {
       const priceMap = Object.fromEntries(hist.map(h => [h.date, h.close]));
       const base = hist.length ? hist[0].close : 1;
       return {
-        label: t,
+        label: stocks[t].name || t,
         data: allDates.map(d => priceMap[d] != null ? +((priceMap[d]/base)*100).toFixed(2) : null),
         borderColor: COLORS[i % COLORS.length],
         backgroundColor: 'transparent',
