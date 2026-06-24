@@ -490,20 +490,29 @@ def _ema(data, period):
         result.append(v * k + result[-1] * (1 - k))
     return result
 
-def _rsi(closes, period=14):
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    if len(gains) < period:
-        return 50.0
+def _sma(arr, period, off=0):
+    """끝에서 off개 떨어진 지점 기준 단순이동평균. 데이터 부족 시 None."""
+    end = len(arr) - off
+    if end < period:
+        return None
+    return sum(arr[end - period:end]) / period
+
+def _rsi_series(closes, period=14):
+    """각 시점의 RSI를 리스트로 반환 (warmup 구간은 None). 다이버전스 탐지용."""
+    n = len(closes)
+    out = [None] * n
+    if n < period + 1:
+        return out
+    gains = [max(closes[i] - closes[i - 1], 0) for i in range(1, n)]
+    losses = [max(closes[i - 1] - closes[i], 0) for i in range(1, n)]
     ag = sum(gains[:period]) / period
     al = sum(losses[:period]) / period
+    out[period] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
     for i in range(period, len(gains)):
         ag = (ag * (period - 1) + gains[i]) / period
         al = (al * (period - 1) + losses[i]) / period
-    return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+        out[i + 1] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    return out
 
 @app.route('/api/signal/<path:ticker>')
 def signal(ticker):
@@ -512,62 +521,124 @@ def signal(ticker):
         return jsonify({'success': True, 'data': cached})
     try:
         t = yf.Ticker(ticker)
-        hist = t.history(period='1y', interval='1d')
-        if hist.empty or len(hist) < 30:
-            return jsonify({'success': False, 'error': '데이터 부족 (최소 30일 필요)'}), 422
+        # 200일선·기울기 판정을 위해 2년치 일봉 확보 (요청 수는 1회로 동일)
+        hist = t.history(period='2y', interval='1d')
+        if hist.empty or len(hist) < 60:
+            return jsonify({'success': False, 'error': '데이터 부족 (최소 60거래일 필요)'}), 422
 
         closes = [float(v) for v in hist['Close'].tolist()]
+        vols   = [float(v) for v in hist['Volume'].tolist()]
         price = closes[-1]
+        n = len(closes)
 
-        # ── RSI(14) ──
-        rsi = _rsi(closes, 14)
-        if rsi < 30:   rsi_s = 90
-        elif rsi < 40: rsi_s = 75
-        elif rsi < 50: rsi_s = 58
-        elif rsi < 60: rsi_s = 45
-        elif rsi < 70: rsi_s = 28
-        else:          rsi_s = 12
+        # ── 1단계: 추세 판정 (모든 매수신호의 대전제) ──────────────
+        ma20  = _sma(closes, 20)
+        ma60  = _sma(closes, 60)
+        ma120 = _sma(closes, 120)
+        ma200 = _sma(closes, 200)
+        lt = ma200 or ma120 or ma60                 # 장기 추세 기준선
+        ma60_prev = _sma(closes, 60, 20)            # 20거래일 전 60일선 → 기울기
+        slope60 = (ma60 - ma60_prev) if (ma60 and ma60_prev) else 0.0
+        rising60 = slope60 > 0
 
-        # ── 이동평균 ──
-        ma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else None
-        ma60 = sum(closes[-60:]) / 60 if len(closes) >= 60 else None
-        if ma20 and ma60:
-            if price > ma20 > ma60:   ma_s = 80  # 정배열
-            elif price > ma20:        ma_s = 65
-            elif price < ma20 < ma60: ma_s = 20  # 역배열
-            else:                     ma_s = 35
+        above_lt = bool(lt and price > lt)
+        align_up = bool(ma20 and ma60 and price > ma20 > ma60 and (not ma120 or ma60 > ma120))
+        align_dn = bool(ma20 and ma60 and price < ma20 < ma60 and (not ma120 or ma60 < ma120))
+        if align_up and above_lt and rising60:
+            regime, regime_label, trend_s = 'strong_up', '강한 상승추세', 90
+        elif above_lt and rising60:
+            regime, regime_label, trend_s = 'up', '상승추세', 72
+        elif align_dn and not above_lt and not rising60:
+            regime, regime_label, trend_s = 'strong_down', '강한 하락추세', 8
+        elif (not above_lt) and not rising60:
+            regime, regime_label, trend_s = 'down', '하락추세', 22
         else:
-            ma_s = 50
+            regime, regime_label, trend_s = 'range', '횡보', 50
+        is_up   = regime in ('up', 'strong_up')
+        is_down = regime in ('down', 'strong_down')
 
-        # ── MACD(12,26,9) ──
-        ema12 = _ema(closes, 12)
-        ema26 = _ema(closes, 26)
+        # ── 2단계: RSI(14) + 강세 다이버전스 ──────────────────────
+        rsi_arr = _rsi_series(closes, 14)
+        rsi = rsi_arr[-1] if rsi_arr[-1] is not None else 50.0
+        # 강세 다이버전스: 최근 저점이 직전 저점보다 낮은데 RSI는 더 높음 = 하락동력 약화
+        bull_div = False
+        if n >= 35 and all(x is not None for x in rsi_arr[-30:]):
+            recent, prior = closes[-12:], closes[-30:-12]
+            ri = n - 12 + recent.index(min(recent))
+            pi = n - 30 + prior.index(min(prior))
+            if closes[ri] < closes[pi] and rsi_arr[ri] > rsi_arr[pi] + 2:
+                bull_div = True
+        # RSI 해석은 추세 맥락에 따라 정반대 (정설: 추세장 vs 횡보장)
+        if is_up:
+            if   rsi < 40: rsi_s = 78   # 상승추세 깊은 눌림 = 기회
+            elif rsi < 55: rsi_s = 88   # 건강한 눌림 = 최적 매수존
+            elif rsi < 70: rsi_s = 60
+            else:          rsi_s = 32   # 과매수 = 추격 자제(매도 아님)
+        elif is_down:
+            if   rsi < 30: rsi_s = 25   # 과매도 = 떨어지는 칼날(함정)
+            elif rsi < 50: rsi_s = 32
+            else:          rsi_s = 38   # 하락 중 반등 = 되돌림, 위험
+        else:                            # 횡보: 고전적 평균회귀
+            if   rsi < 30: rsi_s = 88
+            elif rsi < 45: rsi_s = 68
+            elif rsi < 55: rsi_s = 50
+            elif rsi < 70: rsi_s = 38
+            else:          rsi_s = 18
+        if bull_div:
+            rsi_s = min(100, rsi_s + 15)
+
+        # ── 3단계: MACD(12,26,9) — 제로라인·히스토그램 모멘텀 반영 ──
+        ema12 = _ema(closes, 12); ema26 = _ema(closes, 26)
         macd_line = [a - b for a, b in zip(ema12, ema26)]
         sig_line  = _ema(macd_line, 9)
         macd_val, sig_val = macd_line[-1], sig_line[-1]
         macd_cross = macd_val > sig_val and macd_line[-2] <= sig_line[-2]
-        macd_s = 85 if macd_cross else (62 if macd_val > sig_val else 38)
-
-        # ── 볼린저 밴드(20,2) ──
-        if len(closes) >= 20:
-            r20 = closes[-20:]
-            bb_mid = sum(r20) / 20
-            std = (sum((x - bb_mid) ** 2 for x in r20) / 20) ** 0.5
-            bb_upper = bb_mid + 2 * std
-            bb_lower = bb_mid - 2 * std
-            span = bb_upper - bb_lower
-            bb_pct = (price - bb_lower) / span if span > 0 else 0.5
+        hist_rising = (macd_val - sig_val) > (macd_line[-2] - sig_line[-2])
+        if macd_cross:
+            macd_s = 92 if macd_val > 0 else 82           # 제로라인 위 크로스가 더 강함
+        elif macd_val > sig_val:
+            macd_s = (72 if macd_val > 0 else 60) + (4 if hist_rising else -6)
         else:
-            bb_mid = bb_upper = bb_lower = None
-            bb_pct = 0.5
-        if bb_pct < 0.10:   bb_s = 90
-        elif bb_pct < 0.25: bb_s = 75
-        elif bb_pct < 0.50: bb_s = 55
-        elif bb_pct < 0.75: bb_s = 42
-        elif bb_pct < 0.90: bb_s = 28
-        else:               bb_s = 12
+            macd_s = (46 if macd_val > 0 else 30) + (6 if hist_rising else 0)
+        macd_s = max(0, min(100, macd_s))
 
-        tech_score = round(rsi_s * 0.35 + ma_s * 0.30 + macd_s * 0.20 + bb_s * 0.15)
+        # ── 4단계: 볼린저 밴드(20,2) — 추세 맥락 반영 ─────────────
+        r20 = closes[-20:]
+        bb_mid = sum(r20) / 20
+        std = (sum((x - bb_mid) ** 2 for x in r20) / 20) ** 0.5
+        bb_upper, bb_lower = bb_mid + 2 * std, bb_mid - 2 * std
+        span = bb_upper - bb_lower
+        bb_pct = (price - bb_lower) / span if span > 0 else 0.5
+        if is_down:                                       # 하락추세 하단터치 = '밴드 타기'(지속)
+            bb_s = 30 if bb_pct < 0.25 else (40 if bb_pct < 0.75 else 25)
+        else:
+            if   bb_pct < 0.15: bb_s = 85
+            elif bb_pct < 0.40: bb_s = 65
+            elif bb_pct < 0.65: bb_s = 52
+            elif bb_pct < 0.90: bb_s = 38
+            else:               bb_s = 22                 # 상단 과확장
+        if bull_div and bb_pct < 0.3:
+            bb_s = min(100, bb_s + 8)
+
+        # ── 5단계: 거래량 확인 (정설: 거래량은 가격에 선행) ────────
+        vol_ma20 = (sum(vols[-20:]) / 20) if (len(vols) >= 20 and sum(vols[-20:]) > 0) else None
+        vol_ratio = (vols[-1] / vol_ma20) if vol_ma20 else 1.0
+        up_bar = closes[-1] >= closes[-2]
+        if up_bar:
+            vol_s = 88 if vol_ratio >= 1.8 else (68 if vol_ratio >= 1.1 else 50)
+        else:
+            vol_s = 22 if vol_ratio >= 1.8 else (38 if vol_ratio >= 1.1 else 48)
+
+        # ── 6단계: 종합 + 추세 게이트 ─────────────────────────────
+        tech_raw = round(trend_s * 0.30 + rsi_s * 0.22 + macd_s * 0.22 + bb_s * 0.12 + vol_s * 0.14)
+        # 하락추세에선 반전이 '확인'되지 않으면 매수등급으로 못 올림 (떨어지는 칼날 방지)
+        reversal_confirmed = bull_div and up_bar and vol_ratio >= 1.2 and macd_val > sig_val
+        gated = is_down and not reversal_confirmed
+        tech_score = min(tech_raw, 45) if gated else tech_raw
+        # 추격매수 방지: 20일선 대비 이격 과대하면 소폭 감점
+        ext = ((price / ma20) - 1) if ma20 else 0.0
+        if ext > 0.15 and not gated:
+            tech_score = max(0, tech_score - 8)
 
         # ── 펀더멘털 ──
         info = t.info
@@ -638,27 +709,75 @@ def signal(ticker):
 
         combined = round(tech_score * 0.55 + fund_score * 0.45)
 
-        if combined >= 68:   label = '매수 고려'
-        elif combined >= 48: label = '관망'
-        else:                label = '주의'
+        def lab(s):
+            if s >= 68: return '매수 고려'
+            if s >= 48: return '관망'
+            return '주의'
+        label = lab(combined)
+
+        # ── 차트를 몰라도 읽히는 근거 문장 (중요도 순) ──
+        reasons = []
+        reasons.append({
+            'strong_up': '강한 상승추세 — 장기선 위, 정배열·우상향',
+            'up':        '상승추세 — 장기선 위, 60일선 우상향',
+            'range':     '횡보 — 뚜렷한 방향성 없음, 박스권 대응',
+            'down':      '하락추세 — 장기선 아래, 60일선 하락',
+            'strong_down': '강한 하락추세 — 역배열, 매수 신중',
+        }[regime])
+        if is_up:
+            if rsi < 55:   reasons.append(f'상승추세 속 눌림목(RSI {rsi:.0f}) — 매수 유리 구간')
+            elif rsi >= 70: reasons.append(f'과매수(RSI {rsi:.0f}) — 추격 자제, 눌림 대기')
+        elif is_down:
+            reasons.append('하락추세라 과매도·밴드 하단은 함정 가능 → 매수신호 억제')
+        else:
+            if rsi < 30:   reasons.append(f'횡보 속 과매도(RSI {rsi:.0f}) — 평균회귀 매수 후보')
+            elif rsi > 70: reasons.append(f'횡보 속 과매수(RSI {rsi:.0f}) — 비중 확대 부적절')
+        if macd_cross:
+            reasons.append('MACD 골든크로스 발생' + (' (제로라인 위, 강한 신호)' if macd_val > 0 else ' (바닥권 반등 조짐)'))
+        elif macd_val > sig_val and hist_rising:
+            reasons.append('MACD 상승 모멘텀 강화 중')
+        elif macd_val < sig_val and not hist_rising:
+            reasons.append('MACD 하락 모멘텀 — 진입 보류')
+        if bull_div:
+            reasons.append('강세 다이버전스 — 하락 동력 약화, 반전 가능성')
+        if up_bar and vol_ratio >= 1.8:
+            reasons.append(f'거래량 급증({vol_ratio:.1f}배) 동반 상승 — 매수세 확인')
+        elif (not up_bar) and vol_ratio >= 1.8:
+            reasons.append(f'거래량 급증({vol_ratio:.1f}배) 동반 하락 — 매도압력')
+        elif up_bar and vol_ratio < 0.8:
+            reasons.append('상승하지만 거래량 부족 — 신뢰도 낮음')
+        if ext > 0.15:
+            reasons.append(f'20일선 대비 +{ext*100:.0f}% 과열 — 추격 주의')
+        if gated:
+            reasons.append('※ 하락추세 미확인 반전 → 매수등급 제한(관망 이하)')
 
         data = {
             'combined': combined,
             'tech_score': tech_score,
             'fund_score': fund_score,
             'signal': label,
+            'tech_label': lab(tech_score),
+            'fund_label': lab(fund_score),
+            'regime': regime,
+            'regime_label': regime_label,
+            'reasons': reasons,
             'indicators': {
                 'rsi': round(rsi, 1),
-                'ma20': round(ma20, 2) if ma20 else None,
-                'ma60': round(ma60, 2) if ma60 else None,
+                'ma20':  round(ma20, 2)  if ma20  else None,
+                'ma60':  round(ma60, 2)  if ma60  else None,
+                'ma120': round(ma120, 2) if ma120 else None,
+                'ma200': round(ma200, 2) if ma200 else None,
                 'price': round(price, 2),
                 'macd': round(macd_val, 4),
                 'macd_signal': round(sig_val, 4),
                 'macd_cross': macd_cross,
-                'bb_upper': round(bb_upper, 2) if bb_upper else None,
-                'bb_mid':   round(bb_mid, 2)   if bb_mid   else None,
-                'bb_lower': round(bb_lower, 2) if bb_lower else None,
+                'bb_upper': round(bb_upper, 2),
+                'bb_mid':   round(bb_mid, 2),
+                'bb_lower': round(bb_lower, 2),
                 'bb_pct': round(bb_pct * 100, 1),
+                'vol_ratio': round(vol_ratio, 2),
+                'bull_div': bull_div,
+                'ext': round(ext * 100, 1),
             },
             'fundamentals': {
                 'per': per, 'pbr': pbr, 'roe': roe,

@@ -640,11 +640,35 @@ function renderSignalCard(ticker) {
     return '혼조';
   })();
 
+  // 추세(regime) 칩: 매수신호의 대전제 — 색/이모지로 한눈에
+  const REGIME = {
+    strong_up:   { emoji: '🚀', color: 'var(--green)'  },
+    up:          { emoji: '📈', color: 'var(--green)'  },
+    range:       { emoji: '↔️', color: 'var(--yellow)' },
+    down:        { emoji: '📉', color: 'var(--red)'    },
+    strong_down: { emoji: '⛔', color: 'var(--red)'    },
+  };
+  const rg = REGIME[sig.regime] || REGIME.range;
+
+  const volTxt = ind.vol_ratio >= 1.8 ? `${ind.vol_ratio}배 🔥급증`
+               : ind.vol_ratio >= 1.1 ? `${ind.vol_ratio}배 ↑`
+               : ind.vol_ratio < 0.8  ? `${ind.vol_ratio}배 한산`
+               : '평소 수준';
+
   const techItems =
+    indItem('추세', `<span style="color:${rg.color}">${rg.emoji} ${esc(sig.regime_label || '-')}</span>`) +
     indItem('RSI (14)', `${ind.rsi} ${ind.rsi < 30 ? '📉 과매도' : ind.rsi > 70 ? '📈 과매수' : ''}`) +
-    indItem('이동평균', maStatus) +
     indItem('MACD', ind.macd_cross ? '🔔 골든크로스' : ind.macd > ind.macd_signal ? '상승세' : '하락세') +
-    indItem('볼린저 위치', `${ind.bb_pct}% ${ind.bb_pct < 25 ? '🔵 하단' : ind.bb_pct > 75 ? '🔴 상단' : '중립'}`);
+    indItem('이동평균', maStatus) +
+    indItem('볼린저 위치', `${ind.bb_pct}% ${ind.bb_pct < 25 ? '🔵 하단' : ind.bb_pct > 75 ? '🔴 상단' : '중립'}`) +
+    indItem('거래량', `${volTxt}${ind.bull_div ? ' · ✨다이버전스' : ''}`);
+
+  // 근거 문장 — 차트를 몰라도 "왜 이 점수인지" 읽히게
+  const reasonsHtml = (sig.reasons && sig.reasons.length)
+    ? `<ul style="margin:10px 0 0;padding-left:18px;font-size:12px;color:var(--muted);line-height:1.7">
+        ${sig.reasons.map(r => `<li>${esc(r)}</li>`).join('')}
+       </ul>`
+    : '';
 
   const fundItems =
     indItem('PER', fund.per != null ? fund.per.toFixed(1)+'x' : '-') +
@@ -658,8 +682,10 @@ function renderSignalCard(ticker) {
         <div class="signal-name">${esc(name)}</div>
         <div class="signal-ticker-label">${esc(ticker)}</div>
       </div>
+      <span class="signal-badge" style="margin-top:0;background:transparent;border:1px solid ${rg.color};color:${rg.color}">${rg.emoji} ${esc(sig.regime_label || '')}</span>
     </div>
     ${block('📈 기술적 분석 (차트)', sig.tech_score, techItems)}
+    ${reasonsHtml}
     ${block('💰 펀더멘털 (가치)', sig.fund_score, fundItems)}
   </div>`;
 }
