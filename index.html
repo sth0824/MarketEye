@@ -88,6 +88,11 @@
   .down { color: var(--red); }
   .card-remove { position: absolute; top: 10px; right: 10px; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 16px; padding: 2px 6px; border-radius: 4px; }
   .card-remove:hover { background: var(--surface2); color: var(--red); }
+  .card-fav { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; padding: 0; line-height: 1; flex-shrink: 0; }
+  .card-fav:hover { color: var(--yellow); }
+  .card-fav.on { color: var(--yellow); }
+  .group-pill.fav-pill { border-color: rgba(210,153,34,.5); }
+  .group-pill.fav-pill.active { background: var(--yellow); border-color: var(--yellow); color: #1a1a1a; }
   .card-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .metric { background: var(--surface2); border-radius: 6px; padding: 8px; }
   .metric-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
@@ -303,6 +308,32 @@ function curGroup() { return groups.find(g => g.id === activeId) || groups[0]; }
 // 현재 그룹에서 데이터 로드가 끝난 티커들을 사용자가 정한 순서대로 반환
 function orderedTickers() { const g = curGroup(); return g ? g.tickers.filter(t => stocks[t]) : []; }
 
+// ---- 즐겨찾기(항상 존재하는 특수 그룹) ----
+// 별도 데이터 구조 대신 '특수 그룹'으로 두어 기존 동기화·렌더 로직을 그대로 재사용한다.
+const FAV_ID = '__fav__';
+function favGroup() { return groups.find(g => g.id === FAV_ID); }
+function ensureFav() {  // 즐겨찾기 그룹이 없으면 맨 앞에 생성
+  if (!groups.some(g => g.id === FAV_ID)) {
+    groups.unshift({ id: FAV_ID, name: '⭐ 즐겨찾기', tickers: [] });
+  }
+}
+function isFav(t) { const f = favGroup(); return !!(f && f.tickers.includes(t)); }
+function toggleFav(t) {
+  const f = favGroup(); if (!f) return;
+  const i = f.tickers.indexOf(t);
+  if (i >= 0) f.tickers.splice(i, 1); else f.tickers.push(t);
+  saveState();
+  renderGroupBar();
+  const btn = document.getElementById('fav-' + t);
+  if (btn) {
+    const on = isFav(t);
+    btn.textContent = on ? '★' : '☆';
+    btn.classList.toggle('on', on);
+    btn.title = on ? '즐겨찾기 해제' : '즐겨찾기 추가';
+  }
+  if (curGroup() && curGroup().id === FAV_ID) renderCards();  // 즐겨찾기 보는 중이면 갱신
+}
+
 const POPULAR = ['AAPL','MSFT','GOOGL','AMZN','NVDA','TSLA','META','NFLX','ORCL','AMD',
   '005930.KS','000660.KS','035420.KS','035720.KS','068270.KS','207940.KS'];
 
@@ -499,8 +530,11 @@ async function pullSync(pushIfEmpty) {
       // 서버에 데이터가 없는 신규 코드 → 기본 그룹 생성
       groups = [{ id: genId(), name: '내 관심종목', tickers: [] }];
       activeId = groups[0].id;
+      ensureFav();
       if (pushIfEmpty) await pushSyncNow();
     }
+    ensureFav();
+    if (!groups.some(g => g.id === activeId)) activeId = (favGroup() ? groups.find(g => g.id !== FAV_ID) || groups[0] : groups[0]).id;
     renderGroupBar();
     loadActiveGroup();
     updateSyncUI();
@@ -791,14 +825,16 @@ async function runBacktest(ticker) {
 function renderGroupBar() {
   const bar = document.getElementById('group-bar');
   if (!bar) return;
-  bar.innerHTML = groups.map(g =>
-    `<div class="group-pill ${g.id === activeId ? 'active' : ''}" onclick="switchGroup('${g.id}')" ondblclick="renameGroup('${g.id}')" title="더블클릭하면 이름 변경">
+  const realCount = groups.filter(g => g.id !== FAV_ID).length;
+  bar.innerHTML = groups.map(g => {
+    const fav = g.id === FAV_ID;
+    return `<div class="group-pill ${g.id === activeId ? 'active' : ''} ${fav ? 'fav-pill' : ''}" onclick="switchGroup('${g.id}')" ${fav ? '' : `ondblclick="renameGroup('${g.id}')"`} title="${fav ? '즐겨찾기 모음' : '더블클릭하면 이름 변경'}">
        <span>${esc(g.name)}</span>
        <span class="group-count">${g.tickers.length}</span>
-       <button class="group-edit" onclick="event.stopPropagation();renameGroup('${g.id}')" title="이름 변경">✎</button>
-       ${groups.length > 1 ? `<button class="group-del" onclick="event.stopPropagation();deleteGroup('${g.id}')" title="그룹 삭제">✕</button>` : ''}
-     </div>`
-  ).join('') + `<button class="group-add" onclick="newGroup()">+ 새 그룹</button>`;
+       ${fav ? '' : `<button class="group-edit" onclick="event.stopPropagation();renameGroup('${g.id}')" title="이름 변경">✎</button>`}
+       ${(!fav && realCount > 1) ? `<button class="group-del" onclick="event.stopPropagation();deleteGroup('${g.id}')" title="그룹 삭제">✕</button>` : ''}
+     </div>`;
+  }).join('') + `<button class="group-add" onclick="newGroup()">+ 새 그룹</button>`;
 }
 
 function switchGroup(id) {
@@ -821,6 +857,7 @@ function newGroup() {
 }
 
 function renameGroup(id) {
+  if (id === FAV_ID) return;  // 즐겨찾기는 이름 변경 불가
   const g = groups.find(x => x.id === id);
   if (!g) return;
   const name = prompt('그룹 이름 변경:', g.name);
@@ -831,12 +868,13 @@ function renameGroup(id) {
 }
 
 function deleteGroup(id) {
-  if (groups.length <= 1) { showError('마지막 그룹은 삭제할 수 없습니다'); return; }
+  if (id === FAV_ID) { showError('즐겨찾기는 삭제할 수 없습니다'); return; }
+  if (groups.filter(x => x.id !== FAV_ID).length <= 1) { showError('마지막 그룹은 삭제할 수 없습니다'); return; }
   const g = groups.find(x => x.id === id);
   if (!g) return;
   if (!confirm(`'${g.name}' 그룹을 삭제할까요?`)) return;
   groups = groups.filter(x => x.id !== id);
-  if (activeId === id) activeId = groups[0].id;
+  if (activeId === id) activeId = (groups.find(x => x.id !== FAV_ID) || groups[0]).id;
   saveState();
   renderGroupBar();
   loadActiveGroup();
@@ -878,10 +916,13 @@ function renderCards() {
     const chgCls = chg >= 0 ? 'up' : 'down';
     const chgSign = chg >= 0 ? '+' : '';
     card.innerHTML = `
-      <button class="card-remove" onclick="removeTicker('${ticker}')">✕</button>
+      <button class="card-remove" onclick="removeTicker('${ticker}')" title="현재 그룹에서 제거">✕</button>
       <div class="card-header">
-        <div>
-          <div class="card-ticker">${esc(d.name)}</div>
+        <div style="min-width:0">
+          <div style="display:flex;align-items:center;gap:6px">
+            <button id="fav-${ticker}" class="card-fav ${isFav(ticker) ? 'on' : ''}" onclick="toggleFav('${ticker}')" title="${isFav(ticker) ? '즐겨찾기 해제' : '즐겨찾기 추가'}">${isFav(ticker) ? '★' : '☆'}</button>
+            <div class="card-ticker">${esc(d.name)}</div>
+          </div>
           <div class="card-name">${esc(ticker)}</div>
           <div style="font-size:10px;color:var(--muted);margin-top:2px">${esc(d.sector)}</div>
         </div>
