@@ -692,11 +692,51 @@ function renderSignalCard(ticker) {
       </div>`
     : '';
 
+  // 5대 축 점수 막대 + 확장 지표 + 근거 (전문가형 펀더멘털)
+  const m = (fund && fund.metrics) || {};
+  const pil = (fund && fund.pillars) || {};
+  const PILLAR_LABELS = { valuation:'밸류에이션', profitability:'수익성·질', growth:'성장성', health:'재무건전성', cashflow:'현금흐름' };
+  const pillarBars = Object.keys(PILLAR_LABELS).map(k => {
+    const v = pil[k];
+    const col = v == null ? 'var(--muted)' : scoreColor(v);
+    return `<div class="signal-bar-row">
+      <span class="signal-bar-label">${PILLAR_LABELS[k]}</span>
+      <span class="signal-bar-track"><span class="signal-bar-fill" style="width:${v == null ? 0 : v}%;background:${col}"></span></span>
+      <span class="signal-bar-val">${v == null ? '-' : v}</span>
+    </div>`;
+  }).join('');
+
   const fundItems =
-    indItem('PER', fund.per != null ? fund.per.toFixed(1)+'x' : '-') +
-    indItem('PBR', fund.pbr != null ? fund.pbr.toFixed(2)+'x' : '-') +
-    indItem('ROE', fund.roe != null ? (fund.roe*100).toFixed(1)+'%' : '-') +
-    indItem('순이익률', fund.margin != null ? (fund.margin*100).toFixed(1)+'%' : '-');
+    indItem('PER', m.per != null ? m.per.toFixed(1)+'x' : '-') +
+    indItem('PBR', m.pbr != null ? m.pbr.toFixed(2)+'x' : '-') +
+    indItem('PEG', m.peg != null ? m.peg.toFixed(2) : '-') +
+    indItem('PSR', m.psr != null ? m.psr.toFixed(2)+'x' : '-') +
+    indItem('EV/EBITDA', m.evEbitda != null ? m.evEbitda.toFixed(1) : '-') +
+    indItem('ROE', m.roe != null ? (m.roe*100).toFixed(1)+'%' : '-') +
+    indItem('영업이익률', m.operatingMargin != null ? (m.operatingMargin*100).toFixed(1)+'%' : '-') +
+    indItem('매출성장', m.revenueGrowth != null ? (m.revenueGrowth*100).toFixed(1)+'%' : '-') +
+    indItem('부채비율', m.debtToEquity != null ? m.debtToEquity.toFixed(0)+'%' : '-') +
+    indItem('FCF마진', m.fcfMargin != null ? m.fcfMargin+'%' : '-');
+
+  const fundReasonsHtml = (fund && fund.reasons && fund.reasons.length)
+    ? `<ul style="margin:8px 0 0;padding-left:18px;font-size:12px;color:var(--muted);line-height:1.7">
+        ${fund.reasons.map(r => `<li>${esc(r)}</li>`).join('')}
+       </ul>`
+    : '';
+
+  const lbF = scoreLabel(sig.fund_score);
+  const fundBlock = `<div class="signal-block">
+    <div class="signal-block-head">
+      <span class="signal-block-title">💰 펀더멘털 (가치)</span>
+      <span class="signal-block-score">
+        <span class="signal-badge ${lbF.cls}" style="margin-top:0">${lbF.emoji} ${lbF.text}</span>
+        <b style="color:${scoreColor(sig.fund_score)};font-size:18px;margin-left:6px">${sig.fund_score}</b><span style="color:var(--muted);font-size:11px">/100</span>
+      </span>
+    </div>
+    <div class="signal-bars">${pillarBars}</div>
+    <div class="signal-indicators">${fundItems}</div>
+    ${fundReasonsHtml}
+  </div>`;
 
   return `<div class="signal-card">
     <div class="signal-card-header">
@@ -713,7 +753,7 @@ function renderSignalCard(ticker) {
       <button class="secondary" style="font-size:12px;padding:6px 12px;width:100%" onclick="runBacktest('${ticker}')">📊 이 전략 2년 백테스트</button>
       <div id="bt-${ticker}" style="margin-top:8px"></div>
     </div>
-    ${block('💰 펀더멘털 (가치)', sig.fund_score, fundItems)}
+    ${fundBlock}
   </div>`;
 }
 

@@ -823,6 +823,146 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
         },
     }
 
+def _fundamental_signal(info, per, pbr):
+    """5대 축 펀더멘털 점수 (전문가형). yfinance info + 계산된 PER/PBR 사용.
+    밸류에이션(PEG·다중지표) / 수익성·질 / 성장성 / 재무건전성 / 현금흐름.
+    각 축은 가용 지표 평균, 누락 축은 가중치 재정규화로 처리. 네트워크 불필요."""
+    g = lambda k: safe_val(info.get(k))
+    roe = g('returnOnEquity'); roa = g('returnOnAssets')
+    op_m = g('operatingMargins'); net_m = g('profitMargins')
+    rev_g = g('revenueGrowth'); earn_g = g('earningsGrowth')
+    debt = g('debtToEquity'); cur = g('currentRatio')
+    cash = g('totalCash'); tdebt = g('totalDebt')
+    fcf = g('freeCashflow'); rev = g('totalRevenue'); mcap = g('marketCap')
+    fpe = g('forwardPE'); psr = g('priceToSalesTrailing12Months'); evb = g('enterpriseToEbitda')
+
+    def avg(vals):
+        xs = [v for v in vals if v is not None]
+        return (sum(xs) / len(xs)) if xs else None
+
+    # ── 1) 밸류에이션 (성장 보정 PEG + 다중 지표 교차) ──
+    def sc_per(p):
+        if p is None or p <= 0: return None         # 적자는 이익기반 지표 제외
+        gg = earn_g * 100 if earn_g is not None else None
+        if gg and gg > 0:                            # 성장률 있으면 PEG로 (성장주 보정)
+            peg = p / gg
+            return 95 if peg < 0.75 else 85 if peg < 1.0 else 70 if peg < 1.5 else 50 if peg < 2.0 else 32 if peg < 3.0 else 18
+        return 85 if p < 10 else 72 if p < 15 else 58 if p < 20 else 42 if p < 30 else 28 if p < 50 else 15
+    def sc_pbr(pb):
+        if pb is None or pb <= 0: return None
+        r = roe * 100 if roe is not None else None
+        if r is not None and r > 0:                  # ROE 높으면 높은 PBR 정당화 (정당PBR≈ROE/요구수익률)
+            ratio = pb / r
+            return 92 if ratio < 0.06 else 75 if ratio < 0.10 else 58 if ratio < 0.14 else 42 if ratio < 0.20 else 25
+        if r is not None and r <= 0: return 22
+        return 88 if pb < 1 else 70 if pb < 2 else 52 if pb < 3 else 35 if pb < 5 else 20
+    def sc_psr(s):
+        if s is None or s <= 0: return None
+        return 88 if s < 1 else 72 if s < 2 else 55 if s < 4 else 35 if s < 8 else 20
+    def sc_evb(x):
+        if x is None or x <= 0: return None
+        return 90 if x < 6 else 72 if x < 10 else 55 if x < 14 else 38 if x < 20 else 20
+    def sc_fcfy(f, m):
+        if not f or not m or m <= 0: return None
+        y = f / m * 100
+        return 92 if y > 8 else 80 if y > 5 else 65 if y > 3 else 50 if y > 0 else 25
+    valuation = avg([sc_per(per), sc_pbr(pbr), sc_psr(psr), sc_evb(evb), sc_fcfy(fcf, mcap)])
+
+    # ── 2) 수익성·질 (부채로 부풀린 ROE 보정) ──
+    def sc_roe(r):
+        if r is None: return None
+        p = r * 100
+        base = 95 if p > 25 else 80 if p > 15 else 65 if p > 10 else 45 if p > 5 else 22 if p > 0 else 10
+        if debt is not None and debt > 200 and base > 50: base -= 15
+        return base
+    def sc_roa(r):
+        if r is None: return None
+        p = r * 100
+        return 92 if p > 12 else 75 if p > 7 else 58 if p > 3 else 40 if p > 0 else 18
+    def sc_m(m):
+        if m is None: return None
+        p = m * 100
+        return 90 if p > 20 else 75 if p > 12 else 58 if p > 6 else 40 if p > 0 else 18
+    profitability = avg([sc_roe(roe), sc_roa(roa), sc_m(op_m), sc_m(net_m)])
+
+    # ── 3) 성장성 ──
+    def sc_g(x):
+        if x is None: return None
+        p = x * 100
+        return 95 if p > 30 else 85 if p > 20 else 72 if p > 12 else 58 if p > 6 else 45 if p > 0 else 28 if p > -10 else 15
+    growth = avg([sc_g(rev_g), sc_g(earn_g)])
+
+    # ── 4) 재무 건전성 ──
+    def sc_debt(d):
+        if d is None: return None
+        r = d / 100
+        return 92 if r < 0.3 else 78 if r < 0.6 else 60 if r < 1.0 else 42 if r < 2.0 else 22
+    def sc_cur(c):
+        if c is None: return None
+        return 90 if c > 2 else 75 if c > 1.5 else 58 if c > 1 else 35
+    def sc_nc(c, d):
+        if c is None or d is None: return None
+        if d == 0: return 95
+        return 90 if (c - d) > 0 else 60 if c / d > 0.5 else 40 if c / d > 0.2 else 25
+    health = avg([sc_debt(debt), sc_cur(cur), sc_nc(cash, tdebt)])
+
+    # ── 5) 현금흐름 (FCF 양수·마진) ──
+    def sc_fcf(f, r):
+        if f is None: return None
+        if f <= 0: return 22
+        if r and r > 0:
+            m = f / r * 100
+            return 92 if m > 15 else 78 if m > 8 else 62 if m > 3 else 48
+        return 60
+    cashflow = avg([sc_fcf(fcf, rev)])
+
+    pillars = {'valuation': valuation, 'profitability': profitability,
+               'growth': growth, 'health': health, 'cashflow': cashflow}
+    weights = {'valuation': 0.28, 'profitability': 0.24, 'growth': 0.20, 'health': 0.16, 'cashflow': 0.12}
+    avail = {k: v for k, v in pillars.items() if v is not None}
+    if avail:
+        wsum = sum(weights[k] for k in avail)
+        fund_score = round(sum(avail[k] * weights[k] for k in avail) / wsum)
+    else:
+        fund_score = 50
+
+    # ── 근거 문장 ──
+    peg_val = (per / (earn_g * 100)) if (per and per > 0 and earn_g and earn_g > 0) else None
+    reasons = []
+    if valuation is not None and valuation >= 68:
+        reasons.append('밸류에이션 매력적' + (f' — PEG {peg_val:.1f} (성장 대비 저평가)' if (peg_val and peg_val < 1) else ''))
+    elif valuation is not None and valuation < 40:
+        reasons.append('밸류에이션 부담' + (f' — PEG {peg_val:.1f} (성장 대비 고평가)' if (peg_val and peg_val > 2) else ''))
+    if per is None or per <= 0:
+        reasons.append('적자 — 이익기반 지표 제외, 매출·현금흐름 위주 평가')
+    if roe is not None:
+        rp = roe * 100
+        if rp > 15:  reasons.append(f'높은 자본수익성(ROE {rp:.0f}%)' + (' — 단, 부채 과다로 질 낮음' if (debt and debt > 200) else ''))
+        elif rp < 5: reasons.append(f'낮은 자본수익성(ROE {rp:.0f}%)')
+    if growth is not None:
+        if growth >= 70:  reasons.append('성장성 우수 — 매출·이익 견조한 성장')
+        elif growth < 40: reasons.append('성장 정체 또는 역성장')
+    if health is not None:
+        if health >= 70:  reasons.append('재무 건전 — 낮은 부채·충분한 유동성')
+        elif health < 40: reasons.append('재무 부담 — 높은 부채 또는 유동성 취약')
+    if cashflow is not None:
+        if cashflow >= 62: reasons.append('견조한 잉여현금흐름(FCF)')
+        elif cashflow <= 22: reasons.append('잉여현금흐름 적자 — 현금 창출력 약함')
+
+    return {
+        'fund_score': fund_score,
+        'pillars': {k: (round(v) if v is not None else None) for k, v in pillars.items()},
+        'reasons': reasons,
+        'metrics': {
+            'per': per, 'forwardPer': fpe, 'pbr': pbr, 'psr': psr, 'evEbitda': evb,
+            'roe': roe, 'roa': roa, 'operatingMargin': op_m, 'netMargin': net_m,
+            'revenueGrowth': rev_g, 'earningsGrowth': earn_g,
+            'peg': (round(peg_val, 2) if peg_val else None),
+            'debtToEquity': debt, 'currentRatio': cur, 'freeCashflow': fcf,
+            'fcfMargin': (round(fcf / rev * 100, 1) if (fcf and rev and rev > 0) else None),
+        },
+    }
+
 @app.route('/api/signal/<path:ticker>')
 def signal(ticker):
     cached = _cache_get(('signal', ticker), 1800)
@@ -875,62 +1015,12 @@ def signal(ticker):
                 info['currentPrice'] = fi.last_price
         except Exception:
             pass
-        def sv(k): return info.get(k)
-
-        def s_per(v):
-            if v is None: return 50
-            if v < 0: return 20
-            if v < 10: return 90;
-            if v < 15: return 80
-            if v < 20: return 65
-            if v < 30: return 45
-            return 20
-
-        def s_pbr(v):
-            if v is None: return 50
-            if v < 1: return 90
-            if v < 2: return 75
-            if v < 3: return 55
-            return 25
-
-        def s_roe(v):
-            if v is None: return 50
-            p = v * 100
-            if p > 25: return 95
-            if p > 15: return 80
-            if p > 10: return 65
-            if p > 5:  return 45
-            return 20
-
-        def s_debt(v):
-            if v is None: return 50
-            r = v / 100
-            if r < 0.5: return 90
-            if r < 1.0: return 75
-            if r < 2.0: return 55
-            return 25
-
-        def s_margin(v):
-            if v is None: return 50
-            p = v * 100
-            if p > 20: return 90
-            if p > 10: return 75
-            if p > 5:  return 55
-            return 25
-
         # PER/PBR: yfinance 미제공(한국 종목 등) 시 분기 재무제표로 TTM 직접 계산
         # — 개요 카드와 동일한 폴백 로직을 재사용해 '-'로 비는 문제를 막는다.
         per, pbr, _, _ = _calc_per_pbr(info, t)
-        roe = sv('returnOnEquity'); debt = sv('debtToEquity')
-        margin = sv('profitMargins')
-
-        fund_score = round(
-            s_per(per)    * 0.30 +
-            s_pbr(pbr)    * 0.20 +
-            s_roe(roe)    * 0.25 +
-            s_debt(debt)  * 0.10 +
-            s_margin(margin) * 0.15
-        )
+        # 5대 축 전문가형 펀더멘털 점수
+        fs = _fundamental_signal(info, per, pbr)
+        fund_score = fs['fund_score']
 
         combined = round(tech_score * 0.55 + fund_score * 0.45)
 
@@ -952,10 +1042,7 @@ def signal(ticker):
             'reasons': ts['reasons'],
             'indicators': ts['indicators'],
             'plan': ts['plan'],
-            'fundamentals': {
-                'per': per, 'pbr': pbr, 'roe': roe,
-                'debt': debt, 'margin': margin,
-            }
+            'fundamentals': fs,
         }
         _cache_set(('signal', ticker), data)
         return jsonify({'success': True, 'data': data})
