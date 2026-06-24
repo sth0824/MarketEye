@@ -548,7 +548,7 @@ async function fetchSignal(ticker) {
     if (json.success) {
       signals[ticker] = json.data;
       // 개요 탭 카드 배지 갱신
-      updateSignalBadge(ticker, json.data);
+      if (activeTab === 'overview') updateSignalBadge(ticker, json.data);
       // 신호 탭이 열려 있으면 재렌더
       if (activeTab === 'signal') renderSignalTab();
     }
@@ -571,17 +571,19 @@ function scoreColor(s) {
   return 'var(--red)';
 }
 
+// 카드 innerHTML에 직접 넣는 배지 (카드가 다시 그려져도 유지됨)
+function signalBadgeHtml(ticker) {
+  const sig = signals[ticker];
+  if (!sig) return '';
+  const cls = signalClass(sig.signal);
+  return `<div class="signal-badge ${cls}">${signalEmoji(sig.signal)} ${sig.signal} <span style="opacity:.7;font-weight:400">${sig.combined}점</span></div>`;
+}
+
+// 이미 그려진 카드에 배지만 갱신 (신호가 가격보다 늦게 도착한 경우)
 function updateSignalBadge(ticker, sig) {
   const card = document.getElementById(`card-${ticker}`);
-  if (!card) return;
-  let badge = card.querySelector('.signal-badge');
-  if (!badge) {
-    badge = document.createElement('div');
-    card.appendChild(badge);
-  }
-  const cls = signalClass(sig.signal);
-  badge.className = `signal-badge ${cls}`;
-  badge.innerHTML = `${signalEmoji(sig.signal)} ${sig.signal} <span style="opacity:.7;font-weight:400">${sig.combined}점</span>`;
+  if (!card || card.querySelector('.signal-badge')) return;
+  card.insertAdjacentHTML('beforeend', signalBadgeHtml(ticker));
 }
 
 function renderSignalTab() {
@@ -778,6 +780,7 @@ function renderCards() {
         <span>Beta ${d.beta != null ? d.beta.toFixed(2) : '-'}</span>
       </div>
       ${d.targetPrice ? `<div style="margin-top:10px;font-size:11px;color:var(--muted)">목표주가 <span style="color:var(--yellow)">${fmt(d.targetPrice, d.currency)}</span> | 의견 <span style="color:var(--yellow)">${esc(d.recommendation)}</span></div>` : ''}
+      ${signalBadgeHtml(ticker)}
     `;
     attachDragHandlers(card, ticker);
     c.appendChild(card);
