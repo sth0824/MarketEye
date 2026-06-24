@@ -131,11 +131,12 @@
 
 <header>
   <h1>Market<span>Eye</span></h1>
-  <div id="refresh-info">자동새로고침 <span id="refresh-countdown">30s</span> · <span id="last-updated">-</span></div>
+  <div id="refresh-info">자동새로고침 <span id="refresh-countdown">30s</span> · <span id="last-updated">-</span> · <span id="sync-status"></span></div>
   <div id="search-bar" style="position:relative">
     <input id="ticker-input" type="text" placeholder="티커 입력 (예: AAPL, 삼성전자, 하이닉스)" autocomplete="off">
     <button onclick="addTicker()">추가</button>
     <button class="secondary" onclick="clearAll()">전체 삭제</button>
+    <button id="sync-btn" class="secondary" onclick="openSyncDialog()" title="기기 간 동기화">☁ 동기화</button>
     <div id="suggestions"></div>
   </div>
 </header>
@@ -193,6 +194,7 @@ let activeTab = 'overview';
 // ---- 그룹(워치리스트) 모델 ----
 let groups = [];      // [{id, name, tickers:[...]}]
 let activeId = null;  // 현재 선택된 그룹 id
+let syncCode = localStorage.getItem('marketeye_sync_code') || ''; // 기기 간 동기화 코드
 function genId() { return 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2,5); }
 function curGroup() { return groups.find(g => g.id === activeId) || groups[0]; }
 // 현재 그룹에서 데이터 로드가 끝난 티커들을 사용자가 정한 순서대로 반환
@@ -324,6 +326,7 @@ const GROUPS_KEY = 'marketeye_groups';
 const LEGACY_KEY = 'marketeye_tickers'; // 구버전 단일 목록 마이그레이션용
 function saveState() {
   try { localStorage.setItem(GROUPS_KEY, JSON.stringify({ groups, activeId })); } catch(e) {}
+  pushSync(); // 동기화 코드가 설정돼 있으면 서버에도 저장 (디바운스)
 }
 function restoreState() {
   let data = null;
@@ -341,6 +344,87 @@ function restoreState() {
   }
   renderGroupBar();
   loadActiveGroup();
+  updateSyncUI();
+  if (syncCode) pullSync(true); // 서버 데이터로 동기화 (서버가 비었으면 로컬을 올림)
+}
+
+// ---- 기기 간 동기화 (개인 코드 + 서버 저장) ----
+function updateSyncUI(status) {
+  const st = document.getElementById('sync-status');
+  const btn = document.getElementById('sync-btn');
+  if (btn) btn.textContent = syncCode ? '☁ 동기화 ✓' : '☁ 동기화';
+  if (!st) return;
+  if (status) { st.textContent = status; st.style.color = 'var(--yellow)'; return; }
+  st.textContent = syncCode ? `동기화: ${syncCode}` : '';
+  st.style.color = 'var(--muted)';
+}
+
+function openSyncDialog() {
+  const v = prompt(
+    '기기 간 동기화 코드를 입력하세요.\n' +
+    '같은 코드를 다른 기기(폰·PC)에서 입력하면 관심종목이 함께 동기화됩니다.\n' +
+    '※ 남이 추측하기 어려운 나만의 코드를 쓰세요. (비우고 확인하면 동기화 해제)',
+    syncCode || ''
+  );
+  if (v === null) return;
+  syncCode = v.trim();
+  if (syncCode) {
+    localStorage.setItem('marketeye_sync_code', syncCode);
+    pullSync(true);
+  } else {
+    localStorage.removeItem('marketeye_sync_code');
+    updateSyncUI();
+  }
+}
+
+// 서버 → 로컬: 서버 데이터가 있으면 그걸로 교체, 없고 pushIfEmpty면 로컬을 서버로 올림
+async function pullSync(pushIfEmpty) {
+  if (!syncCode) return;
+  updateSyncUI('동기화 중...');
+  try {
+    const res = await fetch(`${API}/sync/${encodeURIComponent(syncCode)}`);
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error || '동기화 실패');
+    if (json.data && Array.isArray(json.data.groups) && json.data.groups.length) {
+      groups = json.data.groups;
+      activeId = groups.some(g => g.id === json.data.activeId) ? json.data.activeId : groups[0].id;
+      try { localStorage.setItem(GROUPS_KEY, JSON.stringify({ groups, activeId })); } catch(e) {}
+      renderGroupBar();
+      loadActiveGroup();
+      updateSyncUI();
+    } else if (pushIfEmpty) {
+      await pushSyncNow();
+    } else {
+      updateSyncUI();
+    }
+  } catch(e) {
+    updateSyncUI('동기화 실패');
+    showError('동기화 실패: ' + e.message);
+  }
+}
+
+// 로컬 → 서버 (디바운스)
+let syncTimer = null;
+function pushSync() {
+  if (!syncCode) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(pushSyncNow, 800);
+}
+async function pushSyncNow() {
+  if (!syncCode) return;
+  try {
+    updateSyncUI('저장 중...');
+    const res = await fetch(`${API}/sync/${encodeURIComponent(syncCode)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { groups, activeId } }),
+    });
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error || '저장 실패');
+    updateSyncUI();
+  } catch(e) {
+    updateSyncUI('저장 실패');
+  }
 }
 
 // 현재 그룹의 종목 데이터를 모두 불러옴

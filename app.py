@@ -457,6 +457,66 @@ def get_batch():
     return jsonify(results)
 
 
+# ── 관심종목 동기화 (Supabase 영구 저장) ──────────────────
+# 개인 동기화 코드(code)별로 그룹 데이터를 Supabase 테이블에 저장한다.
+# Supabase 키는 서버 환경변수로만 보관하며 프론트엔드에 노출되지 않는다.
+SUPABASE_URL = os.environ.get('SUPABASE_URL', '').rstrip('/')
+SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')   # service_role 키 권장
+SYNC_TABLE = 'watchlists'
+
+def _sb_headers():
+    return {
+        'apikey': SUPABASE_KEY,
+        'Authorization': f'Bearer {SUPABASE_KEY}',
+        'Content-Type': 'application/json',
+    }
+
+def _sync_enabled():
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+@app.route('/api/sync/<code>', methods=['GET'])
+def sync_get(code):
+    if not _sync_enabled():
+        return jsonify({'success': False, 'error': '동기화가 서버에 설정되지 않았습니다'}), 503
+    code = (code or '').strip()
+    if not code:
+        return jsonify({'success': False, 'error': '코드가 비어 있습니다'}), 400
+    try:
+        r = requests.get(
+            f'{SUPABASE_URL}/rest/v1/{SYNC_TABLE}',
+            headers=_sb_headers(),
+            params={'code': f'eq.{code}', 'select': 'data', 'limit': '1'},
+            timeout=10,
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return jsonify({'success': True, 'data': rows[0]['data'] if rows else None})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/sync/<code>', methods=['PUT'])
+def sync_put(code):
+    if not _sync_enabled():
+        return jsonify({'success': False, 'error': '동기화가 서버에 설정되지 않았습니다'}), 503
+    code = (code or '').strip()
+    if not code:
+        return jsonify({'success': False, 'error': '코드가 비어 있습니다'}), 400
+    payload = request.get_json(silent=True) or {}
+    data = payload.get('data')
+    try:
+        # code를 기준으로 upsert (있으면 갱신, 없으면 삽입)
+        r = requests.post(
+            f'{SUPABASE_URL}/rest/v1/{SYNC_TABLE}',
+            headers={**_sb_headers(), 'Prefer': 'resolution=merge-duplicates'},
+            json=[{'code': code, 'data': data}],
+            timeout=10,
+        )
+        r.raise_for_status()
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 # 프론트엔드(index.html) 서빙 — API와 같은 서버에서 제공
 @app.route('/')
 def index():
