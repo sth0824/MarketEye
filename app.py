@@ -114,6 +114,14 @@ def _search_krx(query, limit=10):
             contains.append(s)
     return (exact + starts + contains)[:limit]
 
+def _krx_name(ticker):
+    """티커에 해당하는 KRX 한글 종목명을 반환 (없으면 None)."""
+    tl = (ticker or '').lower()
+    for s in _krx_stocks:
+        if s['ticker'].lower() == tl:
+            return s['name']
+    return None
+
 def _load_krx_bundle():
     """저장소에 포함된 krx_stocks.json을 로드 (KRX 사이트 접근 불가한 환경용 폴백)."""
     global _krx_stocks
@@ -289,7 +297,7 @@ def _fetch_stock(ticker):
 
     data = {
             'ticker': ticker.upper(),
-            'name': info.get('longName') or info.get('shortName') or ticker.upper(),
+            'name': _krx_name(ticker) or info.get('longName') or info.get('shortName') or ticker.upper(),
             'sector': info.get('sector', '-'),
             'industry': info.get('industry', '-'),
             'currency': info.get('currency', 'USD'),

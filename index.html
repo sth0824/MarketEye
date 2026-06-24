@@ -57,10 +57,25 @@
   .tab-btn.active { color: var(--blue); border-bottom-color: var(--blue); }
   .tab-btn:hover { color: var(--text); }
 
+  /* 그룹(워치리스트) 바 */
+  #group-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; }
+  .group-pill { display: inline-flex; align-items: center; gap: 6px; background: var(--surface); border: 1px solid var(--border); color: var(--muted); padding: 6px 10px 6px 14px; border-radius: 20px; cursor: pointer; font-size: 13px; user-select: none; transition: all .15s; }
+  .group-pill:hover { border-color: var(--accent); color: var(--text); }
+  .group-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .group-count { font-size: 11px; background: rgba(255,255,255,.12); border-radius: 10px; padding: 1px 7px; }
+  .group-pill.active .group-count { background: rgba(255,255,255,.25); }
+  .group-del { background: none; border: none; color: inherit; cursor: pointer; font-size: 12px; opacity: .55; padding: 0 2px; line-height: 1; }
+  .group-del:hover { opacity: 1; }
+  .group-add { background: none; border: 1px dashed var(--border); color: var(--muted); padding: 6px 12px; border-radius: 20px; cursor: pointer; font-size: 13px; }
+  .group-add:hover { border-color: var(--accent); color: var(--text); }
+
   /* 카드 그리드 */
   #cards-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; margin-bottom: 24px; }
   .stock-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; position: relative; transition: border-color .2s; }
   .stock-card:hover { border-color: var(--accent); }
+  .stock-card { cursor: grab; }
+  .stock-card.dragging { opacity: .4; cursor: grabbing; }
+  .stock-card.drag-over { border-color: var(--blue); box-shadow: 0 0 0 2px var(--blue) inset; }
   .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
   .card-ticker { font-size: 20px; font-weight: 700; color: var(--blue); }
   .card-name { font-size: 11px; color: var(--muted); margin-top: 2px; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -128,6 +143,7 @@
 <div id="loading-bar"></div>
 
 <main>
+  <div id="group-bar"></div>
   <div class="tabs">
     <button class="tab-btn active" onclick="switchTab('overview')">개요</button>
     <button class="tab-btn" onclick="switchTab('compare')">비교 테이블</button>
@@ -171,8 +187,16 @@
 const _isLocal = location.protocol === 'file:'
   || ['localhost', '127.0.0.1', ''].includes(location.hostname);
 const API = _isLocal ? 'http://localhost:5001/api' : '/api';
-let stocks = {}; // ticker -> data
+let stocks = {}; // ticker -> data (현재 그룹의 캐시)
 let activeTab = 'overview';
+
+// ---- 그룹(워치리스트) 모델 ----
+let groups = [];      // [{id, name, tickers:[...]}]
+let activeId = null;  // 현재 선택된 그룹 id
+function genId() { return 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2,5); }
+function curGroup() { return groups.find(g => g.id === activeId) || groups[0]; }
+// 현재 그룹에서 데이터 로드가 끝난 티커들을 사용자가 정한 순서대로 반환
+function orderedTickers() { const g = curGroup(); return g ? g.tickers.filter(t => stocks[t]) : []; }
 
 const POPULAR = ['AAPL','MSFT','GOOGL','AMZN','NVDA','TSLA','META','NFLX','ORCL','AMD',
   '005930.KS','000660.KS','035420.KS','035720.KS','068270.KS','207940.KS'];
@@ -194,29 +218,38 @@ async function addTicker(ticker) {
   // 순수 숫자면 한국 종목코드 → KRX에서 .KS/.KQ 해석
   ticker = /^\d{5,6}$/.test(raw) ? await resolveKrTicker(raw) : raw.toUpperCase();
   if (!ticker) return;
-  if (stocks[ticker] !== undefined) { showError(`${ticker}은 이미 추가되어 있습니다`); return; }
+  const g = curGroup();
+  if (g.tickers.includes(ticker)) { showError(`${ticker}은 이미 추가되어 있습니다`); return; }
   document.getElementById('ticker-input').value = '';
   document.getElementById('empty-state').style.display = 'none';
 
-  // 로딩 카드
+  // 현재 그룹에 추가하고 로딩 카드 표시
+  g.tickers.push(ticker);
   stocks[ticker] = null;
+  saveState();
   renderLoadingCard(ticker);
-  setLoadingBar(30);
+  fetchStock(ticker);
+}
 
+// 단일 티커 데이터 fetch → 캐시에 저장 후 렌더 (실패 시 그룹에서 제거)
+async function fetchStock(ticker) {
+  setLoadingBar(30);
   try {
     const res = await fetch(`${API}/stock/${ticker}`);
     const json = await res.json();
     if (!json.success) throw new Error(json.error || '데이터 로드 실패');
     stocks[ticker] = json.data;
-    saveState();
     setLoadingBar(100);
     renderAll();
   } catch(e) {
+    const g = curGroup();
+    g.tickers = g.tickers.filter(t => t !== ticker);
     delete stocks[ticker];
+    saveState();
     showError(`${ticker}: ${e.message}`);
     setLoadingBar(0);
     renderAll();
-    if (Object.keys(stocks).length === 0) document.getElementById('empty-state').style.display = '';
+    if (!curGroup().tickers.length) document.getElementById('empty-state').style.display = '';
   }
 }
 
@@ -228,7 +261,7 @@ let refreshTimer = null;
 let countdown = REFRESH_SEC;
 
 async function refreshPrices() {
-  const tickers = Object.keys(stocks).filter(t => stocks[t]);
+  const tickers = orderedTickers();
   if (!tickers.length) return;
 
   document.getElementById('last-updated').textContent = '새로고침 중...';
@@ -269,31 +302,110 @@ startRefreshLoop();
 restoreState();
 
 function removeTicker(ticker) {
+  const g = curGroup();
+  g.tickers = g.tickers.filter(t => t !== ticker);
   delete stocks[ticker];
   saveState();
   renderAll();
-  if (Object.keys(stocks).length === 0) document.getElementById('empty-state').style.display = '';
+  if (!g.tickers.length) document.getElementById('empty-state').style.display = '';
 }
 
 function clearAll() {
+  if (curGroup().tickers.length && !confirm('현재 그룹의 모든 종목을 삭제할까요?')) return;
+  curGroup().tickers = [];
   stocks = {};
   saveState();
   renderAll();
   document.getElementById('empty-state').style.display = '';
 }
 
-// ---- 상태 저장/복원 (localStorage) ----
-const STORAGE_KEY = 'marketeye_tickers';
+// ---- 상태 저장/복원 (localStorage, 그룹 기반) ----
+const GROUPS_KEY = 'marketeye_groups';
+const LEGACY_KEY = 'marketeye_tickers'; // 구버전 단일 목록 마이그레이션용
 function saveState() {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(Object.keys(stocks))); } catch(e) {}
+  try { localStorage.setItem(GROUPS_KEY, JSON.stringify({ groups, activeId })); } catch(e) {}
 }
 function restoreState() {
-  let saved = [];
-  try { saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch(e) {}
-  if (saved.length) {
-    document.getElementById('empty-state').style.display = 'none';
-    saved.forEach(t => addTicker(t));
+  let data = null;
+  try { data = JSON.parse(localStorage.getItem(GROUPS_KEY) || 'null'); } catch(e) {}
+  if (data && Array.isArray(data.groups) && data.groups.length) {
+    groups = data.groups;
+    activeId = groups.some(g => g.id === data.activeId) ? data.activeId : groups[0].id;
+  } else {
+    // 구버전 단일 목록을 기본 그룹으로 마이그레이션
+    let old = [];
+    try { old = JSON.parse(localStorage.getItem(LEGACY_KEY) || '[]'); } catch(e) {}
+    groups = [{ id: genId(), name: '내 관심종목', tickers: old }];
+    activeId = groups[0].id;
+    saveState();
   }
+  renderGroupBar();
+  loadActiveGroup();
+}
+
+// 현재 그룹의 종목 데이터를 모두 불러옴
+function loadActiveGroup() {
+  stocks = {};
+  const g = curGroup();
+  const tickers = g ? g.tickers.slice() : [];
+  document.getElementById('empty-state').style.display = tickers.length ? 'none' : '';
+  tickers.forEach(t => { stocks[t] = null; });
+  renderAll();
+  tickers.forEach(t => fetchStock(t));
+}
+
+// ---- 그룹 관리 ----
+function renderGroupBar() {
+  const bar = document.getElementById('group-bar');
+  if (!bar) return;
+  bar.innerHTML = groups.map(g =>
+    `<div class="group-pill ${g.id === activeId ? 'active' : ''}" onclick="switchGroup('${g.id}')" ondblclick="renameGroup('${g.id}')" title="더블클릭하면 이름 변경">
+       <span>${esc(g.name)}</span>
+       <span class="group-count">${g.tickers.length}</span>
+       ${groups.length > 1 ? `<button class="group-del" onclick="event.stopPropagation();deleteGroup('${g.id}')" title="그룹 삭제">✕</button>` : ''}
+     </div>`
+  ).join('') + `<button class="group-add" onclick="newGroup()">+ 새 그룹</button>`;
+}
+
+function switchGroup(id) {
+  if (id === activeId) return;
+  activeId = id;
+  saveState();
+  renderGroupBar();
+  loadActiveGroup();
+}
+
+function newGroup() {
+  const name = prompt('새 그룹 이름을 입력하세요:', '새 그룹');
+  if (name === null) return;
+  const g = { id: genId(), name: name.trim() || '새 그룹', tickers: [] };
+  groups.push(g);
+  activeId = g.id;
+  saveState();
+  renderGroupBar();
+  loadActiveGroup();
+}
+
+function renameGroup(id) {
+  const g = groups.find(x => x.id === id);
+  if (!g) return;
+  const name = prompt('그룹 이름 변경:', g.name);
+  if (name === null) return;
+  g.name = name.trim() || g.name;
+  saveState();
+  renderGroupBar();
+}
+
+function deleteGroup(id) {
+  if (groups.length <= 1) { showError('마지막 그룹은 삭제할 수 없습니다'); return; }
+  const g = groups.find(x => x.id === id);
+  if (!g) return;
+  if (!confirm(`'${g.name}' 그룹을 삭제할까요?`)) return;
+  groups = groups.filter(x => x.id !== id);
+  if (activeId === id) activeId = groups[0].id;
+  saveState();
+  renderGroupBar();
+  loadActiveGroup();
 }
 
 // ---- 렌더 ----
@@ -318,11 +430,15 @@ function renderLoadingCard(ticker) {
 function renderCards() {
   const c = document.getElementById('cards-container');
   c.innerHTML = '';
-  Object.entries(stocks).forEach(([ticker, d]) => {
+  const g = curGroup();
+  (g ? g.tickers : []).forEach(ticker => {
+    const d = stocks[ticker];
     if (!d) { renderLoadingCard(ticker); return; }
     const card = document.createElement('div');
     card.className = 'stock-card';
     card.id = `card-${ticker}`;
+    card.draggable = true;
+    card.dataset.ticker = ticker;
     const chg = d.changePercent;
     const chgCls = chg >= 0 ? 'up' : 'down';
     const chgSign = chg >= 0 ? '+' : '';
@@ -330,8 +446,8 @@ function renderCards() {
       <button class="card-remove" onclick="removeTicker('${ticker}')">✕</button>
       <div class="card-header">
         <div>
-          <div class="card-ticker">${esc(ticker)}</div>
-          <div class="card-name">${esc(d.name)}</div>
+          <div class="card-ticker">${esc(d.name)}</div>
+          <div class="card-name">${esc(ticker)}</div>
           <div style="font-size:10px;color:var(--muted);margin-top:2px">${esc(d.sector)}</div>
         </div>
         <div class="card-price">
@@ -358,8 +474,42 @@ function renderCards() {
       </div>
       ${d.targetPrice ? `<div style="margin-top:10px;font-size:11px;color:var(--muted)">목표주가 <span style="color:var(--yellow)">${fmt(d.targetPrice, d.currency)}</span> | 의견 <span style="color:var(--yellow)">${esc(d.recommendation)}</span></div>` : ''}
     `;
+    attachDragHandlers(card, ticker);
     c.appendChild(card);
     drawMiniChart(ticker, d.history);
+  });
+}
+
+// ---- 카드 드래그앤드롭 정렬 ----
+let dragTicker = null;
+function attachDragHandlers(card, ticker) {
+  card.addEventListener('dragstart', e => {
+    dragTicker = ticker;
+    e.dataTransfer.effectAllowed = 'move';
+    card.classList.add('dragging');
+  });
+  card.addEventListener('dragend', () => {
+    dragTicker = null;
+    document.querySelectorAll('.stock-card.dragging, .stock-card.drag-over')
+      .forEach(el => el.classList.remove('dragging', 'drag-over'));
+  });
+  card.addEventListener('dragover', e => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (dragTicker && dragTicker !== ticker) card.classList.add('drag-over');
+  });
+  card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
+  card.addEventListener('drop', e => {
+    e.preventDefault();
+    card.classList.remove('drag-over');
+    if (!dragTicker || dragTicker === ticker) return;
+    const arr = curGroup().tickers;
+    const from = arr.indexOf(dragTicker), to = arr.indexOf(ticker);
+    if (from < 0 || to < 0) return;
+    arr.splice(from, 1);
+    arr.splice(to, 0, dragTicker);
+    saveState();
+    renderCards();
   });
 }
 
@@ -445,7 +595,7 @@ const METRIC_GROUPS = [
 ];
 
 function renderCompareTable() {
-  const tickers = Object.keys(stocks).filter(t => stocks[t]);
+  const tickers = orderedTickers();
   const section = document.getElementById('compare-section');
   if (tickers.length < 1) { section.innerHTML = '<p style="color:var(--muted);padding:20px">기업을 1개 이상 추가하면 비교 테이블이 표시됩니다.</p>'; return; }
 
@@ -489,7 +639,7 @@ function renderCompareTable() {
 let barCharts = {};
 
 function renderCharts() {
-  const tickers = Object.keys(stocks).filter(t => stocks[t]);
+  const tickers = orderedTickers();
   const section = document.getElementById('charts-section');
   section.innerHTML = '';
   if (!tickers.length) { section.innerHTML = '<p style="color:var(--muted)">기업을 추가하면 차트가 표시됩니다.</p>'; return; }
@@ -645,7 +795,7 @@ async function fetchSuggestions(raw) {
     if (!results.length) { hideSug(); return; }
     selectedIdx = -1;
     sug.innerHTML = results.map((r, i) => {
-      const already = stocks[r.ticker] !== undefined;
+      const already = curGroup().tickers.includes(r.ticker);
       return `<div class="sug-item ${already ? 'sug-dim' : ''}" data-ticker="${esc(r.ticker)}" data-idx="${i}">
         <span class="sug-ticker">${esc(r.ticker)}</span>
         <span class="sug-name">${esc(r.name)}</span>
