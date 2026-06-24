@@ -64,6 +64,8 @@
   .group-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
   .group-count { font-size: 11px; background: rgba(255,255,255,.12); border-radius: 10px; padding: 1px 7px; }
   .group-pill.active .group-count { background: rgba(255,255,255,.25); }
+  .group-edit { background: none; border: none; color: inherit; cursor: pointer; font-size: 12px; opacity: .55; padding: 0 2px; line-height: 1; }
+  .group-edit:hover { opacity: 1; }
   .group-del { background: none; border: none; color: inherit; cursor: pointer; font-size: 12px; opacity: .55; padding: 0 2px; line-height: 1; }
   .group-del:hover { opacity: 1; }
   .group-add { background: none; border: 1px dashed var(--border); color: var(--muted); padding: 6px 12px; border-radius: 20px; cursor: pointer; font-size: 13px; }
@@ -443,6 +445,7 @@ function renderGroupBar() {
     `<div class="group-pill ${g.id === activeId ? 'active' : ''}" onclick="switchGroup('${g.id}')" ondblclick="renameGroup('${g.id}')" title="더블클릭하면 이름 변경">
        <span>${esc(g.name)}</span>
        <span class="group-count">${g.tickers.length}</span>
+       <button class="group-edit" onclick="event.stopPropagation();renameGroup('${g.id}')" title="이름 변경">✎</button>
        ${groups.length > 1 ? `<button class="group-del" onclick="event.stopPropagation();deleteGroup('${g.id}')" title="그룹 삭제">✕</button>` : ''}
      </div>`
   ).join('') + `<button class="group-add" onclick="newGroup()">+ 새 그룹</button>`;
