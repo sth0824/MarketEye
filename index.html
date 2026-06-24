@@ -114,6 +114,33 @@
   .chart-card h3 { font-size: 13px; color: var(--muted); margin-bottom: 12px; }
   canvas { width: 100% !important; }
 
+  /* 신호 배지 */
+  .signal-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 12px; margin-top: 10px; }
+  .signal-badge.buy  { background: rgba(63,185,80,.18); color: var(--green); border: 1px solid rgba(63,185,80,.4); }
+  .signal-badge.wait { background: rgba(210,153,34,.18); color: var(--yellow); border: 1px solid rgba(210,153,34,.4); }
+  .signal-badge.warn { background: rgba(248,81,73,.18); color: var(--red); border: 1px solid rgba(248,81,73,.4); }
+
+  /* 신호 탭 */
+  .signal-section-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px,1fr)); gap: 16px; }
+  .signal-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+  .signal-card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; }
+  .signal-name { font-size: 16px; font-weight: 700; color: var(--blue); }
+  .signal-ticker-label { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .signal-score-ring { text-align: center; }
+  .signal-score-num { font-size: 32px; font-weight: 800; }
+  .signal-score-label { font-size: 10px; color: var(--muted); }
+  .signal-bars { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+  .signal-bar-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .signal-bar-label { color: var(--muted); width: 90px; flex-shrink: 0; }
+  .signal-bar-track { flex: 1; height: 6px; background: var(--surface2); border-radius: 3px; overflow: hidden; }
+  .signal-bar-fill { height: 100%; border-radius: 3px; transition: width .5s; }
+  .signal-bar-val { color: var(--text); width: 36px; text-align: right; flex-shrink: 0; }
+  .signal-indicators { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 12px; }
+  .signal-ind-item { background: var(--surface2); border-radius: 6px; padding: 8px 10px; }
+  .signal-ind-key { color: var(--muted); font-size: 10px; margin-bottom: 2px; }
+  .signal-ind-val { font-weight: 600; }
+  .signal-loading { color: var(--muted); text-align: center; padding: 40px; }
+
   /* 빈 상태 */
   #empty-state { text-align: center; padding: 80px 20px; color: var(--muted); }
   #empty-state h2 { font-size: 24px; margin-bottom: 8px; color: var(--text); }
@@ -178,6 +205,9 @@
     /* 차트: 1열 */
     #charts-section { grid-template-columns: 1fr; }
 
+    /* 신호 탭 */
+    .signal-section-grid { grid-template-columns: 1fr; }
+
     /* 에러 토스트 */
     #error-toast { left: 14px; right: 14px; bottom: 14px; max-width: 100%; }
 
@@ -211,6 +241,7 @@
     <button class="tab-btn active" onclick="switchTab('overview')">개요</button>
     <button class="tab-btn" onclick="switchTab('compare')">비교 테이블</button>
     <button class="tab-btn" onclick="switchTab('charts')">차트</button>
+    <button class="tab-btn" onclick="switchTab('signal')">📈 진입 신호</button>
   </div>
 
   <div id="tab-overview">
@@ -240,6 +271,10 @@
   <div id="tab-charts" style="display:none">
     <div id="charts-section"></div>
   </div>
+
+  <div id="tab-signal" style="display:none">
+    <div id="signal-section"><p class="signal-loading">종목을 추가하면 진입 신호가 표시됩니다.</p></div>
+  </div>
 </main>
 
 <div id="error-toast"></div>
@@ -250,7 +285,8 @@
 const _isLocal = location.protocol === 'file:'
   || ['localhost', '127.0.0.1', ''].includes(location.hostname);
 const API = _isLocal ? 'http://localhost:5001/api' : '/api';
-let stocks = {}; // ticker -> data (현재 그룹의 캐시)
+let stocks = {};   // ticker -> data
+let signals = {};  // ticker -> signal data
 let activeTab = 'overview';
 
 // ---- 그룹(워치리스트) 모델 ----
@@ -294,6 +330,7 @@ async function addTicker(ticker) {
   saveState();
   renderLoadingCard(ticker);
   fetchStock(ticker);
+  fetchSignal(ticker);
 }
 
 // 단일 티커 데이터 fetch → 캐시에 저장 후 렌더 (실패 시 그룹에서 제거)
@@ -495,12 +532,129 @@ async function pushSyncNow() {
 // 현재 그룹의 종목 데이터를 모두 불러옴
 function loadActiveGroup() {
   stocks = {};
+  signals = {};
   const g = curGroup();
   const tickers = g ? g.tickers.slice() : [];
   document.getElementById('empty-state').style.display = tickers.length ? 'none' : '';
   tickers.forEach(t => { stocks[t] = null; });
   renderAll();
-  tickers.forEach(t => fetchStock(t));
+  tickers.forEach(t => { fetchStock(t); fetchSignal(t); });
+}
+
+async function fetchSignal(ticker) {
+  try {
+    const res = await fetch(`${API}/signal/${encodeURIComponent(ticker)}`);
+    const json = await res.json();
+    if (json.success) {
+      signals[ticker] = json.data;
+      // 개요 탭 카드 배지 갱신
+      updateSignalBadge(ticker, json.data);
+      // 신호 탭이 열려 있으면 재렌더
+      if (activeTab === 'signal') renderSignalTab();
+    }
+  } catch(e) {}
+}
+
+function signalClass(label) {
+  if (label === '매수 고려') return 'buy';
+  if (label === '관망') return 'wait';
+  return 'warn';
+}
+function signalEmoji(label) {
+  if (label === '매수 고려') return '✅';
+  if (label === '관망') return '⏳';
+  return '⚠️';
+}
+function scoreColor(s) {
+  if (s >= 68) return 'var(--green)';
+  if (s >= 48) return 'var(--yellow)';
+  return 'var(--red)';
+}
+
+function updateSignalBadge(ticker, sig) {
+  const card = document.getElementById(`card-${ticker}`);
+  if (!card) return;
+  let badge = card.querySelector('.signal-badge');
+  if (!badge) {
+    badge = document.createElement('div');
+    card.appendChild(badge);
+  }
+  const cls = signalClass(sig.signal);
+  badge.className = `signal-badge ${cls}`;
+  badge.innerHTML = `${signalEmoji(sig.signal)} ${sig.signal} <span style="opacity:.7;font-weight:400">${sig.combined}점</span>`;
+}
+
+function renderSignalTab() {
+  const section = document.getElementById('signal-section');
+  const tickers = orderedTickers();
+  if (!tickers.length) {
+    section.innerHTML = '<p class="signal-loading">종목을 추가하면 진입 신호가 표시됩니다.</p>';
+    return;
+  }
+  section.innerHTML = `<div class="signal-section-grid">${tickers.map(t => renderSignalCard(t)).join('')}</div>`;
+}
+
+function renderSignalCard(ticker) {
+  const sig = signals[ticker];
+  const name = (stocks[ticker] && stocks[ticker].name) || ticker;
+  if (!sig) {
+    return `<div class="signal-card">
+      <div class="signal-name">${esc(name)}</div>
+      <div class="signal-ticker-label">${esc(ticker)}</div>
+      <div class="signal-loading" style="padding:20px 0">분석 중...</div>
+    </div>`;
+  }
+  const ind = sig.indicators;
+  const fund = sig.fundamentals;
+  const cls = signalClass(sig.signal);
+
+  function bar(label, score) {
+    const color = score >= 68 ? 'var(--green)' : score >= 48 ? 'var(--yellow)' : 'var(--red)';
+    return `<div class="signal-bar-row">
+      <span class="signal-bar-label">${label}</span>
+      <div class="signal-bar-track"><div class="signal-bar-fill" style="width:${score}%;background:${color}"></div></div>
+      <span class="signal-bar-val">${score}점</span>
+    </div>`;
+  }
+
+  function indItem(key, val) {
+    return `<div class="signal-ind-item"><div class="signal-ind-key">${key}</div><div class="signal-ind-val">${val}</div></div>`;
+  }
+
+  const maStatus = (() => {
+    if (!ind.ma20 || !ind.ma60) return '-';
+    if (ind.price > ind.ma20 && ind.ma20 > ind.ma60) return '정배열 ↑';
+    if (ind.price < ind.ma20 && ind.ma20 < ind.ma60) return '역배열 ↓';
+    return '혼조';
+  })();
+
+  return `<div class="signal-card">
+    <div class="signal-card-header">
+      <div>
+        <div class="signal-name">${esc(name)}</div>
+        <div class="signal-ticker-label">${esc(ticker)}</div>
+        <div class="signal-badge ${cls}" style="margin-top:6px">${signalEmoji(sig.signal)} ${sig.signal}</div>
+      </div>
+      <div class="signal-score-ring">
+        <div class="signal-score-num" style="color:${scoreColor(sig.combined)}">${sig.combined}</div>
+        <div class="signal-score-label">종합점수 / 100</div>
+      </div>
+    </div>
+    <div class="signal-bars">
+      ${bar('기술적 분석', sig.tech_score)}
+      ${bar('밸류에이션', sig.fund_score)}
+    </div>
+    <div class="signal-indicators">
+      ${indItem('RSI (14)', `${ind.rsi} ${ind.rsi < 30 ? '📉 과매도' : ind.rsi > 70 ? '📈 과매수' : ''}`)}
+      ${indItem('이동평균', maStatus)}
+      ${indItem('MACD', ind.macd_cross ? '🔔 골든크로스' : ind.macd > ind.macd_signal ? '상승세' : '하락세')}
+      ${indItem('볼린저 위치', `${ind.bb_pct}% ${ind.bb_pct < 25 ? '🔵 하단' : ind.bb_pct > 75 ? '🔴 상단' : '중립'}`)}
+      ${indItem('PER', fund.per != null ? fund.per.toFixed(1)+'x' : '-')}
+      ${indItem('PBR', fund.pbr != null ? fund.pbr.toFixed(2)+'x' : '-')}
+      ${indItem('ROE', fund.roe != null ? (fund.roe*100).toFixed(1)+'%' : '-')}
+      ${indItem('순이익률', fund.margin != null ? (fund.margin*100).toFixed(1)+'%' : '-')}
+    </div>
+  </div>`;
 }
 
 // ---- 그룹 관리 ----
@@ -562,7 +716,8 @@ function deleteGroup(id) {
 function renderAll() {
   if (activeTab === 'overview') renderCards();
   else if (activeTab === 'compare') renderCompareTable();
-  else renderCharts();
+  else if (activeTab === 'charts') renderCharts();
+  else if (activeTab === 'signal') renderSignalTab();
 }
 
 function renderLoadingCard(ticker) {
@@ -889,11 +1044,12 @@ function renderCharts() {
 // ---- 탭 전환 ----
 function switchTab(tab) {
   activeTab = tab;
-  ['overview','compare','charts'].forEach(t => {
+  const TABS = ['overview','compare','charts','signal'];
+  TABS.forEach(t => {
     document.getElementById(`tab-${t}`).style.display = t === tab ? '' : 'none';
-    document.querySelectorAll('.tab-btn').forEach((btn, i) => {
-      btn.classList.toggle('active', ['overview','compare','charts'][i] === tab);
-    });
+  });
+  document.querySelectorAll('.tab-btn').forEach((btn, i) => {
+    btn.classList.toggle('active', TABS[i] === tab);
   });
   renderAll();
 }

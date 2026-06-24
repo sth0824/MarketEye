@@ -457,7 +457,185 @@ def get_batch():
     return jsonify(results)
 
 
-# ── 관심종목 동기화 (Supabase 영구 저장) ──────────────────
+# ── 진입 시점 신호 분석 ─────────────────────────────────────
+def _ema(data, period):
+    k = 2 / (period + 1)
+    result = [data[0]]
+    for v in data[1:]:
+        result.append(v * k + result[-1] * (1 - k))
+    return result
+
+def _rsi(closes, period=14):
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    if len(gains) < period:
+        return 50.0
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        ag = (ag * (period - 1) + gains[i]) / period
+        al = (al * (period - 1) + losses[i]) / period
+    return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+
+@app.route('/api/signal/<path:ticker>')
+def signal(ticker):
+    cached = _cache_get(('signal', ticker), 1800)
+    if cached:
+        return jsonify({'success': True, 'data': cached})
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period='1y', interval='1d')
+        if hist.empty or len(hist) < 30:
+            return jsonify({'success': False, 'error': '데이터 부족 (최소 30일 필요)'}), 422
+
+        closes = [float(v) for v in hist['Close'].tolist()]
+        price = closes[-1]
+
+        # ── RSI(14) ──
+        rsi = _rsi(closes, 14)
+        if rsi < 30:   rsi_s = 90
+        elif rsi < 40: rsi_s = 75
+        elif rsi < 50: rsi_s = 58
+        elif rsi < 60: rsi_s = 45
+        elif rsi < 70: rsi_s = 28
+        else:          rsi_s = 12
+
+        # ── 이동평균 ──
+        ma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else None
+        ma60 = sum(closes[-60:]) / 60 if len(closes) >= 60 else None
+        if ma20 and ma60:
+            if price > ma20 > ma60:   ma_s = 80  # 정배열
+            elif price > ma20:        ma_s = 65
+            elif price < ma20 < ma60: ma_s = 20  # 역배열
+            else:                     ma_s = 35
+        else:
+            ma_s = 50
+
+        # ── MACD(12,26,9) ──
+        ema12 = _ema(closes, 12)
+        ema26 = _ema(closes, 26)
+        macd_line = [a - b for a, b in zip(ema12, ema26)]
+        sig_line  = _ema(macd_line, 9)
+        macd_val, sig_val = macd_line[-1], sig_line[-1]
+        macd_cross = macd_val > sig_val and macd_line[-2] <= sig_line[-2]
+        macd_s = 85 if macd_cross else (62 if macd_val > sig_val else 38)
+
+        # ── 볼린저 밴드(20,2) ──
+        if len(closes) >= 20:
+            r20 = closes[-20:]
+            bb_mid = sum(r20) / 20
+            std = (sum((x - bb_mid) ** 2 for x in r20) / 20) ** 0.5
+            bb_upper = bb_mid + 2 * std
+            bb_lower = bb_mid - 2 * std
+            span = bb_upper - bb_lower
+            bb_pct = (price - bb_lower) / span if span > 0 else 0.5
+        else:
+            bb_mid = bb_upper = bb_lower = None
+            bb_pct = 0.5
+        if bb_pct < 0.10:   bb_s = 90
+        elif bb_pct < 0.25: bb_s = 75
+        elif bb_pct < 0.50: bb_s = 55
+        elif bb_pct < 0.75: bb_s = 42
+        elif bb_pct < 0.90: bb_s = 28
+        else:               bb_s = 12
+
+        tech_score = round(rsi_s * 0.35 + ma_s * 0.30 + macd_s * 0.20 + bb_s * 0.15)
+
+        # ── 펀더멘털 ──
+        info = t.info
+        def sv(k): return info.get(k)
+
+        def s_per(v):
+            if v is None: return 50
+            if v < 0: return 20
+            if v < 10: return 90;
+            if v < 15: return 80
+            if v < 20: return 65
+            if v < 30: return 45
+            return 20
+
+        def s_pbr(v):
+            if v is None: return 50
+            if v < 1: return 90
+            if v < 2: return 75
+            if v < 3: return 55
+            return 25
+
+        def s_roe(v):
+            if v is None: return 50
+            p = v * 100
+            if p > 25: return 95
+            if p > 15: return 80
+            if p > 10: return 65
+            if p > 5:  return 45
+            return 20
+
+        def s_debt(v):
+            if v is None: return 50
+            r = v / 100
+            if r < 0.5: return 90
+            if r < 1.0: return 75
+            if r < 2.0: return 55
+            return 25
+
+        def s_margin(v):
+            if v is None: return 50
+            p = v * 100
+            if p > 20: return 90
+            if p > 10: return 75
+            if p > 5:  return 55
+            return 25
+
+        per = sv('trailingPE'); pbr = sv('priceToBook')
+        roe = sv('returnOnEquity'); debt = sv('debtToEquity')
+        margin = sv('profitMargins')
+
+        fund_score = round(
+            s_per(per)    * 0.30 +
+            s_pbr(pbr)    * 0.20 +
+            s_roe(roe)    * 0.25 +
+            s_debt(debt)  * 0.10 +
+            s_margin(margin) * 0.15
+        )
+
+        combined = round(tech_score * 0.55 + fund_score * 0.45)
+
+        if combined >= 68:   label = '매수 고려'
+        elif combined >= 48: label = '관망'
+        else:                label = '주의'
+
+        data = {
+            'combined': combined,
+            'tech_score': tech_score,
+            'fund_score': fund_score,
+            'signal': label,
+            'indicators': {
+                'rsi': round(rsi, 1),
+                'ma20': round(ma20, 2) if ma20 else None,
+                'ma60': round(ma60, 2) if ma60 else None,
+                'price': round(price, 2),
+                'macd': round(macd_val, 4),
+                'macd_signal': round(sig_val, 4),
+                'macd_cross': macd_cross,
+                'bb_upper': round(bb_upper, 2) if bb_upper else None,
+                'bb_mid':   round(bb_mid, 2)   if bb_mid   else None,
+                'bb_lower': round(bb_lower, 2) if bb_lower else None,
+                'bb_pct': round(bb_pct * 100, 1),
+            },
+            'fundamentals': {
+                'per': per, 'pbr': pbr, 'roe': roe,
+                'debt': debt, 'margin': margin,
+            }
+        }
+        _cache_set(('signal', ticker), data)
+        return jsonify({'success': True, 'data': data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 # 개인 동기화 코드(code)별로 그룹 데이터를 Supabase 테이블에 저장한다.
 # Supabase 키는 서버 환경변수로만 보관하며 프론트엔드에 노출되지 않는다.
 SUPABASE_URL = os.environ.get('SUPABASE_URL', '').rstrip('/')
