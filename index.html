@@ -300,9 +300,6 @@ function startRefreshLoop() {
   }, 1000);
 }
 
-startRefreshLoop();
-restoreState();
-
 function removeTicker(ticker) {
   const g = curGroup();
   g.tickers = g.tickers.filter(t => t !== ticker);
@@ -921,6 +918,10 @@ input.addEventListener('input', () => {
 });
 
 document.addEventListener('click', e => { if (!e.target.closest('#search-bar')) hideSug(); });
+
+// 모든 선언·리스너 등록 후 마지막에 초기화 (const TDZ 방지)
+startRefreshLoop();
+restoreState();
 </script>
 </body>
 </html>
