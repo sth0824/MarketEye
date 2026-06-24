@@ -127,20 +127,78 @@
   .loading-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; min-height: 200px; display: flex; align-items: center; justify-content: center; color: var(--muted); }
   .spinner { width: 24px; height: 24px; border: 3px solid var(--border); border-top-color: var(--blue); border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 10px; }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── 모바일 반응형 ── */
+  @media (max-width: 768px) {
+    /* 헤더: 2줄 레이아웃 */
+    header {
+      flex-wrap: wrap;
+      height: auto;
+      padding: 10px 14px;
+      gap: 8px;
+    }
+    header h1 { font-size: 16px; }
+    #sync-btn { margin-left: auto; padding: 7px 10px; font-size: 12px; }
+    #refresh-info { font-size: 10px; order: 4; width: 100%; }
+    #search-bar {
+      order: 3;
+      flex: 1 1 100%;
+      max-width: 100%;
+      margin-left: 0;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    #ticker-input { font-size: 16px; /* iOS 줌 방지 */ }
+    #search-bar button { padding: 8px 12px; font-size: 13px; }
+
+    /* main 여백 축소 */
+    main { padding: 12px 14px; }
+
+    /* 그룹 바 스크롤 */
+    #group-bar { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; -webkit-overflow-scrolling: touch; }
+    #group-bar::-webkit-scrollbar { display: none; }
+
+    /* 탭 버튼 */
+    .tabs { gap: 0; }
+    .tab-btn { padding: 8px 12px; font-size: 13px; flex: 1; text-align: center; }
+
+    /* 카드: 1열 */
+    #cards-container { grid-template-columns: 1fr; gap: 12px; }
+    .stock-card { padding: 14px; }
+    .card-ticker { font-size: 17px; }
+    .card-price-val { font-size: 19px; }
+
+    /* 비교 테이블: 가로 스크롤 유지, 첫 열 고정 */
+    #compare-section { -webkit-overflow-scrolling: touch; }
+    .compare-table th, .compare-table td { padding: 8px 10px; font-size: 12px; }
+    .compare-table td:first-child, .compare-table th:first-child { min-width: 120px; font-size: 11px; }
+
+    /* 차트: 1열 */
+    #charts-section { grid-template-columns: 1fr; }
+
+    /* 에러 토스트 */
+    #error-toast { left: 14px; right: 14px; bottom: 14px; max-width: 100%; }
+
+    /* 빈 상태 */
+    #empty-state { padding: 40px 16px; }
+    #empty-state h2 { font-size: 18px; }
+    .ticker-chips { gap: 6px; }
+    .ticker-chip { font-size: 12px; padding: 5px 10px; }
+  }
 </style>
 </head>
 <body>
 
 <header>
   <h1>Market<span>Eye</span></h1>
-  <div id="refresh-info">자동새로고침 <span id="refresh-countdown">30s</span> · <span id="last-updated">-</span> · <span id="sync-status"></span></div>
+  <button id="sync-btn" class="secondary" onclick="openSyncDialog()" title="접속 코드로 로그인 (기기 간 공유)" style="margin-left:auto">🔑 로그인</button>
   <div id="search-bar" style="position:relative">
-    <input id="ticker-input" type="text" placeholder="티커 입력 (예: AAPL, 삼성전자, 하이닉스)" autocomplete="off">
+    <input id="ticker-input" type="text" placeholder="티커 입력 (예: AAPL, 삼성전자)" autocomplete="off">
     <button onclick="addTicker()">추가</button>
     <button class="secondary" onclick="clearAll()">전체 삭제</button>
-    <button id="sync-btn" class="secondary" onclick="openSyncDialog()" title="접속 코드로 로그인 (기기 간 공유)">🔑 로그인</button>
     <div id="suggestions"></div>
   </div>
+  <div id="refresh-info">자동새로고침 <span id="refresh-countdown">30s</span> · <span id="last-updated">-</span> · <span id="sync-status"></span></div>
 </header>
 
 <div id="loading-bar"></div>
