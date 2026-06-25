@@ -335,7 +335,19 @@ function toggleFav(t) {
   if (curGroup() && curGroup().id === FAV_ID) renderCards();  // 즐겨찾기 보는 중이면 갱신
 }
 
-const POPULAR = ['AAPL','MSFT','GOOGL','AMZN','NVDA','TSLA','META','NFLX','ORCL','AMD',
+// ---- 빠른 조회(저장·동기화 안 되는 임시 그룹) ----
+// 그냥 검색해서 잠깐 보고 싶을 때 쓰는 모드. 서버/진짜 그룹에 저장되지 않아
+// 새로고침하면 비워지고, 다른 워치리스트 그룹을 오염시키지 않는다.
+const QUICK_ID = '__quick__';
+function ensureQuick() {  // 즐겨찾기 바로 다음에 생성 (없을 때만)
+  if (!groups.some(g => g.id === QUICK_ID)) {
+    const favIdx = groups.findIndex(g => g.id === FAV_ID);
+    groups.splice(favIdx >= 0 ? favIdx + 1 : 0, 0,
+      { id: QUICK_ID, name: '🔍 빠른 조회', tickers: [] });
+  }
+}
+
+const POPULAR =['AAPL','MSFT','GOOGL','AMZN','NVDA','TSLA','META','NFLX','ORCL','AMD',
   '005930.KS','000660.KS','035420.KS','035720.KS','068270.KS','207940.KS'];
 
 // 한국 종목코드(숫자)를 KRX 검색으로 .KS/.KQ 정확히 해석
@@ -535,7 +547,8 @@ async function pullSync(pushIfEmpty) {
       if (pushIfEmpty) await pushSyncNow();
     }
     ensureFav();
-    if (!groups.some(g => g.id === activeId)) activeId = (favGroup() ? groups.find(g => g.id !== FAV_ID) || groups[0] : groups[0]).id;
+    ensureQuick();
+    if (!groups.some(g => g.id === activeId)) activeId = (groups.find(g => g.id !== FAV_ID && g.id !== QUICK_ID) || groups[0]).id;
     renderGroupBar();
     loadActiveGroup();
     updateSyncUI();
@@ -556,10 +569,15 @@ async function pushSyncNow() {
   if (!syncCode) return;
   try {
     updateSyncUI('저장 중...');
+    // 빠른 조회 그룹은 임시이므로 서버에 저장하지 않는다.
+    const persistGroups = groups.filter(g => g.id !== QUICK_ID);
+    const persistActive = activeId === QUICK_ID
+      ? (persistGroups.find(g => g.id !== FAV_ID) || persistGroups[0] || {}).id
+      : activeId;
     const res = await fetch(`${API}/sync/${encodeURIComponent(syncCode)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ data: { groups, activeId } }),
+      body: JSON.stringify({ data: { groups: persistGroups, activeId: persistActive } }),
     });
     const json = await res.json();
     if (!json.success) throw new Error(json.error || '저장 실패');
@@ -826,14 +844,16 @@ async function runBacktest(ticker) {
 function renderGroupBar() {
   const bar = document.getElementById('group-bar');
   if (!bar) return;
-  const realCount = groups.filter(g => g.id !== FAV_ID).length;
+  const realCount = groups.filter(g => g.id !== FAV_ID && g.id !== QUICK_ID).length;
   bar.innerHTML = groups.map(g => {
     const fav = g.id === FAV_ID;
-    return `<div class="group-pill ${g.id === activeId ? 'active' : ''} ${fav ? 'fav-pill' : ''}" onclick="switchGroup('${g.id}')" ${fav ? '' : `ondblclick="renameGroup('${g.id}')"`} title="${fav ? '즐겨찾기 모음' : '더블클릭하면 이름 변경'}">
+    const special = fav || g.id === QUICK_ID;  // 즐겨찾기·빠른조회는 이름변경/삭제 불가
+    const tip = fav ? '즐겨찾기 모음' : (g.id === QUICK_ID ? '검색해서 잠깐 보기 (저장 안 됨)' : '더블클릭하면 이름 변경');
+    return `<div class="group-pill ${g.id === activeId ? 'active' : ''} ${fav ? 'fav-pill' : ''}" onclick="switchGroup('${g.id}')" ${special ? '' : `ondblclick="renameGroup('${g.id}')"`} title="${tip}">
        <span>${esc(g.name)}</span>
        <span class="group-count">${g.tickers.length}</span>
-       ${fav ? '' : `<button class="group-edit" onclick="event.stopPropagation();renameGroup('${g.id}')" title="이름 변경">✎</button>`}
-       ${(!fav && realCount > 1) ? `<button class="group-del" onclick="event.stopPropagation();deleteGroup('${g.id}')" title="그룹 삭제">✕</button>` : ''}
+       ${special ? '' : `<button class="group-edit" onclick="event.stopPropagation();renameGroup('${g.id}')" title="이름 변경">✎</button>`}
+       ${(!special && realCount > 1) ? `<button class="group-del" onclick="event.stopPropagation();deleteGroup('${g.id}')" title="그룹 삭제">✕</button>` : ''}
      </div>`;
   }).join('') + `<button class="group-add" onclick="newGroup()">+ 새 그룹</button>`;
 }
@@ -858,7 +878,7 @@ function newGroup() {
 }
 
 function renameGroup(id) {
-  if (id === FAV_ID) return;  // 즐겨찾기는 이름 변경 불가
+  if (id === FAV_ID || id === QUICK_ID) return;  // 즐겨찾기·빠른조회는 이름 변경 불가
   const g = groups.find(x => x.id === id);
   if (!g) return;
   const name = prompt('그룹 이름 변경:', g.name);
@@ -869,13 +889,13 @@ function renameGroup(id) {
 }
 
 function deleteGroup(id) {
-  if (id === FAV_ID) { showError('즐겨찾기는 삭제할 수 없습니다'); return; }
-  if (groups.filter(x => x.id !== FAV_ID).length <= 1) { showError('마지막 그룹은 삭제할 수 없습니다'); return; }
+  if (id === FAV_ID || id === QUICK_ID) { showError('이 그룹은 삭제할 수 없습니다'); return; }
+  if (groups.filter(x => x.id !== FAV_ID && x.id !== QUICK_ID).length <= 1) { showError('마지막 그룹은 삭제할 수 없습니다'); return; }
   const g = groups.find(x => x.id === id);
   if (!g) return;
   if (!confirm(`'${g.name}' 그룹을 삭제할까요?`)) return;
   groups = groups.filter(x => x.id !== id);
-  if (activeId === id) activeId = (groups.find(x => x.id !== FAV_ID) || groups[0]).id;
+  if (activeId === id) activeId = (groups.find(x => x.id !== FAV_ID && x.id !== QUICK_ID) || groups[0]).id;
   saveState();
   renderGroupBar();
   loadActiveGroup();
