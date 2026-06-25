@@ -234,7 +234,6 @@
 
 <header>
   <h1>Market<span>Eye</span></h1>
-  <button id="sync-btn" class="secondary" onclick="openSyncDialog()" title="접속 코드로 로그인 (기기 간 공유)" style="margin-left:auto">🔑 로그인</button>
   <div id="search-bar" style="position:relative">
     <input id="ticker-input" type="text" placeholder="티커 입력 (예: AAPL, 삼성전자)" autocomplete="off">
     <button onclick="addTicker()">추가</button>
@@ -242,6 +241,7 @@
     <div id="suggestions"></div>
   </div>
   <div id="refresh-info">자동새로고침 <span id="refresh-countdown">30s</span> · <span id="last-updated">-</span> · <span id="sync-status"></span></div>
+  <button id="sync-btn" class="secondary" onclick="openSyncDialog()" title="접속 코드로 로그인 (기기 간 공유)">🔑 로그인</button>
 </header>
 
 <div id="loading-bar"></div>
