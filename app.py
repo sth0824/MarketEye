@@ -210,6 +210,7 @@ def _fetch_naver(code):
     price = _naver_num(b.get('closePrice'))
     chg = _naver_num(b.get('compareToPreviousClosePrice'))
     pct = _naver_num(b.get('fluctuationsRatio'))
+    out['tradeDate'] = ((b.get('localTradedAt') or '')[:10]) or None  # 'YYYY-MM-DD'
     dir_code = str((b.get('compareToPreviousPrice') or {}).get('code') or '')
     if price is not None and chg is not None and pct is not None:
         # 네이버 방향코드: 1·2=상승(+), 3=보합(0), 4·5=하락(-)
@@ -1077,6 +1078,37 @@ def signal(ticker):
         price = closes[-1]
         n = len(closes)
 
+        # 한국 종목: 야후 일봉의 마지막 값을 네이버 실시간으로 교체/추가한다.
+        # (야후 KRX 15~20분 지연 → 차트·기술점수·진입가가 실시간 가격을 반영하도록)
+        # per/pbr도 네이버 실시간 값을 받아 아래 펀더멘털 계산에서 덮어쓴다.
+        nv_per = nv_pbr = nv_mcap = nv_fpe = None
+        if ticker.upper().endswith(('.KS', '.KQ')):
+            try:
+                nv = _fetch_naver(ticker.split('.')[0])
+                rt = nv.get('price')
+                if rt:
+                    last_date = hist.index[-1].date().isoformat()
+                    dh, dl, vol = nv.get('dayHigh'), nv.get('dayLow'), nv.get('volume')
+                    if nv.get('tradeDate') == last_date:
+                        # 야후에 이미 오늘 봉이 있으면(지연된 값) 실시간으로 갱신
+                        closes[-1] = rt
+                        highs[-1] = max(highs[-1], dh or rt, rt)
+                        lows[-1] = min(lows[-1], dl or rt, rt)
+                        if vol:
+                            vols[-1] = vol
+                    else:
+                        # 야후에 오늘 봉이 아직 없으면 실시간 봉을 추가
+                        closes.append(rt)
+                        highs.append(dh or rt)
+                        lows.append(dl or rt)
+                        vols.append(vol or 0.0)
+                    price = closes[-1]
+                    n = len(closes)
+                nv_per, nv_pbr = nv.get('per'), nv.get('pbr')
+                nv_mcap, nv_fpe = nv.get('marketCap'), nv.get('forwardPer')
+            except Exception:
+                pass
+
         # 시장 대비 상대강도 (지수 종가 캐시 사용) — 백테스트엔 없는 실시간 보강 요소
         rs_60 = None
         try:
@@ -1113,6 +1145,24 @@ def signal(ticker):
         # PER/PBR: yfinance 미제공(한국 종목 등) 시 분기 재무제표로 TTM 직접 계산
         # — 개요 카드와 동일한 폴백 로직을 재사용해 '-'로 비는 문제를 막는다.
         per, pbr, _, _ = _calc_per_pbr(info, t)
+        # 한국 종목은 네이버 실시간 PER/PBR로 덮어써 밸류에이션 축을 최신화
+        if nv_per is not None:
+            per = nv_per
+        if nv_pbr is not None:
+            pbr = nv_pbr
+        # 네이버 실시간 시총으로 시총 파생 밸류에이션 지표도 최신화
+        # (PSR·EV/EBITDA·FCF수익률은 시총을 분모/분자로 쓰므로 지연가 영향을 받음)
+        if nv_mcap is not None:
+            info['marketCap'] = nv_mcap
+            rev = safe_val(info.get('totalRevenue'))
+            if rev and rev > 0:
+                info['priceToSalesTrailing12Months'] = nv_mcap / rev
+            ebitda = safe_val(info.get('ebitda'))
+            if ebitda and ebitda > 0:
+                ev = nv_mcap + (safe_val(info.get('totalDebt')) or 0) - (safe_val(info.get('totalCash')) or 0)
+                info['enterpriseToEbitda'] = ev / ebitda
+        if nv_fpe is not None:
+            info['forwardPE'] = nv_fpe
         # 5대 축 전문가형 펀더멘털 점수
         fs = _fundamental_signal(info, per, pbr)
         fund_score = fs['fund_score']
