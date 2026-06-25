@@ -22,7 +22,8 @@
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
 
-  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 24px; height: 56px; display: flex; align-items: center; gap: 16px; position: sticky; top: 0; z-index: 100; }
+  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 24px; height: 56px; display: flex; align-items: center; gap: 16px; position: sticky; top: 0; z-index: 100; transition: transform .3s ease; }
+  header.header-hidden { transform: translateY(-100%); }
   #refresh-info { font-size: 11px; color: var(--muted); white-space: nowrap; }
   #refresh-info span { color: var(--green); }
   .refreshing { animation: pulse 1s infinite; }
@@ -1315,6 +1316,29 @@ input.addEventListener('input', () => {
 });
 
 document.addEventListener('click', e => { if (!e.target.closest('#search-bar')) hideSug(); });
+
+// ── 스크롤 방향에 따라 헤더 자동 숨김(내릴 때)·표시(올릴 때) ──
+(function () {
+  const header = document.querySelector('header');
+  const sugg = document.getElementById('suggestions');
+  let lastY = window.scrollY, ticking = false;
+  function update() {
+    const y = window.scrollY;
+    const suggOpen = sugg && sugg.offsetParent !== null;   // 검색 추천 열림
+    if (y <= 56 || suggOpen) {
+      header.classList.remove('header-hidden');            // 맨 위·검색 중엔 항상 표시
+    } else if (y - lastY > 4) {
+      header.classList.add('header-hidden');               // 내릴 때 숨김
+    } else if (lastY - y > 4) {
+      header.classList.remove('header-hidden');            // 올릴 때 표시
+    }
+    lastY = y;
+    ticking = false;
+  }
+  window.addEventListener('scroll', () => {
+    if (!ticking) { requestAnimationFrame(update); ticking = true; }
+  }, { passive: true });
+})();
 
 // 모든 선언·리스너 등록 후 마지막에 초기화 (const TDZ 방지)
 startRefreshLoop();

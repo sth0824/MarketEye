@@ -4,7 +4,6 @@ import yfinance as yf
 import requests
 import traceback
 import json
-import io
 import os
 import time
 import threading
