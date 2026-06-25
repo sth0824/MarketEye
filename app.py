@@ -1058,39 +1058,44 @@ def _fundamental_signal(info, per, pbr):
         },
     }
 
-def _composite_signal(tech_score, fund_score, regime, rr):
-    """차트(기술)·가치(펀더멘털)를 전문가식으로 종합한 단일 '진입 점수'.
-    단순 가중합이 아니라:
-      1) 가중 기하평균 → 한쪽이 부실하면 다른 쪽으로 상쇄 불가(균형을 요구)
-      2) 양쪽 동의 시 확신 가산 · 크게 엇갈리면 신뢰 저하 감산
-      3) 추세 역행(하락추세)·손익비 불리 시 상단 제한(떨어지는 칼날 방지)
-    반환: 0~100 점수 + '사도 될지 말지' 한 줄 판정/근거."""
+def _composite_signal(tech_score, fund_score, regime, rr, fund_conf=1.0):
+    """차트(기술)·가치(펀더멘털)를 전문가식으로 합성한 단일 '진입 점수'.
+
+    설계 원칙(이중 계산·과신 방지):
+      1) 가중 기하평균(차트0.55:가치0.45) → 한쪽이 부실하면 상쇄 불가(균형 요구)
+      2) 데이터 신뢰도 수축 — 가치 지표가 듬성하면 가치점수를 중립(50)으로 당김
+      3) 관계 조정 — 양쪽 동의 가산·크게 엇갈리면 신뢰 저하 감산
+      4) 안전 레일 — '강한 하락추세'만 하드캡(떨어지는 칼날 회피)
+    ※ 손익비·추세는 이미 차트 점수(tech_score) 안에 반영돼 있으므로 여기서
+      다시 깎지 않는다(이중 계산 제거). 손익비는 차트 점수를 통해 한 번만 반영됨.
+    반환: 0~100 점수 + 신뢰도 + '사도 될지 말지' 한 줄 판정/근거."""
     t = max(1, tech_score)
-    f = max(1, fund_score)
-    # 1) 가중 기하평균 (차트 0.55 : 가치 0.45) — 불균형을 산술평균보다 강하게 응징
-    score = (t ** 0.55) * (f ** 0.45)
-    gap = abs(tech_score - fund_score)
-    # 2) 동의/불일치 조정
-    if tech_score >= 65 and fund_score >= 65:
+    # 2) 데이터 신뢰도 수축: 가용 가치지표가 적을수록 가치점수를 50으로 끌어당김
+    fund_conf = max(0.0, min(1.0, fund_conf))
+    f_adj = max(1.0, 50 + (fund_score - 50) * fund_conf)
+
+    # 1) 가중 기하평균
+    score = (t ** 0.55) * (f_adj ** 0.45)
+
+    # 3) 관계 조정 (원신호 재계산이 아니라 '두 점수의 일치도'만 본다)
+    gap = abs(tech_score - f_adj)
+    if tech_score >= 65 and f_adj >= 65:
         score += 6          # 차트·가치 모두 양호 → 고확신
-    elif tech_score >= 55 and fund_score >= 55:
+    elif tech_score >= 55 and f_adj >= 55:
         score += 2
     if gap >= 35:
         score -= 6          # 한쪽만 좋음 → 신호 충돌, 신뢰 저하
     elif gap >= 22:
         score -= 3
-    # 3) 추세 역행 상단 제한
+
+    # 4) 안전 레일: 강한 하락추세만 하드캡 (리스크 오버레이)
     if regime == 'strong_down':
-        score = min(score, 38)
-    elif regime == 'down':
-        score = min(score, 50)
-    # 4) 손익비 — '이 가격'이 살 자리인가
-    if rr is not None:
-        if rr < 1.0:
-            score = min(score, 52)
-        elif rr >= 2.0:
-            score += 3
+        score = min(score, 40)
     score = int(max(0, min(100, round(score))))
+
+    # 신뢰도 등급 (데이터 완전성 + 두 점수 일치도)
+    conf = fund_conf * (1 - min(gap, 50) / 100)
+    conf_label = '높음' if conf >= 0.6 else ('보통' if conf >= 0.35 else '낮음')
 
     # 판정/근거 (사도 될지 말지 한 줄)
     if score >= 72:
@@ -1102,25 +1107,28 @@ def _composite_signal(tech_score, fund_score, regime, rr):
     else:
         verdict, vlabel, vemoji = 'avoid', '매수 보류', '🔴'
 
-    if regime in ('down', 'strong_down'):
-        why = '하락추세 — 반등 확인 전 매수 자제'
+    if regime == 'strong_down':
+        why = '강한 하락추세 — 반등 확인 전 매수 자제(떨어지는 칼날)'
     elif rr is not None and rr < 1.0:
         why = '현재가는 손익비 불리 — 눌림목(저점) 대기'
-    elif tech_score >= 60 and fund_score >= 60:
+    elif tech_score >= 60 and f_adj >= 60:
         why = '차트·가치 모두 양호 — 정석 매수 구간'
-    elif tech_score - fund_score >= 22:
+    elif tech_score - f_adj >= 22:
         why = '흐름은 좋으나 밸류 부담 — 단기 트레이딩 한정·비중 축소'
-    elif fund_score - tech_score >= 22:
+    elif f_adj - tech_score >= 22:
         why = '저평가 우량주이나 타이밍 미흡 — 분할매수·바닥 확인 후'
-    elif tech_score < 48 and fund_score < 48:
+    elif tech_score < 48 and f_adj < 48:
         why = '차트·가치 모두 부진 — 매수 보류'
     elif score >= 60:
         why = '차트가 받쳐주나 밸류는 평범 — 분할 접근 권장'
     else:
         why = '뚜렷한 우위 없음 — 관망 권장'
+    if fund_conf < 0.5:
+        why += ' (가치 데이터 부족 → 차트 위주 해석)'
 
     return {'score': score, 'verdict': verdict, 'verdict_label': vlabel,
-            'verdict_emoji': vemoji, 'why': why}
+            'verdict_emoji': vemoji, 'why': why,
+            'confidence': round(conf, 2), 'confidence_label': conf_label}
 
 
 def _signal_base(ticker):
@@ -1243,8 +1251,11 @@ def signal(ticker):
         fs = _fundamental_signal(info, per, pbr)
         fund_score = fs['fund_score']
 
-        # 전문가식 종합 점수 (차트·가치를 관계까지 고려해 합성)
-        comp = _composite_signal(tech_score, fund_score, ts['regime'], ts['plan'].get('rr'))
+        # 가치 점수 신뢰도: 5대 축 중 데이터가 있는 축의 가중 비율 (0~1)
+        _pw = {'valuation': 0.28, 'profitability': 0.24, 'growth': 0.20, 'health': 0.16, 'cashflow': 0.12}
+        fund_conf = sum(_pw[k] for k, v in fs['pillars'].items() if v is not None)
+        # 전문가식 종합 점수 (차트·가치를 관계·신뢰도까지 고려해 합성)
+        comp = _composite_signal(tech_score, fund_score, ts['regime'], ts['plan'].get('rr'), fund_conf)
         combined = comp['score']
 
         def lab(s):
@@ -1318,6 +1329,30 @@ def backtest(ticker):
             else:
                 i += 1
 
+        # ── 점수 구간별 미래수익 검증 (점수의 단조성: 높은 점수 = 높은 미래수익?) ──
+        # 매 거래일의 기술점수와 그 시점 이후 HOLD_MAX일 단순 수익률을 짝지어 구간 통계.
+        BUCKETS = [(0, 40), (40, 55), (55, 68), (68, 80), (80, 101)]
+        bkt = {f'{lo}-{hi if hi <= 100 else 100}': [] for lo, hi in BUCKETS}
+        for k in range(START, n - 1):
+            s = _technical_signal(closes[:k + 1], highs[:k + 1], lows[:k + 1],
+                                  vols[:k + 1], rs_60=None, weekly_up=None, with_reasons=False)['tech_score']
+            fwd = (closes[min(k + HOLD_MAX, n - 1)] / closes[k] - 1) * 100 if closes[k] else 0
+            for lo, hi in BUCKETS:
+                if lo <= s < hi:
+                    bkt[f'{lo}-{hi if hi <= 100 else 100}'].append(fwd)
+                    break
+        score_buckets = [
+            {'range': key,
+             'n': len(v),
+             'avg_fwd': round(sum(v) / len(v), 2) if v else None,
+             'win_rate': round(sum(1 for x in v if x > 0) / len(v) * 100, 1) if v else None}
+            for key, v in bkt.items()
+        ]
+        # 단조성 점검: 인접 구간 평균수익이 우상향하는 비율 (1.0이면 완전 단조)
+        avgs = [b['avg_fwd'] for b in score_buckets if b['avg_fwd'] is not None]
+        monotonic = (round(sum(1 for a, b in zip(avgs, avgs[1:]) if b >= a) / (len(avgs) - 1), 2)
+                     if len(avgs) >= 2 else None)
+
         total = len(trades)
         rets = [tr['ret'] for tr in trades]
         wins = [r for r in rets if r > 0]
@@ -1348,7 +1383,9 @@ def backtest(ticker):
                 'time':   sum(1 for tr in trades if tr['reason'] == '기간만료'),
             },
             'params': {'buy_threshold': BUY_TH, 'max_hold_days': HOLD_MAX, 'period': '2y'},
-            'note': '수수료·슬리피지 미반영. 상대강도·주봉 필터는 백테스트에서 제외(중립). 과거 성과가 미래를 보장하지 않음.',
+            'score_buckets': score_buckets,   # 점수 구간별 미래 20일 수익·승률 (단조성 검증용)
+            'monotonic': monotonic,           # 인접 구간 우상향 비율 (1.0=완전 단조)
+            'note': '수수료·슬리피지 미반영. 상대강도·주봉 필터는 백테스트에서 제외(중립). 과거 성과가 미래를 보장하지 않음. 점수 구간 검증은 차트(기술) 점수 한정 — 가치 점수는 과거 시점 데이터 제약으로 검증 불가.',
         }
         _cache_set(('backtest', ticker), data)
         return jsonify({'success': True, 'data': data})

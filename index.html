@@ -808,10 +808,11 @@ function renderSignalCard(ticker) {
           <b style="color:${col};font-size:26px;margin-left:8px">${comp.score}</b><span style="color:var(--muted);font-size:11px">/100</span>
         </span>
       </div>
-      <div style="display:flex;gap:10px;align-items:center;margin-top:8px;font-size:12px;color:var(--muted)">
+      <div style="display:flex;gap:10px;align-items:center;margin-top:8px;font-size:12px;color:var(--muted);flex-wrap:wrap">
         <span>📈 차트 <b style="color:${scoreColor(sig.tech_score)}">${sig.tech_score}</b></span>
         <span style="opacity:.5">×</span>
         <span>💰 가치 <b style="color:${scoreColor(sig.fund_score)}">${sig.fund_score}</b></span>
+        ${comp.confidence_label ? `<span style="margin-left:auto">신뢰도 <b>${comp.confidence_label}</b></span>` : ''}
       </div>
       <div style="margin-top:8px;font-size:12px;color:var(--text);line-height:1.6">💡 ${esc(comp.why)}</div>
     </div>`;
@@ -834,6 +835,32 @@ function renderSignalCard(ticker) {
       <div id="bt-${ticker}" style="margin-top:8px"></div>
     </div>
     ${fundBlock}
+  </div>`;
+}
+
+// 점수 구간별 미래수익 검증 표 — "점수가 높을수록 실제로 더 벌었나"(단조성)를 눈으로
+function bucketHtml(d) {
+  const bks = d.score_buckets;
+  if (!bks || !bks.length) return '';
+  const max = Math.max(1, ...bks.map(b => Math.abs(b.avg_fwd || 0)));
+  const rows = bks.map(b => {
+    if (!b.n) return `<div class="signal-bar-row" style="opacity:.4"><span class="signal-bar-label">${b.range}점</span><span class="signal-bar-track"></span><span class="signal-bar-val">표본없음</span></div>`;
+    const pos = b.avg_fwd >= 0;
+    const w = Math.round(Math.abs(b.avg_fwd) / max * 100);
+    const col = pos ? 'var(--green)' : 'var(--red)';
+    return `<div class="signal-bar-row" title="표본 ${b.n}개 · 승률 ${b.win_rate}%">
+      <span class="signal-bar-label">${b.range}점</span>
+      <span class="signal-bar-track"><span class="signal-bar-fill" style="width:${w}%;background:${col}"></span></span>
+      <span class="signal-bar-val" style="color:${col}">${pos ? '+' : ''}${b.avg_fwd}%</span>
+    </div>`;
+  }).join('');
+  const mono = d.monotonic != null
+    ? `<span style="color:${d.monotonic >= 0.67 ? 'var(--green)' : d.monotonic >= 0.5 ? 'var(--yellow)' : 'var(--red)'}">단조성 ${Math.round(d.monotonic * 100)}%</span>`
+    : '';
+  return `<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
+    <div style="font-weight:700;margin-bottom:6px">🔬 점수 구간별 미래 20일 수익 ${mono}
+      <span style="color:var(--muted);font-weight:400;font-size:10px">차트점수 실증</span></div>
+    <div class="signal-bars">${rows}</div>
   </div>`;
 }
 
@@ -860,6 +887,7 @@ async function runBacktest(ticker) {
           <div>최대낙폭 <b style="color:var(--red)">${d.max_drawdown}%</b></div>
           <div>청산 🎯${d.exits.target} 🛑${d.exits.stop} ⏰${d.exits.time}</div>
         </div>
+        ${bucketHtml(d)}
         <div style="margin-top:8px;color:var(--muted);font-size:10px;line-height:1.5">${esc(d.note)}</div>
       </div>`;
   } catch (e) {
