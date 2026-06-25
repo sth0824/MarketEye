@@ -1058,6 +1058,71 @@ def _fundamental_signal(info, per, pbr):
         },
     }
 
+def _composite_signal(tech_score, fund_score, regime, rr):
+    """차트(기술)·가치(펀더멘털)를 전문가식으로 종합한 단일 '진입 점수'.
+    단순 가중합이 아니라:
+      1) 가중 기하평균 → 한쪽이 부실하면 다른 쪽으로 상쇄 불가(균형을 요구)
+      2) 양쪽 동의 시 확신 가산 · 크게 엇갈리면 신뢰 저하 감산
+      3) 추세 역행(하락추세)·손익비 불리 시 상단 제한(떨어지는 칼날 방지)
+    반환: 0~100 점수 + '사도 될지 말지' 한 줄 판정/근거."""
+    t = max(1, tech_score)
+    f = max(1, fund_score)
+    # 1) 가중 기하평균 (차트 0.55 : 가치 0.45) — 불균형을 산술평균보다 강하게 응징
+    score = (t ** 0.55) * (f ** 0.45)
+    gap = abs(tech_score - fund_score)
+    # 2) 동의/불일치 조정
+    if tech_score >= 65 and fund_score >= 65:
+        score += 6          # 차트·가치 모두 양호 → 고확신
+    elif tech_score >= 55 and fund_score >= 55:
+        score += 2
+    if gap >= 35:
+        score -= 6          # 한쪽만 좋음 → 신호 충돌, 신뢰 저하
+    elif gap >= 22:
+        score -= 3
+    # 3) 추세 역행 상단 제한
+    if regime == 'strong_down':
+        score = min(score, 38)
+    elif regime == 'down':
+        score = min(score, 50)
+    # 4) 손익비 — '이 가격'이 살 자리인가
+    if rr is not None:
+        if rr < 1.0:
+            score = min(score, 52)
+        elif rr >= 2.0:
+            score += 3
+    score = int(max(0, min(100, round(score))))
+
+    # 판정/근거 (사도 될지 말지 한 줄)
+    if score >= 72:
+        verdict, vlabel, vemoji = 'strong_buy', '적극 매수 고려', '🟢'
+    elif score >= 60:
+        verdict, vlabel, vemoji = 'buy', '분할 매수 고려', '🟢'
+    elif score >= 48:
+        verdict, vlabel, vemoji = 'watch', '관망', '🟡'
+    else:
+        verdict, vlabel, vemoji = 'avoid', '매수 보류', '🔴'
+
+    if regime in ('down', 'strong_down'):
+        why = '하락추세 — 반등 확인 전 매수 자제'
+    elif rr is not None and rr < 1.0:
+        why = '현재가는 손익비 불리 — 눌림목(저점) 대기'
+    elif tech_score >= 60 and fund_score >= 60:
+        why = '차트·가치 모두 양호 — 정석 매수 구간'
+    elif tech_score - fund_score >= 22:
+        why = '흐름은 좋으나 밸류 부담 — 단기 트레이딩 한정·비중 축소'
+    elif fund_score - tech_score >= 22:
+        why = '저평가 우량주이나 타이밍 미흡 — 분할매수·바닥 확인 후'
+    elif tech_score < 48 and fund_score < 48:
+        why = '차트·가치 모두 부진 — 매수 보류'
+    elif score >= 60:
+        why = '차트가 받쳐주나 밸류는 평범 — 분할 접근 권장'
+    else:
+        why = '뚜렷한 우위 없음 — 관망 권장'
+
+    return {'score': score, 'verdict': verdict, 'verdict_label': vlabel,
+            'verdict_emoji': vemoji, 'why': why}
+
+
 def _signal_base(ticker):
     """신호 계산 중 '장중 불변·고비용' 부분만 캐싱한다.
     (야후 2년 일봉 배열·주봉추세·info·야후 PER/PBR — 모두 장중에 바뀌지 않거나
@@ -1178,16 +1243,19 @@ def signal(ticker):
         fs = _fundamental_signal(info, per, pbr)
         fund_score = fs['fund_score']
 
-        combined = round(tech_score * 0.55 + fund_score * 0.45)
+        # 전문가식 종합 점수 (차트·가치를 관계까지 고려해 합성)
+        comp = _composite_signal(tech_score, fund_score, ts['regime'], ts['plan'].get('rr'))
+        combined = comp['score']
 
         def lab(s):
             if s >= 68: return '매수 고려'
             if s >= 48: return '관망'
             return '주의'
-        label = lab(combined)
+        label = comp['verdict_label']
 
         data = {
             'combined': combined,
+            'composite': comp,
             'tech_score': tech_score,
             'fund_score': fund_score,
             'signal': label,

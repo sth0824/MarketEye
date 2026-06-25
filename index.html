@@ -631,7 +631,12 @@ function signalBadgeHtml(ticker) {
   if (!sig) return '';
   const t = scoreLabel(sig.tech_score);
   const f = scoreLabel(sig.fund_score);
+  const c = sig.composite;
+  const compBadge = c
+    ? `<div class="signal-badge ${scoreLabel(c.score).cls}" style="margin-top:0;font-weight:700">🎯 종합 ${c.score} ${c.verdict_emoji}</div>`
+    : '';
   return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
+    ${compBadge}
     <div class="signal-badge ${t.cls}" style="margin-top:0">📈 차트 ${sig.tech_score} ${t.emoji}</div>
     <div class="signal-badge ${f.cls}" style="margin-top:0">💰 가치 ${sig.fund_score} ${f.emoji}</div>
   </div>`;
@@ -791,6 +796,27 @@ function renderSignalCard(ticker) {
     ${fundReasonsHtml}
   </div>`;
 
+  // 전문가식 종합 점수 — 차트·가치를 관계까지 고려해 합성한 '진입 판정'
+  const comp = sig.composite;
+  const compHtml = comp ? (() => {
+    const col = scoreColor(comp.score);
+    return `<div class="signal-block" style="border:1px solid ${col};background:linear-gradient(135deg,var(--surface2),transparent)">
+      <div class="signal-block-head">
+        <span class="signal-block-title">🎯 종합 진입 점수 <span style="color:var(--muted);font-weight:400;font-size:10px">차트·가치 합성</span></span>
+        <span class="signal-block-score">
+          <span class="signal-badge" style="margin-top:0;background:${col};color:#0b0e14;font-weight:700">${comp.verdict_emoji} ${comp.verdict_label}</span>
+          <b style="color:${col};font-size:26px;margin-left:8px">${comp.score}</b><span style="color:var(--muted);font-size:11px">/100</span>
+        </span>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;margin-top:8px;font-size:12px;color:var(--muted)">
+        <span>📈 차트 <b style="color:${scoreColor(sig.tech_score)}">${sig.tech_score}</b></span>
+        <span style="opacity:.5">×</span>
+        <span>💰 가치 <b style="color:${scoreColor(sig.fund_score)}">${sig.fund_score}</b></span>
+      </div>
+      <div style="margin-top:8px;font-size:12px;color:var(--text);line-height:1.6">💡 ${esc(comp.why)}</div>
+    </div>`;
+  })() : '';
+
   return `<div class="signal-card">
     <div class="signal-card-header">
       <div>
@@ -799,6 +825,7 @@ function renderSignalCard(ticker) {
       </div>
       <span class="signal-badge" style="margin-top:0;background:transparent;border:1px solid ${rg.color};color:${rg.color}">${rg.emoji} ${esc(sig.regime_label || '')}</span>
     </div>
+    ${compHtml}
     ${block('📈 기술적 분석 (차트)', sig.tech_score, techItems)}
     ${planHtml}
     ${reasonsHtml}
