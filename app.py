@@ -9,6 +9,7 @@ import os
 import time
 import threading
 import unicodedata
+import re
 
 app = Flask(__name__)
 CORS(app)
@@ -158,6 +159,87 @@ def safe_val(val):
         return f
     except (TypeError, ValueError):
         return None
+
+
+# ── 네이버 증권 실시간 시세 (한국 종목; 야후 KRX 15~20분 지연 해소) ──────────
+_NAVER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                  'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
+    'Referer': 'https://m.stock.naver.com/',
+}
+
+
+def _naver_num(s):
+    """'358,000' · '5.14' · '28.90배' · '0.47%' · '12,372원' 등을 float로 정규화."""
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        return float(s)
+    cleaned = re.sub(r'[^0-9.\-]', '', str(s))
+    if cleaned in ('', '-', '.', '-.'):
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _naver_won(s):
+    """'2,090조 446억' 형태의 시가총액을 원 단위 float로 변환."""
+    if s is None:
+        return None
+    txt = str(s)
+    total = 0.0
+    matched = False
+    for unit, mul in (('조', 1e12), ('억', 1e8), ('만', 1e4)):
+        m = re.search(r'([\d,]+)\s*' + unit, txt)
+        if m:
+            total += float(m.group(1).replace(',', '')) * mul
+            matched = True
+    return total if matched else _naver_num(txt)
+
+
+def _fetch_naver(code):
+    """네이버 증권 모바일 JSON에서 실시간 시세·펀더멘털을 dict로 반환.
+    code: 종목코드 6자리(예: '005930'). 실패 시 예외를 던진다."""
+    out = {}
+
+    # 1) 실시간 시세 (현재가·등락) — basic 엔드포인트
+    b = requests.get(f'https://m.stock.naver.com/api/stock/{code}/basic',
+                     headers=_NAVER_HEADERS, timeout=5).json()
+    price = _naver_num(b.get('closePrice'))
+    chg = _naver_num(b.get('compareToPreviousClosePrice'))
+    pct = _naver_num(b.get('fluctuationsRatio'))
+    dir_code = str((b.get('compareToPreviousPrice') or {}).get('code') or '')
+    if price is not None and chg is not None and pct is not None:
+        # 네이버 방향코드: 1·2=상승(+), 3=보합(0), 4·5=하락(-)
+        sign = -1 if dir_code in ('4', '5') else (0 if dir_code == '3' else 1)
+        out['price'] = price
+        out['change'] = sign * chg
+        out['changePercent'] = sign * pct
+        out['prevClose'] = price - sign * chg
+
+    # 2) 펀더멘털 + 당일 OHLC·52주 — integration 엔드포인트
+    i = requests.get(f'https://m.stock.naver.com/api/stock/{code}/integration',
+                     headers=_NAVER_HEADERS, timeout=5).json()
+    ti = {x.get('code'): x.get('value') for x in (i.get('totalInfos') or [])}
+    out['open'] = _naver_num(ti.get('openPrice'))
+    out['dayHigh'] = _naver_num(ti.get('highPrice'))
+    out['dayLow'] = _naver_num(ti.get('lowPrice'))
+    out['volume'] = _naver_num(ti.get('accumulatedTradingVolume'))
+    out['high52'] = _naver_num(ti.get('highPriceOf52Weeks'))
+    out['low52'] = _naver_num(ti.get('lowPriceOf52Weeks'))
+    out['per'] = _naver_num(ti.get('per'))
+    out['forwardPer'] = _naver_num(ti.get('cnsPer'))
+    out['eps'] = _naver_num(ti.get('eps'))
+    out['forwardEps'] = _naver_num(ti.get('cnsEps'))
+    out['pbr'] = _naver_num(ti.get('pbr'))
+    out['bookValue'] = _naver_num(ti.get('bps'))
+    dy = _naver_num(ti.get('dividendYieldRatio'))
+    out['dividendYield'] = dy / 100 if dy is not None else None
+    out['dividendRate'] = _naver_num(ti.get('dividend'))
+    out['marketCap'] = _naver_won(ti.get('marketValue'))
+    return out
 
 
 def _yahoo_search(query):
@@ -401,6 +483,19 @@ def _fetch_stock(ticker):
 
             'history': history,
     }
+
+    # 한국 종목은 네이버 실시간 시세·펀더멘털로 보강 (야후 KRX 15~20분 지연 해소).
+    # 네이버 조회 실패 시 위에서 만든 야후 값을 그대로 사용한다(폴백).
+    tk = ticker.upper()
+    if tk.endswith('.KS') or tk.endswith('.KQ'):
+        try:
+            nv = _fetch_naver(tk.split('.')[0])
+            for k, v in nv.items():
+                if v is not None:
+                    data[k] = v
+        except Exception:
+            pass
+
     return data
 
 
