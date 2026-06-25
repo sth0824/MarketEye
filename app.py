@@ -135,15 +135,18 @@ def _load_krx_bundle():
         print('KRX bundle load failed:', e)
         return False
 
-# 앱 시작 시 KRX 로드: 번들 먼저(즉시 검색 가능) → 라이브 갱신 시도(되면 최신화)
-def _krx_loader():
-    _load_krx_bundle()           # 항상 동작하는 기본값 (해외 IP에서도 OK)
+# 앱 시작 시 KRX 로드.
+# 번들은 '동기'로 즉시 로드 → 첫 요청부터 한글 종목명 보장(콜드스타트 레이스로
+# 영어 이름이 캐시에 박히는 문제 방지). 느린 라이브 갱신만 백그라운드로 돌린다.
+_load_krx_bundle()               # 로컬 파일 — 빠름. 즉시 _krx_name 사용 가능
+
+def _krx_live_refresh():
     try:
         _load_krx()              # KRX 사이트 접근 가능하면 최신 목록으로 교체
     except Exception:
         pass                     # 실패해도 번들 데이터 유지
 
-threading.Thread(target=_krx_loader, daemon=True).start()
+threading.Thread(target=_krx_live_refresh, daemon=True).start()
 
 
 def safe_val(val):
