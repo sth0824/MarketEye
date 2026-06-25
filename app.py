@@ -1059,37 +1059,79 @@ def _fundamental_signal(info, per, pbr):
         },
     }
 
+def _signal_base(ticker):
+    """신호 계산 중 '장중 불변·고비용' 부분만 캐싱한다.
+    (야후 2년 일봉 배열·주봉추세·info·야후 PER/PBR — 모두 장중에 바뀌지 않거나
+    분기 단위로만 바뀜) 실시간 가격·네이버 오버레이·점수 계산은 캐싱하지 않고
+    매 요청마다 새로 한다. 데이터 부족 시 None."""
+    cached = _cache_get(('sigbase', ticker), 1800)
+    if cached is not None:
+        return cached
+    t = yf.Ticker(ticker)
+    # 200일선·기울기 판정을 위해 2년치 일봉 확보
+    hist = t.history(period='2y', interval='1d')
+    if hist.empty or len(hist) < 60:
+        return None
+    closes = [float(v) for v in hist['Close'].tolist()]
+    highs  = [float(v) for v in hist['High'].tolist()]
+    lows   = [float(v) for v in hist['Low'].tolist()]
+    vols   = [float(v) for v in hist['Volume'].tolist()]
+
+    # 주봉(상위 시간프레임) 추세 — 장중 거의 불변
+    weekly_up = None
+    try:
+        wclos = [float(v) for v in hist['Close'].resample('W').last().dropna().tolist()]
+        if len(wclos) >= 34:
+            wma30, wma30_prev = sum(wclos[-30:]) / 30, sum(wclos[-34:-4]) / 30
+            weekly_up = wclos[-1] > wma30 and wma30 > wma30_prev
+    except Exception:
+        pass
+
+    # 펀더멘털 info + 야후 PER/PBR (분기 재무 기반, 장중 불변)
+    info = t.info
+    try:
+        fi = t.fast_info
+        if fi.last_price:
+            info['currentPrice'] = fi.last_price
+    except Exception:
+        pass
+    per, pbr, _, _ = _calc_per_pbr(info, t)
+
+    base = {
+        'closes': closes, 'highs': highs, 'lows': lows, 'vols': vols,
+        'last_date': hist.index[-1].date().isoformat(),
+        'weekly_up': weekly_up,
+        'info': info, 'per': per, 'pbr': pbr,
+    }
+    _cache_set(('sigbase', ticker), base)
+    return base
+
+
 @app.route('/api/signal/<path:ticker>')
 def signal(ticker):
-    cached = _cache_get(('signal', ticker), 1800)
-    if cached:
-        return jsonify({'success': True, 'data': cached})
     try:
-        t = yf.Ticker(ticker)
-        # 200일선·기울기 판정을 위해 2년치 일봉 확보 (요청 수는 1회로 동일)
-        hist = t.history(period='2y', interval='1d')
-        if hist.empty or len(hist) < 60:
+        base = _signal_base(ticker)
+        if base is None:
             return jsonify({'success': False, 'error': '데이터 부족 (최소 60거래일 필요)'}), 422
 
-        closes = [float(v) for v in hist['Close'].tolist()]
-        highs  = [float(v) for v in hist['High'].tolist()]
-        lows   = [float(v) for v in hist['Low'].tolist()]
-        vols   = [float(v) for v in hist['Volume'].tolist()]
-        price = closes[-1]
+        # 캐시된 배열·info는 매 요청마다 복사 후 실시간 값으로 오버레이한다.
+        # (결과는 캐싱하지 않으므로 종목에 들어갈 때마다 네이버 실시간이 반영됨)
+        closes = list(base['closes']); highs = list(base['highs'])
+        lows = list(base['lows']); vols = list(base['vols'])
+        weekly_up = base['weekly_up']
+        info = dict(base['info'])
+        per, pbr = base['per'], base['pbr']
         n = len(closes)
 
-        # 한국 종목: 야후 일봉의 마지막 값을 네이버 실시간으로 교체/추가한다.
-        # (야후 KRX 15~20분 지연 → 차트·기술점수·진입가가 실시간 가격을 반영하도록)
-        # per/pbr도 네이버 실시간 값을 받아 아래 펀더멘털 계산에서 덮어쓴다.
-        nv_per = nv_pbr = nv_mcap = nv_fpe = None
+        # 한국 종목: 마지막 봉을 네이버 실시간으로 교체/추가하고 PER/PBR·시총을 최신화.
+        # (야후 KRX 15~20분 지연 → 차트·기술점수·진입가·밸류에이션이 실시간 반영)
         if ticker.upper().endswith(('.KS', '.KQ')):
             try:
                 nv = _fetch_naver(ticker.split('.')[0])
                 rt = nv.get('price')
                 if rt:
-                    last_date = hist.index[-1].date().isoformat()
                     dh, dl, vol = nv.get('dayHigh'), nv.get('dayLow'), nv.get('volume')
-                    if nv.get('tradeDate') == last_date:
+                    if nv.get('tradeDate') == base['last_date']:
                         # 야후에 이미 오늘 봉이 있으면(지연된 값) 실시간으로 갱신
                         closes[-1] = rt
                         highs[-1] = max(highs[-1], dh or rt, rt)
@@ -1098,18 +1140,30 @@ def signal(ticker):
                             vols[-1] = vol
                     else:
                         # 야후에 오늘 봉이 아직 없으면 실시간 봉을 추가
-                        closes.append(rt)
-                        highs.append(dh or rt)
-                        lows.append(dl or rt)
-                        vols.append(vol or 0.0)
-                    price = closes[-1]
+                        closes.append(rt); highs.append(dh or rt)
+                        lows.append(dl or rt); vols.append(vol or 0.0)
                     n = len(closes)
-                nv_per, nv_pbr = nv.get('per'), nv.get('pbr')
+                if nv.get('per') is not None:
+                    per = nv.get('per')
+                if nv.get('pbr') is not None:
+                    pbr = nv.get('pbr')
+                # 네이버 실시간 시총으로 시총 파생 밸류에이션도 최신화 (PSR·EV/EBITDA)
                 nv_mcap, nv_fpe = nv.get('marketCap'), nv.get('forwardPer')
+                if nv_mcap is not None:
+                    info['marketCap'] = nv_mcap
+                    rev = safe_val(info.get('totalRevenue'))
+                    if rev and rev > 0:
+                        info['priceToSalesTrailing12Months'] = nv_mcap / rev
+                    ebitda = safe_val(info.get('ebitda'))
+                    if ebitda and ebitda > 0:
+                        ev = nv_mcap + (safe_val(info.get('totalDebt')) or 0) - (safe_val(info.get('totalCash')) or 0)
+                        info['enterpriseToEbitda'] = ev / ebitda
+                if nv_fpe is not None:
+                    info['forwardPE'] = nv_fpe
             except Exception:
                 pass
 
-        # 시장 대비 상대강도 (지수 종가 캐시 사용) — 백테스트엔 없는 실시간 보강 요소
+        # 시장 대비 상대강도 (지수 종가는 1시간 캐시)
         rs_60 = None
         try:
             bclos = _benchmark_closes(_benchmark_symbol(ticker))
@@ -1118,51 +1172,9 @@ def signal(ticker):
         except Exception:
             pass
 
-        # 주봉(상위 시간프레임) 추세
-        weekly_up = None
-        try:
-            wclos = [float(v) for v in hist['Close'].resample('W').last().dropna().tolist()]
-            if len(wclos) >= 34:
-                wma30, wma30_prev = sum(wclos[-30:]) / 30, sum(wclos[-34:-4]) / 30
-                weekly_up = wclos[-1] > wma30 and wma30 > wma30_prev
-        except Exception:
-            pass
-
         # 기술적 매수 점수 (백테스트와 동일한 순수 엔진을 공유)
         ts = _technical_signal(closes, highs, lows, vols, rs_60, weekly_up)
         tech_score = ts['tech_score']
-
-        # ── 펀더멘털 ──
-        info = t.info
-        # PER/PBR 직접 계산 시 분자(가격)를 최신값으로: fast_info의 실시간 근접가 주입
-        # (개요 카드와 동일하게 맞춰 가장 최신 가격 기준으로 산출)
-        try:
-            fi = t.fast_info
-            if fi.last_price:
-                info['currentPrice'] = fi.last_price
-        except Exception:
-            pass
-        # PER/PBR: yfinance 미제공(한국 종목 등) 시 분기 재무제표로 TTM 직접 계산
-        # — 개요 카드와 동일한 폴백 로직을 재사용해 '-'로 비는 문제를 막는다.
-        per, pbr, _, _ = _calc_per_pbr(info, t)
-        # 한국 종목은 네이버 실시간 PER/PBR로 덮어써 밸류에이션 축을 최신화
-        if nv_per is not None:
-            per = nv_per
-        if nv_pbr is not None:
-            pbr = nv_pbr
-        # 네이버 실시간 시총으로 시총 파생 밸류에이션 지표도 최신화
-        # (PSR·EV/EBITDA·FCF수익률은 시총을 분모/분자로 쓰므로 지연가 영향을 받음)
-        if nv_mcap is not None:
-            info['marketCap'] = nv_mcap
-            rev = safe_val(info.get('totalRevenue'))
-            if rev and rev > 0:
-                info['priceToSalesTrailing12Months'] = nv_mcap / rev
-            ebitda = safe_val(info.get('ebitda'))
-            if ebitda and ebitda > 0:
-                ev = nv_mcap + (safe_val(info.get('totalDebt')) or 0) - (safe_val(info.get('totalCash')) or 0)
-                info['enterpriseToEbitda'] = ev / ebitda
-        if nv_fpe is not None:
-            info['forwardPE'] = nv_fpe
         # 5대 축 전문가형 펀더멘털 점수
         fs = _fundamental_signal(info, per, pbr)
         fund_score = fs['fund_score']
@@ -1189,7 +1201,6 @@ def signal(ticker):
             'plan': ts['plan'],
             'fundamentals': fs,
         }
-        _cache_set(('signal', ticker), data)
         return jsonify({'success': True, 'data': data})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
