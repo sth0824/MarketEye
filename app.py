@@ -9,20 +9,70 @@ import time
 import threading
 import unicodedata
 import re
+import contextlib
+from itertools import count
 
 app = Flask(__name__)
 CORS(app)
 
-# ── 요청 타이밍 로그 ─────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  로깅 유틸 — 유지보수용 통합 로그
+#
+#  설계 의도:
+#   1) 요청 태그: 동시 요청 10개가 서버 로그에 뒤섞여도 '#7 010120.KS'
+#      같은 태그로 어느 요청의 줄인지 한눈에 구분된다(스레드 로컬).
+#   2) timed(): with 블록의 소요시간을 자동 측정·임계 초과 시 WARN 승격.
+#      네트워크/연산 경계마다 같은 포맷으로 찍혀 병목을 바로 식별한다.
+#   3) flush=True: Render/gunicorn은 stdout을 버퍼링해 로그가 늦거나
+#      순서가 꼬인다 → 매 줄 flush로 실시간·정순 보장.
+#   4) LOG_LEVEL 환경변수(DEBUG/INFO/WARN/ERROR)로 상세도 조절.
+# ══════════════════════════════════════════════════════════════════════
+_LEVELS = {'DEBUG': 10, 'INFO': 20, 'WARN': 30, 'ERROR': 40}
+_MIN_LEVEL = _LEVELS.get(os.environ.get('LOG_LEVEL', 'INFO').upper(), 20)
+_req_seq = count(1)
+_local = threading.local()
+
+def _tag():
+    return getattr(_local, 'tag', '-')
+
+def set_tag(tag):
+    """현재 스레드의 로그 태그 지정 (batch 워커 스레드 등에서 직접 호출)."""
+    _local.tag = tag
+
+def log(msg, level='INFO'):
+    if _LEVELS.get(level, 20) < _MIN_LEVEL:
+        return
+    ts = time.strftime('%H:%M:%S')
+    print(f'{ts} [{level:<5}] [{_tag()}] {msg}', flush=True)
+
+@contextlib.contextmanager
+def timed(label, warn_ms=3000, slow_ms=8000):
+    """with 블록 소요시간을 측정해 로깅. 느리면 자동으로 마크·WARN 승격."""
+    t0 = time.time()
+    log(f'▶ {label}', 'DEBUG')
+    try:
+        yield
+    finally:
+        ms = int((time.time() - t0) * 1000)
+        mark = ' 🐢 매우느림' if ms > slow_ms else (' ⏱ 느림' if ms > warn_ms else '')
+        log(f'✓ {label} {ms}ms{mark}', 'WARN' if ms > warn_ms else 'INFO')
+
+# ── 요청 타이밍 로그 (요청별 태그 부여) ──────────────────────
 @app.before_request
 def _req_start():
+    n = next(_req_seq)
+    # 태그 = '#순번 마지막경로조각' → 동시 요청 구분용 (예: '#7 010120.KS')
+    set_tag(f'#{n} {request.path.rsplit("/", 1)[-1][:18]}')
     request._t0 = time.time()
+    request._rtag = _tag()
+    log(f'요청 시작 {request.method} {request.path}', 'DEBUG')
 
 @app.after_request
 def _req_end(response):
-    ms = int((time.time() - request._t0) * 1000)
-    slow = ' ⚠️ SLOW' if ms > 10000 else (' ⏱ ' if ms > 3000 else '')
-    print(f'[API] {request.method} {request.path} → {response.status_code} ({ms}ms){slow}')
+    ms = int((time.time() - getattr(request, '_t0', time.time())) * 1000)
+    mark = ' 🐢 매우느림' if ms > 10000 else (' ⏱ 느림' if ms > 3000 else '')
+    lvl = 'WARN' if ms > 3000 else 'INFO'
+    log(f'요청 완료 {request.method} {request.path} → {response.status_code} ({ms}ms){mark}', lvl)
     return response
 
 # ── 간단한 TTL 캐시 (Yahoo 레이트리밋 방지) ──────────────
@@ -75,7 +125,7 @@ def _load_krx():
         p.feed(res.text)
         rows = p.rows
         if not rows:
-            print('KRX: no rows parsed')
+            log('KRX 라이브: 파싱된 행 없음', 'WARN')
             return
 
         header = rows[0]
@@ -84,7 +134,7 @@ def _load_krx():
         mkt_idx  = next((i for i,h in enumerate(header) if '시장구분' in h), None)
 
         if code_idx is None or name_idx is None:
-            print('KRX: header parse failed', header)
+            log(f'KRX 라이브: 헤더 파싱 실패 {header}', 'WARN')
             return
 
         results = []
@@ -100,13 +150,12 @@ def _load_krx():
             results.append({'code': code, 'ticker': f'{code}.{suffix}', 'name': name, 'market': market})
 
         if not results:
-            print('KRX: parsed 0 valid stocks, keeping existing data')
+            log('KRX 라이브: 유효 종목 0건 — 기존 데이터 유지', 'WARN')
             return
         _krx_stocks = results
-        print(f'KRX stocks loaded: {len(_krx_stocks)}')
+        log(f'KRX 라이브 갱신 완료: {len(_krx_stocks)}종목')
     except Exception as e:
-        print('KRX load error:', e)
-        traceback.print_exc()
+        log(f'KRX 라이브 로드 실패: {e}', 'WARN')
 
 def _normalize(s):
     """검색용 정규화: 소문자 + 공백/특수문자 제거"""
@@ -141,10 +190,10 @@ def _load_krx_bundle():
         path = os.path.join(os.path.dirname(__file__), 'krx_stocks.json')
         with open(path, encoding='utf-8') as f:
             _krx_stocks = json.load(f)
-        print(f'KRX bundle loaded: {len(_krx_stocks)}')
+        log(f'KRX 번들 로드 완료: {len(_krx_stocks)}종목')
         return True
     except Exception as e:
-        print('KRX bundle load failed:', e)
+        log(f'KRX 번들 로드 실패: {e}', 'ERROR')
         return False
 
 # 앱 시작 시 KRX 로드.
@@ -219,8 +268,9 @@ def _fetch_naver(code):
     out = {}
 
     # 1) 실시간 시세 (현재가·등락) — basic 엔드포인트
-    b = requests.get(f'https://m.stock.naver.com/api/stock/{code}/basic',
-                     headers=_NAVER_HEADERS, timeout=5).json()
+    with timed(f'네이버 basic {code}', warn_ms=1500, slow_ms=3000):
+        b = requests.get(f'https://m.stock.naver.com/api/stock/{code}/basic',
+                         headers=_NAVER_HEADERS, timeout=5).json()
     price = _naver_num(b.get('closePrice'))
     chg = _naver_num(b.get('compareToPreviousClosePrice'))
     pct = _naver_num(b.get('fluctuationsRatio'))
@@ -235,8 +285,9 @@ def _fetch_naver(code):
         out['prevClose'] = price - sign * chg
 
     # 2) 펀더멘털 + 당일 OHLC·52주 — integration 엔드포인트
-    i = requests.get(f'https://m.stock.naver.com/api/stock/{code}/integration',
-                     headers=_NAVER_HEADERS, timeout=5).json()
+    with timed(f'네이버 integration {code}', warn_ms=1500, slow_ms=3000):
+        i = requests.get(f'https://m.stock.naver.com/api/stock/{code}/integration',
+                         headers=_NAVER_HEADERS, timeout=5).json()
     ti = {x.get('code'): x.get('value') for x in (i.get('totalInfos') or [])}
     out['open'] = _naver_num(ti.get('openPrice'))
     out['dayHigh'] = _naver_num(ti.get('highPrice'))
@@ -262,7 +313,8 @@ def _yahoo_search(query):
     params = {'q': query, 'lang': 'en-US', 'region': 'US',
               'quotesCount': 10, 'newsCount': 0, 'enableFuzzyQuery': True, 'enableCb': False}
     headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'}
-    res = requests.get(url, params=params, headers=headers, timeout=5)
+    with timed(f'야후 검색 "{query}"', warn_ms=1500, slow_ms=3000):
+        res = requests.get(url, params=params, headers=headers, timeout=5)
     return res.json().get('quotes', [])
 
 
@@ -287,6 +339,7 @@ def search_ticker():
         # 1차: KRX 로컬 검색 (한국어/종목코드 모두 커버)
         for s in _search_krx(query, limit=8):
             add(s['ticker'], s['name'], s['market'])
+        log(f'검색 "{query}" → KRX 로컬 {len(results)}건', 'DEBUG')
 
         # 2차: 한국어가 아니면 야후 글로벌 검색으로 해외 종목 추가
         if not _is_korean(query) and len(results) < 10:
@@ -298,6 +351,7 @@ def search_ticker():
 
         return jsonify(results[:10])
     except Exception as e:
+        log(f'검색 "{query}" 실패: {e}', 'ERROR')
         traceback.print_exc()
         return jsonify([])
 
@@ -371,25 +425,23 @@ def _calc_per_pbr(info, t):
 def _fetch_stock(ticker):
     """yfinance에서 종목 데이터를 조회해 dict로 반환 (실패 시 예외)."""
     _t = ticker.upper()
-    print(f'[stock] {_t} → yf.Ticker 생성')
     t = yf.Ticker(_t)
 
-    t0 = time.time()
-    print(f'[stock] {_t} → info 조회 시작')
-    info = t.info
-    print(f'[stock] {_t} → info 완료 ({int((time.time()-t0)*1000)}ms), keys={len(info)}')
+    # info: 야후 스크레이프 — 보통 stock 응답에서 가장 무거운 단계
+    with timed(f'yf.info {_t}'):
+        info = t.info
+    log(f'yf.info {_t} keys={len(info)}', 'DEBUG')
 
     # fast_info로 실시간에 가까운 가격 보완 (price 계산 전에 먼저 반영)
     try:
-        t0 = time.time()
-        fi = t.fast_info
-        if fi.last_price:
-            info['currentPrice'] = fi.last_price
-        if fi.previous_close:
-            info['regularMarketPreviousClose'] = fi.previous_close
-        print(f'[stock] {_t} → fast_info 완료 ({int((time.time()-t0)*1000)}ms)')
+        with timed(f'yf.fast_info {_t}', warn_ms=1500, slow_ms=3000):
+            fi = t.fast_info
+            if fi.last_price:
+                info['currentPrice'] = fi.last_price
+            if fi.previous_close:
+                info['regularMarketPreviousClose'] = fi.previous_close
     except Exception as e:
-        print(f'[stock] {_t} → fast_info 실패: {e}')
+        log(f'yf.fast_info {_t} 실패: {e}', 'WARN')
 
     # 현재가 (fast_info 보완 후 계산)
     price = safe_val(info.get('currentPrice') or info.get('regularMarketPrice'))
@@ -412,15 +464,14 @@ def _fetch_stock(ticker):
     if div_yield is not None:
         div_yield = div_yield / 100
 
-    # PER/PBR
-    t0 = time.time()
-    per, pbr, eps_calc, bps_calc = _calc_per_pbr(info, t)
-    print(f'[stock] {_t} → PER/PBR 완료 ({int((time.time()-t0)*1000)}ms) per={per} pbr={pbr}')
+    # PER/PBR (yfinance 미제공 시 분기 재무제표를 추가 조회 → 느릴 수 있음)
+    with timed(f'PER/PBR 계산 {_t}', warn_ms=2000, slow_ms=4000):
+        per, pbr, eps_calc, bps_calc = _calc_per_pbr(info, t)
+    log(f'PER/PBR {_t} per={per} pbr={pbr}', 'DEBUG')
 
     # 최근 1년 종가 히스토리 (차트용 - 월별)
-    t0 = time.time()
-    hist = t.history(period='1y', interval='1mo')
-    print(f'[stock] {_t} → history 완료 ({int((time.time()-t0)*1000)}ms) rows={len(hist)}')
+    with timed(f'yf.history(1y) {_t}', warn_ms=2000, slow_ms=4000):
+        hist = t.history(period='1y', interval='1mo')
     history = []
     if not hist.empty:
         for dt, row in hist.iterrows():
@@ -515,16 +566,14 @@ def _fetch_stock(ticker):
     # 네이버 조회 실패 시 위에서 만든 야후 값을 그대로 사용한다(폴백).
     tk = ticker.upper()
     if tk.endswith('.KS') or tk.endswith('.KQ'):
-        t0 = time.time()
-        print(f'[stock] {tk} → 네이버 실시간 조회 시작')
         try:
-            nv = _fetch_naver(tk.split('.')[0])
+            with timed(f'네이버 보강 {tk}', warn_ms=2000, slow_ms=4000):
+                nv = _fetch_naver(tk.split('.')[0])
             for k, v in nv.items():
                 if v is not None:
                     data[k] = v
-            print(f'[stock] {tk} → 네이버 완료 ({int((time.time()-t0)*1000)}ms)')
         except Exception as e:
-            print(f'[stock] {tk} → 네이버 실패 ({int((time.time()-t0)*1000)}ms): {e}')
+            log(f'네이버 보강 {tk} 실패(야후값 폴백): {e}', 'WARN')
 
     return data
 
@@ -539,12 +588,15 @@ def get_stock(ticker):
     key = ticker.upper()
     cached = _cache_get(('stock', key), STOCK_TTL)
     if cached is not None:
+        log(f'stock {key} 캐시 히트', 'DEBUG')
         return jsonify({'success': True, 'data': cached})
     try:
-        data = _fetch_stock(ticker)
+        with timed(f'stock 전체조회 {key}'):
+            data = _fetch_stock(ticker)
         _cache_set(('stock', key), data)
         return jsonify({'success': True, 'data': data})
     except Exception as e:
+        log(f'stock {key} 실패: {e}', 'ERROR')
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -555,10 +607,12 @@ def get_price(ticker):
     key = ticker.upper()
     cached = _cache_get(('price', key), PRICE_TTL)
     if cached is not None:
+        log(f'price {key} 캐시 히트', 'DEBUG')
         return jsonify({'success': True, 'data': cached})
     try:
         t = yf.Ticker(key)
-        fi = t.fast_info
+        with timed(f'yf.fast_info(price) {key}', warn_ms=1500, slow_ms=3000):
+            fi = t.fast_info
         last = safe_val(fi.last_price)
         prev = safe_val(fi.previous_close)
         change = (last - prev) if (last is not None and prev) else None
@@ -576,6 +630,7 @@ def get_price(ticker):
         _cache_set(('price', key), data)
         return jsonify({'success': True, 'data': data})
     except Exception as e:
+        log(f'price {key} 실패: {e}', 'ERROR')
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -587,20 +642,27 @@ def get_batch():
     ticker_list = [t.strip() for t in tickers.split(',') if t.strip()]
     results = {}
     lock = threading.Lock()
+    parent_tag = _tag()   # 워커 스레드에 부모 요청 태그 전파
 
     def work(ticker):
         key = ticker.upper()
+        set_tag(f'{parent_tag}»{key}')   # 워커 로그도 부모 요청으로 추적 가능
         cached = _cache_get(('stock', key), STOCK_TTL)
         try:
-            data = cached if cached is not None else _fetch_stock(ticker)
-            if cached is None:
+            if cached is not None:
+                data = cached
+            else:
+                with timed(f'batch 조회 {key}'):
+                    data = _fetch_stock(ticker)
                 _cache_set(('stock', key), data)
             payload = {'success': True, 'data': data}
         except Exception as e:
+            log(f'batch {key} 실패: {e}', 'ERROR')
             payload = {'success': False, 'error': str(e)}
         with lock:
             results[key] = payload
 
+    log(f'batch {len(ticker_list)}종목 병렬조회 시작: {ticker_list}', 'DEBUG')
     threads = [threading.Thread(target=work, args=(t,)) for t in ticker_list]
     for th in threads: th.start()
     for th in threads: th.join()
@@ -681,9 +743,11 @@ def _benchmark_closes(symbol):
     if cached is not None:
         return cached
     try:
-        h = yf.Ticker(symbol).history(period='1y', interval='1d')
+        with timed(f'yf.history(지수 {symbol})', warn_ms=2000, slow_ms=4000):
+            h = yf.Ticker(symbol).history(period='1y', interval='1d')
         closes = [float(v) for v in h['Close'].tolist()] if not h.empty else []
-    except Exception:
+    except Exception as e:
+        log(f'지수 {symbol} 조회 실패: {e}', 'WARN')
         closes = []
     _cache_set(('bench', symbol), closes)
     return closes
@@ -1168,16 +1232,15 @@ def _signal_base(ticker):
     매 요청마다 새로 한다. 데이터 부족 시 None."""
     cached = _cache_get(('sigbase', ticker), 1800)
     if cached is not None:
-        print(f'[signal_base] {ticker} → 캐시 히트')
+        log(f'signal_base {ticker} 캐시 히트', 'DEBUG')
         return cached
 
-    print(f'[signal_base] {ticker} → 2년 일봉 조회 시작')
-    t0 = time.time()
     t = yf.Ticker(ticker)
-    hist = t.history(period='2y', interval='1d')
-    print(f'[signal_base] {ticker} → 일봉 완료 ({int((time.time()-t0)*1000)}ms) rows={len(hist)}')
+    # 200일선·기울기 판정을 위해 2년치 일봉 확보 (signal의 핵심 비용)
+    with timed(f'yf.history(2y) {ticker}'):
+        hist = t.history(period='2y', interval='1d')
     if hist.empty or len(hist) < 60:
-        print(f'[signal_base] {ticker} → 데이터 부족 (rows={len(hist)})')
+        log(f'signal_base {ticker} 데이터 부족 (rows={len(hist)})', 'WARN')
         return None
     closes = [float(v) for v in hist['Close'].tolist()]
     highs  = [float(v) for v in hist['High'].tolist()]
@@ -1195,19 +1258,16 @@ def _signal_base(ticker):
         pass
 
     # 펀더멘털 info + 야후 PER/PBR (분기 재무 기반, 장중 불변)
-    t0 = time.time()
-    print(f'[signal_base] {ticker} → info 조회 시작')
-    info = t.info
-    print(f'[signal_base] {ticker} → info 완료 ({int((time.time()-t0)*1000)}ms)')
+    with timed(f'yf.info(signal) {ticker}'):
+        info = t.info
     try:
         fi = t.fast_info
         if fi.last_price:
             info['currentPrice'] = fi.last_price
     except Exception:
         pass
-    t0 = time.time()
-    per, pbr, _, _ = _calc_per_pbr(info, t)
-    print(f'[signal_base] {ticker} → PER/PBR 완료 ({int((time.time()-t0)*1000)}ms)')
+    with timed(f'PER/PBR(signal) {ticker}', warn_ms=2000, slow_ms=4000):
+        per, pbr, _, _ = _calc_per_pbr(info, t)
 
     base = {
         'closes': closes, 'highs': highs, 'lows': lows, 'vols': vols,
@@ -1222,7 +1282,8 @@ def _signal_base(ticker):
 @app.route('/api/signal/<path:ticker>')
 def signal(ticker):
     try:
-        base = _signal_base(ticker)
+        with timed(f'signal_base {ticker}'):
+            base = _signal_base(ticker)
         if base is None:
             return jsonify({'success': False, 'error': '데이터 부족 (최소 60거래일 필요)'}), 422
 
@@ -1238,11 +1299,9 @@ def signal(ticker):
         # 한국 종목: 마지막 봉을 네이버 실시간으로 교체/추가하고 PER/PBR·시총을 최신화.
         # (야후 KRX 15~20분 지연 → 차트·기술점수·진입가·밸류에이션이 실시간 반영)
         if ticker.upper().endswith(('.KS', '.KQ')):
-            t0_nv = time.time()
-            print(f'[signal] {ticker} → 네이버 실시간 조회 시작')
             try:
-                nv = _fetch_naver(ticker.split('.')[0])
-                print(f'[signal] {ticker} → 네이버 완료 ({int((time.time()-t0_nv)*1000)}ms)')
+                with timed(f'네이버 실시간 {ticker}', warn_ms=2000, slow_ms=4000):
+                    nv = _fetch_naver(ticker.split('.')[0])
                 rt = nv.get('price')
                 if rt:
                     dh, dl, vol = nv.get('dayHigh'), nv.get('dayLow'), nv.get('volume')
@@ -1276,7 +1335,7 @@ def signal(ticker):
                 if nv_fpe is not None:
                     info['forwardPE'] = nv_fpe
             except Exception as e:
-                print(f'[signal] {ticker} → 네이버 실패 ({int((time.time()-t0_nv)*1000)}ms): {e}')
+                log(f'네이버 실시간 {ticker} 실패(야후값 폴백): {e}', 'WARN')
 
         # 시장 대비 상대강도 (지수 종가는 1시간 캐시)
         rs_60 = None
@@ -1287,12 +1346,14 @@ def signal(ticker):
         except Exception:
             pass
 
-        # 기술적 매수 점수 (백테스트와 동일한 순수 엔진을 공유)
-        ts = _technical_signal(closes, highs, lows, vols, rs_60, weekly_up)
-        tech_score = ts['tech_score']
-        # 5대 축 전문가형 펀더멘털 점수
-        fs = _fundamental_signal(info, per, pbr)
-        fund_score = fs['fund_score']
+        # 점수 계산은 순수 연산 — 통째로 한 번만 측정(보통 수 ms, 느리면 데이터 이상)
+        with timed(f'signal 점수계산 {ticker}', warn_ms=500, slow_ms=1500):
+            # 기술적 매수 점수 (백테스트와 동일한 순수 엔진을 공유)
+            ts = _technical_signal(closes, highs, lows, vols, rs_60, weekly_up)
+            tech_score = ts['tech_score']
+            # 5대 축 전문가형 펀더멘털 점수
+            fs = _fundamental_signal(info, per, pbr)
+            fund_score = fs['fund_score']
 
         # 가치 점수 신뢰도: 5대 축 중 데이터가 있는 축의 가중 비율 (0~1)
         _pw = {'valuation': 0.28, 'profitability': 0.24, 'growth': 0.20, 'health': 0.16, 'cashflow': 0.12}
@@ -1324,6 +1385,8 @@ def signal(ticker):
         }
         return jsonify({'success': True, 'data': data})
     except Exception as e:
+        log(f'signal {ticker} 실패: {e}', 'ERROR')
+        traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -1334,10 +1397,12 @@ def backtest(ticker):
     손절/목표 또는 최대 보유기간 도달 시 청산. 상대강도·주봉은 백테스트에서 제외(중립)."""
     cached = _cache_get(('backtest', ticker), 3600)
     if cached:
+        log(f'backtest {ticker} 캐시 히트', 'DEBUG')
         return jsonify({'success': True, 'data': cached})
     try:
         t = yf.Ticker(ticker)
-        hist = t.history(period='2y', interval='1d')
+        with timed(f'yf.history(2y,backtest) {ticker}'):
+            hist = t.history(period='2y', interval='1d')
         if hist.empty or len(hist) < 120:
             return jsonify({'success': False, 'error': '데이터 부족 (최소 120거래일 필요)'}), 422
 
@@ -1350,6 +1415,8 @@ def backtest(ticker):
         BUY_TH, HOLD_MAX, START = 68, 20, 70   # 매수기준 / 최대보유(거래일) / 시작 인덱스
         trades = []
         i = START
+        # 과거 전 구간에 신호 엔진을 반복 적용 — backtest의 핵심 CPU 비용 (O(n²))
+        _bt0 = time.time()
         while i < n - 1:
             sub = _technical_signal(closes[:i + 1], highs[:i + 1], lows[:i + 1],
                                     vols[:i + 1], rs_60=None, weekly_up=None, with_reasons=False)
@@ -1371,9 +1438,12 @@ def backtest(ticker):
                 i += (bars or 1)        # 보유기간 동안 중복 진입 방지
             else:
                 i += 1
+        log(f'backtest 매매시뮬 {ticker} {int((time.time()-_bt0)*1000)}ms ({len(trades)}건)',
+            'WARN' if (time.time() - _bt0) > 1.5 else 'INFO')
 
         # ── 점수 구간별 미래수익 검증 (점수의 단조성: 높은 점수 = 높은 미래수익?) ──
         # 매 거래일의 기술점수와 그 시점 이후 HOLD_MAX일 단순 수익률을 짝지어 구간 통계.
+        _bk0 = time.time()
         BUCKETS = [(0, 40), (40, 55), (55, 68), (68, 80), (80, 101)]
         bkt = {f'{lo}-{hi if hi <= 100 else 100}': [] for lo, hi in BUCKETS}
         for k in range(START, n - 1):
@@ -1391,6 +1461,7 @@ def backtest(ticker):
              'win_rate': round(sum(1 for x in v if x > 0) / len(v) * 100, 1) if v else None}
             for key, v in bkt.items()
         ]
+        log(f'backtest 구간검증 {ticker} {int((time.time()-_bk0)*1000)}ms', 'DEBUG')
         # 단조성 점검: 인접 구간 평균수익이 우상향하는 비율 (1.0이면 완전 단조)
         avgs = [b['avg_fwd'] for b in score_buckets if b['avg_fwd'] is not None]
         monotonic = (round(sum(1 for a, b in zip(avgs, avgs[1:]) if b >= a) / (len(avgs) - 1), 2)
@@ -1433,6 +1504,7 @@ def backtest(ticker):
         _cache_set(('backtest', ticker), data)
         return jsonify({'success': True, 'data': data})
     except Exception as e:
+        log(f'backtest {ticker} 실패: {e}', 'ERROR')
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
