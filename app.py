@@ -1,9 +1,11 @@
 from flask import Flask, jsonify, request, send_file
+from flask.json.provider import DefaultJSONProvider
 from flask_cors import CORS
 import yfinance as yf
 import requests
 import traceback
 import json
+import math
 import os
 import time
 import threading
@@ -14,6 +16,29 @@ from itertools import count
 
 app = Flask(__name__)
 CORS(app)
+
+
+# ── JSON NaN/Inf 전역 방어막 ────────────────────────────────────────────
+# Python 기본 json은 NaN/Infinity를 그대로 출력하지만 이는 표준 JSON이 아니라
+# 브라우저 JSON.parse(=res.json())가 거부한다. 과거 signal 응답의 rs_60 등이
+# NaN으로 새어 나가 진입 신호 탭 전체가 '분석 중'에서 멈췄다. 모든 응답에서
+# 비유한(NaN/Inf) float를 재귀적으로 null로 치환해 근본적으로 차단한다.
+def _json_safe(o):
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: _json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_json_safe(v) for v in o]
+    return o
+
+
+class SafeJSONProvider(DefaultJSONProvider):
+    def dumps(self, obj, **kwargs):
+        return super().dumps(_json_safe(obj), **kwargs)
+
+
+app.json = SafeJSONProvider(app)
 
 # ══════════════════════════════════════════════════════════════════════
 #  로깅 유틸 — 유지보수용 통합 로그
