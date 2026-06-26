@@ -87,6 +87,7 @@
   .card-change { font-size: 12px; margin-top: 2px; }
   .up { color: var(--green); }
   .down { color: var(--red); }
+  .neutral { color: var(--muted); }
   .card-remove { position: absolute; top: 10px; right: 10px; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 16px; padding: 2px 6px; border-radius: 4px; }
   .card-remove:hover { background: var(--surface2); color: var(--red); }
   .card-fav { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; padding: 0; line-height: 1; flex-shrink: 0; }
@@ -1022,8 +1023,11 @@ function renderCards() {
     card.draggable = true;
     card.dataset.ticker = ticker;
     const chg = d.changePercent;
-    const chgCls = chg >= 0 ? 'up' : 'down';
-    const chgSign = chg >= 0 ? '+' : '';
+    // 주의: JS에서 null >= 0 은 true 라서, 등락률이 아직 안 들어온(null) 종목을
+    // 무조건 'up'(초록)으로 칠하던 버그가 있었다. 숫자일 때만 상승/하락을 판정한다.
+    const hasChg = typeof chg === 'number' && !isNaN(chg);
+    const chgCls = !hasChg ? 'neutral' : (chg >= 0 ? 'up' : 'down');
+    const chgSign = hasChg && chg > 0 ? '+' : '';
     card.innerHTML = `
       <button class="card-remove" onclick="removeTicker('${ticker}')" title="현재 그룹에서 제거">✕</button>
       <div class="card-header">
