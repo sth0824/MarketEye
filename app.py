@@ -13,6 +13,18 @@ import re
 app = Flask(__name__)
 CORS(app)
 
+# ── 요청 타이밍 로그 ─────────────────────────────────────────
+@app.before_request
+def _req_start():
+    request._t0 = time.time()
+
+@app.after_request
+def _req_end(response):
+    ms = int((time.time() - request._t0) * 1000)
+    slow = ' ⚠️ SLOW' if ms > 10000 else (' ⏱ ' if ms > 3000 else '')
+    print(f'[API] {request.method} {request.path} → {response.status_code} ({ms}ms){slow}')
+    return response
+
 # ── 간단한 TTL 캐시 (Yahoo 레이트리밋 방지) ──────────────
 _cache = {}
 _cache_lock = threading.Lock()
@@ -358,18 +370,26 @@ def _calc_per_pbr(info, t):
 
 def _fetch_stock(ticker):
     """yfinance에서 종목 데이터를 조회해 dict로 반환 (실패 시 예외)."""
-    t = yf.Ticker(ticker.upper())
+    _t = ticker.upper()
+    print(f'[stock] {_t} → yf.Ticker 생성')
+    t = yf.Ticker(_t)
+
+    t0 = time.time()
+    print(f'[stock] {_t} → info 조회 시작')
     info = t.info
+    print(f'[stock] {_t} → info 완료 ({int((time.time()-t0)*1000)}ms), keys={len(info)}')
 
     # fast_info로 실시간에 가까운 가격 보완 (price 계산 전에 먼저 반영)
     try:
+        t0 = time.time()
         fi = t.fast_info
         if fi.last_price:
             info['currentPrice'] = fi.last_price
         if fi.previous_close:
             info['regularMarketPreviousClose'] = fi.previous_close
-    except Exception:
-        pass
+        print(f'[stock] {_t} → fast_info 완료 ({int((time.time()-t0)*1000)}ms)')
+    except Exception as e:
+        print(f'[stock] {_t} → fast_info 실패: {e}')
 
     # 현재가 (fast_info 보완 후 계산)
     price = safe_val(info.get('currentPrice') or info.get('regularMarketPrice'))
@@ -387,16 +407,20 @@ def _fetch_stock(ticker):
     low52 = safe_val(info.get('fiftyTwoWeekLow'))
     high52 = safe_val(info.get('fiftyTwoWeekHigh'))
 
-    # PER / PBR 계산 (yfinance 미제공 시 분기 TTM 재무제표로 직접 계산)
-    per, pbr, eps_calc, bps_calc = _calc_per_pbr(info, t)
-
     # 배당수익률: 최신 yfinance는 퍼센트 숫자(0.36 = 0.36%)로 반환 → 비율(fraction)로 정규화
     div_yield = safe_val(info.get('dividendYield'))
     if div_yield is not None:
         div_yield = div_yield / 100
 
+    # PER/PBR
+    t0 = time.time()
+    per, pbr, eps_calc, bps_calc = _calc_per_pbr(info, t)
+    print(f'[stock] {_t} → PER/PBR 완료 ({int((time.time()-t0)*1000)}ms) per={per} pbr={pbr}')
+
     # 최근 1년 종가 히스토리 (차트용 - 월별)
+    t0 = time.time()
     hist = t.history(period='1y', interval='1mo')
+    print(f'[stock] {_t} → history 완료 ({int((time.time()-t0)*1000)}ms) rows={len(hist)}')
     history = []
     if not hist.empty:
         for dt, row in hist.iterrows():
@@ -491,13 +515,16 @@ def _fetch_stock(ticker):
     # 네이버 조회 실패 시 위에서 만든 야후 값을 그대로 사용한다(폴백).
     tk = ticker.upper()
     if tk.endswith('.KS') or tk.endswith('.KQ'):
+        t0 = time.time()
+        print(f'[stock] {tk} → 네이버 실시간 조회 시작')
         try:
             nv = _fetch_naver(tk.split('.')[0])
             for k, v in nv.items():
                 if v is not None:
                     data[k] = v
-        except Exception:
-            pass
+            print(f'[stock] {tk} → 네이버 완료 ({int((time.time()-t0)*1000)}ms)')
+        except Exception as e:
+            print(f'[stock] {tk} → 네이버 실패 ({int((time.time()-t0)*1000)}ms): {e}')
 
     return data
 
@@ -1141,11 +1168,16 @@ def _signal_base(ticker):
     매 요청마다 새로 한다. 데이터 부족 시 None."""
     cached = _cache_get(('sigbase', ticker), 1800)
     if cached is not None:
+        print(f'[signal_base] {ticker} → 캐시 히트')
         return cached
+
+    print(f'[signal_base] {ticker} → 2년 일봉 조회 시작')
+    t0 = time.time()
     t = yf.Ticker(ticker)
-    # 200일선·기울기 판정을 위해 2년치 일봉 확보
     hist = t.history(period='2y', interval='1d')
+    print(f'[signal_base] {ticker} → 일봉 완료 ({int((time.time()-t0)*1000)}ms) rows={len(hist)}')
     if hist.empty or len(hist) < 60:
+        print(f'[signal_base] {ticker} → 데이터 부족 (rows={len(hist)})')
         return None
     closes = [float(v) for v in hist['Close'].tolist()]
     highs  = [float(v) for v in hist['High'].tolist()]
@@ -1163,14 +1195,19 @@ def _signal_base(ticker):
         pass
 
     # 펀더멘털 info + 야후 PER/PBR (분기 재무 기반, 장중 불변)
+    t0 = time.time()
+    print(f'[signal_base] {ticker} → info 조회 시작')
     info = t.info
+    print(f'[signal_base] {ticker} → info 완료 ({int((time.time()-t0)*1000)}ms)')
     try:
         fi = t.fast_info
         if fi.last_price:
             info['currentPrice'] = fi.last_price
     except Exception:
         pass
+    t0 = time.time()
     per, pbr, _, _ = _calc_per_pbr(info, t)
+    print(f'[signal_base] {ticker} → PER/PBR 완료 ({int((time.time()-t0)*1000)}ms)')
 
     base = {
         'closes': closes, 'highs': highs, 'lows': lows, 'vols': vols,
@@ -1201,8 +1238,11 @@ def signal(ticker):
         # 한국 종목: 마지막 봉을 네이버 실시간으로 교체/추가하고 PER/PBR·시총을 최신화.
         # (야후 KRX 15~20분 지연 → 차트·기술점수·진입가·밸류에이션이 실시간 반영)
         if ticker.upper().endswith(('.KS', '.KQ')):
+            t0_nv = time.time()
+            print(f'[signal] {ticker} → 네이버 실시간 조회 시작')
             try:
                 nv = _fetch_naver(ticker.split('.')[0])
+                print(f'[signal] {ticker} → 네이버 완료 ({int((time.time()-t0_nv)*1000)}ms)')
                 rt = nv.get('price')
                 if rt:
                     dh, dl, vol = nv.get('dayHigh'), nv.get('dayLow'), nv.get('volume')
@@ -1235,8 +1275,8 @@ def signal(ticker):
                         info['enterpriseToEbitda'] = ev / ebitda
                 if nv_fpe is not None:
                     info['forwardPE'] = nv_fpe
-            except Exception:
-                pass
+            except Exception as e:
+                print(f'[signal] {ticker} → 네이버 실패 ({int((time.time()-t0_nv)*1000)}ms): {e}')
 
         # 시장 대비 상대강도 (지수 종가는 1시간 캐시)
         rs_60 = None
