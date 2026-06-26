@@ -1109,6 +1109,8 @@ function drawMiniChart(ticker, history) {
   setTimeout(() => {
     const canvas = document.getElementById(`mini-${ticker}`);
     if (!canvas) return;
+    const existing = Chart.getChart(canvas);
+    if (existing) existing.destroy();
     const ctx = canvas.getContext('2d');
     const prices = history.map(h => h.close);
     const labels = history.map(h => h.date);
