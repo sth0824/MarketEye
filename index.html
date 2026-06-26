@@ -87,6 +87,7 @@
   .card-change { font-size: 12px; margin-top: 2px; }
   .up { color: var(--green); }
   .down { color: var(--red); }
+  .neutral { color: var(--muted); }
   .card-remove { position: absolute; top: 10px; right: 10px; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 16px; padding: 2px 6px; border-radius: 4px; }
   .card-remove:hover { background: var(--surface2); color: var(--red); }
   .card-fav { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; padding: 0; line-height: 1; flex-shrink: 0; }
@@ -296,6 +297,39 @@
 const _isLocal = location.protocol === 'file:'
   || ['localhost', '127.0.0.1', ''].includes(location.hostname);
 const API = _isLocal ? 'http://localhost:5001/api' : '/api';
+
+// ── 디버그 fetch 래퍼 (타임아웃 30s + 단계별 콘솔 로그) ──────────
+const FETCH_TIMEOUT_MS = 30000;
+async function apiFetch(url, options = {}) {
+  const label = url.replace(API, '');
+  const controller = new AbortController();
+  const tid = setTimeout(() => {
+    controller.abort();
+    console.error(`[MarketEye] ⏰ TIMEOUT (${FETCH_TIMEOUT_MS/1000}s): ${label}`);
+  }, FETCH_TIMEOUT_MS);
+  const t0 = performance.now();
+  console.log(`[MarketEye] ▶ 요청: ${label}`);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    const ms = Math.round(performance.now() - t0);
+    if (!res.ok) {
+      console.warn(`[MarketEye] ⚠ HTTP ${res.status} (${ms}ms): ${label}`);
+    } else {
+      const slow = ms > 10000 ? ' 🐢 매우 느림!' : ms > 3000 ? ' ⏱ 느림' : '';
+      console.log(`[MarketEye] ✔ 완료 (${ms}ms)${slow}: ${label}`);
+    }
+    return res;
+  } catch(e) {
+    const ms = Math.round(performance.now() - t0);
+    if (e.name === 'AbortError') {
+      throw new Error(`요청 타임아웃 (${FETCH_TIMEOUT_MS/1000}초 초과) — 서버가 응답하지 않습니다`);
+    }
+    console.error(`[MarketEye] ✖ 실패 (${ms}ms): ${label} — ${e.message}`);
+    throw e;
+  } finally {
+    clearTimeout(tid);
+  }
+}
 let stocks = {};   // ticker -> data
 let signals = {};  // ticker -> signal data
 let activeTab = 'overview';
@@ -353,7 +387,7 @@ const POPULAR =['AAPL','MSFT','GOOGL','AMZN','NVDA','TSLA','META','NFLX','ORCL',
 // 한국 종목코드(숫자)를 KRX 검색으로 .KS/.KQ 정확히 해석
 async function resolveKrTicker(code) {
   try {
-    const res = await fetch(`${API}/search?q=${encodeURIComponent(code)}`);
+    const res = await apiFetch(`${API}/search?q=${encodeURIComponent(code)}`);
     const list = await res.json();
     const hit = list.find(r => r.ticker.startsWith(code + '.'));
     if (hit) return hit.ticker;
@@ -386,7 +420,7 @@ async function addTicker(ticker) {
 async function fetchStock(ticker) {
   setLoadingBar(30);
   try {
-    const res = await fetch(`${API}/stock/${ticker}`);
+    const res = await apiFetch(`${API}/stock/${ticker}`);
     const json = await res.json();
     if (!json.success) throw new Error(json.error || '데이터 로드 실패');
     stocks[ticker] = json.data;
@@ -421,7 +455,7 @@ async function refreshPrices() {
   await Promise.all(tickers.map(async ticker => {
     try {
       // 경량 엔드포인트: 가격·등락률만 (재무지표·히스토리는 유지)
-      const res = await fetch(`${API}/price/${ticker}`);
+      const res = await apiFetch(`${API}/price/${ticker}`);
       const json = await res.json();
       if (json.success) Object.assign(stocks[ticker], json.data);
     } catch(e) {}
@@ -533,7 +567,7 @@ async function pullSync(pushIfEmpty) {
   if (!syncCode) return;
   updateSyncUI('불러오는 중...');
   try {
-    const res = await fetch(`${API}/sync/${encodeURIComponent(syncCode)}`);
+    const res = await apiFetch(`${API}/sync/${encodeURIComponent(syncCode)}`);
     const json = await res.json();
     if (!json.success) throw new Error(json.error || '불러오기 실패');
     if (json.data && Array.isArray(json.data.groups) && json.data.groups.length) {
@@ -574,7 +608,7 @@ async function pushSyncNow() {
     const persistActive = activeId === QUICK_ID
       ? (persistGroups.find(g => g.id !== FAV_ID) || persistGroups[0] || {}).id
       : activeId;
-    const res = await fetch(`${API}/sync/${encodeURIComponent(syncCode)}`, {
+    const res = await apiFetch(`${API}/sync/${encodeURIComponent(syncCode)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ data: { groups: persistGroups, activeId: persistActive } }),
@@ -601,7 +635,7 @@ function loadActiveGroup() {
 
 async function fetchSignal(ticker) {
   try {
-    const res = await fetch(`${API}/signal/${encodeURIComponent(ticker)}`);
+    const res = await apiFetch(`${API}/signal/${encodeURIComponent(ticker)}`);
     const json = await res.json();
     if (json.success) {
       signals[ticker] = json.data;
@@ -609,8 +643,14 @@ async function fetchSignal(ticker) {
       if (activeTab === 'overview') updateSignalBadge(ticker, json.data);
       // 신호 탭이 열려 있으면 재렌더
       if (activeTab === 'signal') renderSignalTab();
+    } else {
+      console.warn(`[MarketEye] signal 실패: ${ticker} — ${json.error || '알 수 없음'}`);
     }
-  } catch(e) {}
+  } catch(e) {
+    // 과거엔 여기서 에러를 통째로 삼켜, 렌더 예외가 나도 카드가 '분석 중'에
+    // 영원히 멈춰 콘솔에 단서조차 없었다. 이제는 반드시 남긴다.
+    console.error(`[MarketEye] fetchSignal 예외: ${ticker}`, e);
+  }
 }
 
 // 점수 → 등급 라벨 (기술/펀더멘털 각각 독립 평가)
@@ -656,7 +696,18 @@ function renderSignalTab() {
     section.innerHTML = '<p class="signal-loading">종목을 추가하면 진입 신호가 표시됩니다.</p>';
     return;
   }
-  section.innerHTML = `<div class="signal-section-grid">${tickers.map(t => renderSignalCard(t)).join('')}</div>`;
+  section.innerHTML = `<div class="signal-section-grid">${tickers.map(t => {
+    // 한 종목 렌더가 예외로 터져도 나머지 카드까지 같이 사라지지 않게 격리한다.
+    try { return renderSignalCard(t); }
+    catch (e) {
+      console.error(`[MarketEye] 진입신호 렌더 실패: ${t}`, e);
+      return `<div class="signal-card">
+        <div class="signal-name">${esc((stocks[t] && stocks[t].name) || t)}</div>
+        <div class="signal-ticker-label">${esc(t)}</div>
+        <div class="signal-loading" style="padding:20px 0;color:var(--red)">표시 중 오류: ${esc(e.message)}</div>
+      </div>`;
+    }
+  }).join('')}</div>`;
 }
 
 function renderSignalCard(ticker) {
@@ -870,7 +921,7 @@ async function runBacktest(ticker) {
   if (!box) return;
   box.innerHTML = '<span style="color:var(--muted);font-size:12px">백테스트 계산 중… (수 초 소요)</span>';
   try {
-    const res = await fetch(`${API}/backtest/${encodeURIComponent(ticker)}`);
+    const res = await apiFetch(`${API}/backtest/${encodeURIComponent(ticker)}`);
     const json = await res.json();
     if (!json.success) throw new Error(json.error || '백테스트 실패');
     const d = json.data;
@@ -989,8 +1040,11 @@ function renderCards() {
     card.draggable = true;
     card.dataset.ticker = ticker;
     const chg = d.changePercent;
-    const chgCls = chg >= 0 ? 'up' : 'down';
-    const chgSign = chg >= 0 ? '+' : '';
+    // 주의: JS에서 null >= 0 은 true 라서, 등락률이 아직 안 들어온(null) 종목을
+    // 무조건 'up'(초록)으로 칠하던 버그가 있었다. 숫자일 때만 상승/하락을 판정한다.
+    const hasChg = typeof chg === 'number' && !isNaN(chg);
+    const chgCls = !hasChg ? 'neutral' : (chg >= 0 ? 'up' : 'down');
+    const chgSign = hasChg && chg > 0 ? '+' : '';
     card.innerHTML = `
       <button class="card-remove" onclick="removeTicker('${ticker}')" title="현재 그룹에서 제거">✕</button>
       <div class="card-header">
@@ -1076,6 +1130,8 @@ function drawMiniChart(ticker, history) {
   setTimeout(() => {
     const canvas = document.getElementById(`mini-${ticker}`);
     if (!canvas) return;
+    const existing = Chart.getChart(canvas);
+    if (existing) existing.destroy();
     const ctx = canvas.getContext('2d');
     const prices = history.map(h => h.close);
     const labels = history.map(h => h.date);
@@ -1344,7 +1400,7 @@ async function fetchSuggestions(raw) {
   // 검색어 그대로 서버에 전달 — KRX 로컬 DB로 한국어 검색, 영문은 야후 파이낸스
   let results = [];
   try {
-    const res = await fetch(`${API}/search?q=${encodeURIComponent(raw.trim())}`);
+    const res = await apiFetch(`${API}/search?q=${encodeURIComponent(raw.trim())}`);
     results = await res.json();
     if (!results.length) { hideSug(); return; }
     selectedIdx = -1;
