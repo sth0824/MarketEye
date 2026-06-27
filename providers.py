@@ -11,11 +11,16 @@ import json
 import re
 import unicodedata
 import threading
+import concurrent.futures
 import requests
 import yfinance as yf
 
-from infra import log, timed
+from infra import log, timed, set_tag, _tag, _cache_get, _cache_set
 from signals import safe_val
+
+# 네이버 실시간 시세 캐시 TTL(초). 같은 종목 연속 조회 시 재호출을 막되,
+# 짧게 잡아 실시간성과 호출 절감을 절충한다 (환경변수로 조정 가능).
+NAVER_TTL = int(os.environ.get('NAVER_TTL', '12'))
 
 
 # ── KRX 전체 상장 종목 캐시 ──────────────────────────────
@@ -177,13 +182,33 @@ def _naver_won(s):
 
 def _fetch_naver(code):
     """네이버 증권 모바일 JSON에서 실시간 시세·펀더멘털을 dict로 반환.
-    code: 종목코드 6자리(예: '005930'). 실패 시 예외를 던진다."""
+    code: 종목코드 6자리(예: '005930'). 실패 시 예외를 던진다.
+
+    basic(실시간 시세)·integration(펀더멘털)은 서로 독립적인 엔드포인트라
+    병렬로 조회해 지연을 줄인다(순차 대비 약 절반). 결과는 NAVER_TTL초 동안
+    캐시해 같은 종목 연속 조회 시 재호출을 막는다(짧은 TTL이라 실시간성 유지).
+    조회 실패 시 예외가 전파되며(캐시에 저장하지 않음) 호출부가 야후값으로 폴백한다."""
+    cached = _cache_get(('naver', code), NAVER_TTL)
+    if cached is not None:
+        return cached
+
     out = {}
+    # basic·integration 두 엔드포인트를 동시에 조회 (순차 → 병렬로 지연 절감)
+    parent = _tag()
+
+    def _get(kind):
+        set_tag(parent)   # 워커 스레드 로그도 부모 요청 태그로 추적
+        with timed(f'네이버 {kind} {code}', warn_ms=1500, slow_ms=3000):
+            return requests.get(f'https://m.stock.naver.com/api/stock/{code}/{kind}',
+                                headers=_NAVER_HEADERS, timeout=5).json()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f_basic = ex.submit(_get, 'basic')
+        f_integ = ex.submit(_get, 'integration')
+        b = f_basic.result()
+        i = f_integ.result()
 
     # 1) 실시간 시세 (현재가·등락) — basic 엔드포인트
-    with timed(f'네이버 basic {code}', warn_ms=1500, slow_ms=3000):
-        b = requests.get(f'https://m.stock.naver.com/api/stock/{code}/basic',
-                         headers=_NAVER_HEADERS, timeout=5).json()
     price = _naver_num(b.get('closePrice'))
     chg = _naver_num(b.get('compareToPreviousClosePrice'))
     pct = _naver_num(b.get('fluctuationsRatio'))
@@ -197,10 +222,7 @@ def _fetch_naver(code):
         out['changePercent'] = sign * pct
         out['prevClose'] = price - sign * chg
 
-    # 2) 펀더멘털 + 당일 OHLC·52주 — integration 엔드포인트
-    with timed(f'네이버 integration {code}', warn_ms=1500, slow_ms=3000):
-        i = requests.get(f'https://m.stock.naver.com/api/stock/{code}/integration',
-                         headers=_NAVER_HEADERS, timeout=5).json()
+    # 2) 펀더멘털 + 당일 OHLC·52주 — integration 엔드포인트 (위에서 병렬 조회됨)
     ti = {x.get('code'): x.get('value') for x in (i.get('totalInfos') or [])}
     out['open'] = _naver_num(ti.get('openPrice'))
     out['dayHigh'] = _naver_num(ti.get('highPrice'))
@@ -218,6 +240,7 @@ def _fetch_naver(code):
     out['dividendYield'] = dy / 100 if dy is not None else None
     out['dividendRate'] = _naver_num(ti.get('dividend'))
     out['marketCap'] = _naver_won(ti.get('marketValue'))
+    _cache_set(('naver', code), out)
     return out
 
 
