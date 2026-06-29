@@ -348,10 +348,31 @@ def signal(ticker):
         except Exception:
             pass
 
+        # 12-1 절대 모멘텀 (최근 12개월 수익에서 마지막 1개월 제외 — 단기 반전 회피).
+        # 가격만으로 계산하며 RS 슬롯에 통합 입력된다(새 가중치 없음). 데이터 부족 시 None.
+        mom_12_1 = None
+        if n > 252 and closes[-252] > 0:
+            mom_12_1 = closes[-21] / closes[-252] - 1
+
+        # 유동성(신뢰도 전용): 최근 20일 일평균 거래대금. 빈약하면 신뢰도만 낮춘다(점수 불변).
+        # 통화 스케일이 다르므로 KR(원)/해외(달러) 임계를 분리. 거래대금 미상이면 1.0(영향 없음).
+        liq_factor = 1.0
+        try:
+            if len(vols) >= 20 and closes[-1] > 0:
+                turnover = (sum(vols[-20:]) / 20) * closes[-1]
+                if ticker.upper().endswith(('.KS', '.KQ')):
+                    liq_factor = (1.0 if turnover >= 1e9 else 0.85 if turnover >= 3e8
+                                  else 0.7 if turnover >= 1e8 else 0.5)
+                else:
+                    liq_factor = (1.0 if turnover >= 2e7 else 0.85 if turnover >= 5e6
+                                  else 0.7 if turnover >= 1e6 else 0.5)
+        except Exception:
+            liq_factor = 1.0
+
         # 점수 계산은 순수 연산 — 통째로 한 번만 측정(보통 수 ms, 느리면 데이터 이상)
         with timed(f'signal 점수계산 {ticker}', warn_ms=500, slow_ms=1500):
             # 기술적 매수 점수 (백테스트와 동일한 순수 엔진을 공유)
-            ts = _technical_signal(closes, highs, lows, vols, rs_60, weekly_up)
+            ts = _technical_signal(closes, highs, lows, vols, rs_60, weekly_up, mom_12_1=mom_12_1)
             tech_score = ts['tech_score']
             # 5대 축 전문가형 펀더멘털 점수
             fs = _fundamental_signal(info, per, pbr)
@@ -360,8 +381,9 @@ def signal(ticker):
         # 가치 점수 신뢰도: 5대 축 중 데이터가 있는 축의 가중 비율 (0~1)
         _pw = {'valuation': 0.28, 'profitability': 0.24, 'growth': 0.20, 'health': 0.16, 'cashflow': 0.12}
         fund_conf = sum(_pw[k] for k, v in fs['pillars'].items() if v is not None)
-        # 전문가식 종합 점수 (차트·가치를 관계·신뢰도까지 고려해 합성)
-        comp = _composite_signal(tech_score, fund_score, ts['regime'], ts['plan'].get('rr'), fund_conf)
+        # 전문가식 종합 점수 (차트·가치를 관계·신뢰도·유동성까지 고려해 합성)
+        comp = _composite_signal(tech_score, fund_score, ts['regime'], ts['plan'].get('rr'),
+                                 fund_conf, liq_factor)
         combined = comp['score']
 
         def lab(s):

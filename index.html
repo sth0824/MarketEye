@@ -859,6 +859,7 @@ function renderSignalCard(ticker) {
           <div><div style="color:var(--muted);font-size:10px">목표</div><div style="color:var(--green)">${fmt(plan.target, cur)} <span style="font-size:10px">+${plan.target_pct != null ? plan.target_pct + '%' : ''}</span></div></div>
         </div>
         <div style="text-align:center;margin-top:8px;color:var(--muted)">손익비 <b style="color:${rrColor}">${plan.rr != null ? plan.rr + ' : 1' : '-'}</b></div>
+        ${plan.size_per_1pct != null ? `<div style="text-align:center;margin-top:6px;color:var(--muted);font-size:10px">자본 1% 리스크 기준 권장 비중 <b style="color:var(--text)">${plan.size_per_1pct > 100 ? '100%+' : plan.size_per_1pct + '%'}</b> · 주당 위험 ${fmt(plan.risk_per_share, cur)}</div>` : ''}
       </div>`
     : '';
 

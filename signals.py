@@ -82,10 +82,11 @@ def _pivots(highs, lows, k=5):
             pl.append((i, lows[i]))
     return ph, pl
 
-def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, with_reasons=True):
+def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, with_reasons=True, mom_12_1=None):
     """가격/거래량 배열만으로 기술적 매수 점수를 계산 (네트워크·펀더멘털 불필요).
     배열의 '마지막 시점' 기준으로 평가 → 실시간 신호와 백테스트가 동일 로직을 공유한다.
-    rs_60(시장 대비 60일 초과수익)·weekly_up(주봉 추세)은 선택 입력, 없으면 중립 처리."""
+    rs_60(시장 대비 60일 초과수익)·weekly_up(주봉 추세)·mom_12_1(12-1 절대 모멘텀)은
+    선택 입력, 없으면 중립 처리(→ 백테스트는 이들을 중립으로 둬 동작 불변)."""
     n = len(closes)
     price = closes[-1]
 
@@ -98,6 +99,10 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
     ma60_prev = _sma(closes, 60, 20)
     slope60 = (ma60 - ma60_prev) if (ma60 and ma60_prev) else 0.0
     rising60 = slope60 > 0
+    # 추세 강도: 60일선 기울기를 가격으로 정규화(≈20거래일당 변화율). 부호·크기 모두 보존.
+    # 기존엔 rising60(부울)만 쓰고 크기를 버렸다 → 가파른 추세와 거의 평평한 드리프트를
+    # 구분하지 못했다. 아래 7단계에서 trend_s를 이 크기로 '미세' 보정한다(순수 가격).
+    trend_strength = (slope60 / ma60) if (ma60 and ma60 > 0) else 0.0
     above_lt = bool(lt and price > lt)
     align_up = bool(ma20 and ma60 and price > ma20 > ma60 and (not ma120 or ma60 > ma120))
     align_dn = bool(ma20 and ma60 and price < ma20 < ma60 and (not ma120 or ma60 < ma120))
@@ -113,17 +118,32 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
         regime, regime_label, trend_s = 'range', '횡보', 50
     is_up   = regime in ('up', 'strong_up')
     is_down = regime in ('down', 'strong_down')
+    # 추세 강도 보정(보수적): 가파르면 소폭 가산, 거의 평평한데 추세로 분류됐으면 소폭 감산.
+    # 레짐 분류 자체는 건드리지 않아 게이트·백테스트 단조성에 영향을 주지 않는다.
+    if is_up:
+        if   trend_strength > 0.04:  trend_s += 5    # 강하게 우상향
+        elif trend_strength < 0.01:  trend_s -= 6    # 사실상 평평 → 상승 과신 보정
+    elif is_down:
+        if   trend_strength < -0.04: trend_s -= 5
+        elif trend_strength > -0.01: trend_s += 4
+    trend_s = max(0, min(100, trend_s))
 
     # 2단계: RSI(14) + 강세 다이버전스
     rsi_arr = _rsi_series(closes, 14)
     rsi = rsi_arr[-1] if rsi_arr[-1] is not None else 50.0
-    bull_div = False
+    bull_div = bear_div = False
     if n >= 35 and all(x is not None for x in rsi_arr[-30:]):
         recent, prior = closes[-12:], closes[-30:-12]
         ri = n - 12 + recent.index(min(recent))
         pi = n - 30 + prior.index(min(prior))
         if closes[ri] < closes[pi] and rsi_arr[ri] > rsi_arr[pi] + 2:
             bull_div = True
+        # 약세 다이버전스(대칭): 가격은 고점 갱신인데 RSI는 더 낮은 고점 → 상승동력 약화.
+        # 매수점수에선 '천장권 추격 억제' 용도. 순수 가격, 강세 로직과 대칭.
+        rhi = n - 12 + recent.index(max(recent))
+        phi = n - 30 + prior.index(max(prior))
+        if closes[rhi] > closes[phi] and rsi_arr[rhi] < rsi_arr[phi] - 2:
+            bear_div = True
     if is_up:
         if   rsi < 40: rsi_s = 78
         elif rsi < 55: rsi_s = 88
@@ -185,13 +205,27 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
         vol_s = 22 if vol_ratio >= 1.8 else (38 if vol_ratio >= 1.1 else 48)
 
     # 6단계: 상대강도(입력) · 시장구조 · 매매플랜
-    rs_s = 50
-    if rs_60 is not None:
-        if   rs_60 > 0.10:  rs_s = 92
-        elif rs_60 > 0.03:  rs_s = 76
-        elif rs_60 > -0.03: rs_s = 55
-        elif rs_60 > -0.10: rs_s = 38
-        else:               rs_s = 20
+    # RS 슬롯 = 시장 대비 60일 상대강도(rs_60) + 12-1 절대 모멘텀(mom_12_1)을 통합.
+    # 둘은 가중치를 새로 만들지 않고 '하나의 RS 점수'로 평균낸다(가용한 것만).
+    # 12-1 모멘텀(최근 12개월 중 마지막 1개월 제외)은 학술적으로 가장 강건한 추세 팩터.
+    # 둘 다 입력이 없으면(=백테스트) 50 중립 → 기존 동작 불변.
+    def _rs_rel(x):
+        if x is None: return None
+        if   x > 0.10:  return 92
+        elif x > 0.03:  return 76
+        elif x > -0.03: return 55
+        elif x > -0.10: return 38
+        else:           return 20
+    def _rs_mom(m):
+        if m is None: return None
+        if   m > 0.40:  return 90
+        elif m > 0.20:  return 78
+        elif m > 0.05:  return 62
+        elif m > -0.05: return 50
+        elif m > -0.20: return 35
+        else:           return 20
+    _rs_parts = [s for s in (_rs_rel(rs_60), _rs_mom(mom_12_1)) if s is not None]
+    rs_s = (sum(_rs_parts) / len(_rs_parts)) if _rs_parts else 50
     weekly_label = '-' if weekly_up is None else ('상승' if weekly_up else '하락/횡보')
 
     structure_s, structure_label = 50, '불명확'
@@ -249,6 +283,10 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
     ext = ((price / ma20) - 1) if ma20 else 0.0
     if ext > 0.15 and not gated:
         tech_score -= 8
+    # 약세 다이버전스: 천장권(과매수·밴드 상단)에서만 소폭 감산해 추격매수 억제.
+    # 강세 다이버전스 가산(+15·+8)과 대칭되는 절제된 크기. 중간권 노이즈엔 적용 안 함.
+    if bear_div and not is_down and (rsi >= 60 or bb_pct > 0.7):
+        tech_score -= 5
     tech_score = max(0, min(100, tech_score))
 
     # 근거 문장 (차트를 몰라도 읽히게)
@@ -277,6 +315,8 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
             reasons.append('MACD 하락 모멘텀 — 진입 보류')
         if bull_div:
             reasons.append('강세 다이버전스 — 하락 동력 약화, 반전 가능성')
+        if bear_div and not is_down and (rsi >= 60 or bb_pct > 0.7):
+            reasons.append('약세 다이버전스 — 가격 고점 갱신에도 모멘텀 둔화, 추격 자제')
         if up_bar and vol_ratio >= 1.8:
             reasons.append(f'거래량 급증({vol_ratio:.1f}배) 동반 상승 — 매수세 확인')
         elif (not up_bar) and vol_ratio >= 1.8:
@@ -286,6 +326,9 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
         if rs_60 is not None:
             if rs_60 > 0.03:    reasons.append(f'시장 대비 강세(상대수익 +{rs_60*100:.0f}%p) — 주도주 성향')
             elif rs_60 < -0.05: reasons.append(f'시장 대비 약세({rs_60*100:.0f}%p) — 지수보다 부진')
+        if mom_12_1 is not None:
+            if mom_12_1 > 0.20:    reasons.append(f'장기 모멘텀 강함(12-1 +{mom_12_1*100:.0f}%) — 추세 지속 우위')
+            elif mom_12_1 < -0.20: reasons.append(f'장기 모멘텀 약함(12-1 {mom_12_1*100:.0f}%) — 추세 하방 지속')
         if structure_label == '상승구조(HH·HL)':
             reasons.append('고점·저점 동반 상승(HH·HL) — 추세 구조 건강')
         elif structure_label == '하락구조(LH·LL)':
@@ -324,8 +367,11 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
             'bb_pct': round(bb_pct * 100, 1),
             'vol_ratio': round(vol_ratio, 2),
             'bull_div': bull_div,
+            'bear_div': bear_div,
             'ext': round(ext * 100, 1),
             'rs_60': round(rs_60 * 100, 1) if rs_60 is not None else None,
+            'mom_12_1': round(mom_12_1 * 100, 1) if mom_12_1 is not None else None,
+            'trend_strength': round(trend_strength * 100, 2),
             'structure': structure_label,
             'weekly': weekly_label,
         },
@@ -339,6 +385,11 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
             'support':    round(support, 2)    if support    is not None else None,
             'resistance': round(resistance, 2) if resistance is not None else None,
             'atr':        round(atr, 2)        if atr        is not None else None,
+            # 포지션 사이징(순수 산수): 손절폭(stop_pct) 기준 '자본 대비 비중'.
+            #  risk_per_share = 진입가-손절가(주당 위험), size_per_1pct = 자본의 1%만
+            #  잃도록 잡을 때의 권장 비중(% of 자본) = 100/손절%. 투자조언 아님.
+            'risk_per_share': round(price - stop, 2) if stop is not None else None,
+            'size_per_1pct':  round(100.0 / stop_pct, 1) if (stop_pct and stop_pct > 0) else None,
         },
     }
 
@@ -482,7 +533,7 @@ def _fundamental_signal(info, per, pbr):
         },
     }
 
-def _composite_signal(tech_score, fund_score, regime, rr, fund_conf=1.0):
+def _composite_signal(tech_score, fund_score, regime, rr, fund_conf=1.0, liq_factor=1.0):
     """차트(기술)·가치(펀더멘털)를 전문가식으로 합성한 단일 '진입 점수'.
 
     설계 원칙(이중 계산·과신 방지):
@@ -517,8 +568,11 @@ def _composite_signal(tech_score, fund_score, regime, rr, fund_conf=1.0):
         score = min(score, 40)
     score = int(max(0, min(100, round(score))))
 
-    # 신뢰도 등급 (데이터 완전성 + 두 점수 일치도)
-    conf = fund_conf * (1 - min(gap, 50) / 100)
+    # 신뢰도 등급 (데이터 완전성 + 두 점수 일치도 + 유동성)
+    # liq_factor: 일평균 거래대금이 빈약하면(<1.0) 신뢰도만 낮춘다 — 점수는 건드리지 않음.
+    # 소형주 슬리피지·변동성 과신 억제용 방어 장치(거래대금 미상이면 1.0=영향 없음).
+    liq_factor = max(0.0, min(1.0, liq_factor))
+    conf = fund_conf * (1 - min(gap, 50) / 100) * liq_factor
     conf_label = '높음' if conf >= 0.6 else ('보통' if conf >= 0.35 else '낮음')
 
     # 판정/근거 (사도 될지 말지 한 줄)
@@ -549,6 +603,8 @@ def _composite_signal(tech_score, fund_score, regime, rr, fund_conf=1.0):
         why = '뚜렷한 우위 없음 — 관망 권장'
     if fund_conf < 0.5:
         why += ' (가치 데이터 부족 → 차트 위주 해석)'
+    if liq_factor < 0.8:
+        why += ' (거래대금 적음 → 체결·변동성 주의, 비중 보수적으로)'
 
     return {'score': score, 'verdict': verdict, 'verdict_label': vlabel,
             'verdict_emoji': vemoji, 'why': why,
