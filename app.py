@@ -10,7 +10,8 @@ import threading
 # 공용 인프라(로깅·타이밍·TTL 캐시·JSON 방어막)는 infra.py로 분리.
 from infra import (
     log, timed, set_tag, _tag, _req_seq,
-    _cache_get, _cache_set, SafeJSONProvider,
+    _cache_get, _cache_set, _cache_get_stale, yf_call, is_rate_limited,
+    SafeJSONProvider,
 )
 # 외부 데이터 수집층(KRX·네이버·야후 조회)은 providers.py로 분리.
 from providers import (
@@ -104,9 +105,16 @@ def get_stock(ticker):
         _cache_set(('stock', key), data)
         return jsonify({'success': True, 'data': data})
     except Exception as e:
+        # 레이트리밋 등으로 신규 조회 실패 시, 만료된 캐시라도 있으면 그 값을 돌려준다.
+        # (빈 화면·달러 표기 대신 직전 정상값을 보여주는 graceful degradation)
+        stale = _cache_get_stale(('stock', key))
+        if stale is not None:
+            log(f'stock {key} 조회 실패 → stale 캐시 반환: {e}', 'WARN')
+            return jsonify({'success': True, 'data': stale, 'stale': True})
         log(f'stock {key} 실패: {e}', 'ERROR')
         traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
+        status = 429 if is_rate_limited(e) else 500
+        return jsonify({'success': False, 'error': str(e)}), status
 
 
 @app.route('/api/price/<ticker>')
@@ -120,7 +128,7 @@ def get_price(ticker):
     try:
         t = yf.Ticker(key)
         with timed(f'yf.fast_info(price) {key}', warn_ms=1500, slow_ms=3000):
-            fi = t.fast_info
+            fi = yf_call(lambda: t.fast_info, f'yf.fast_info(price) {key}')
         last = safe_val(fi.last_price)
         prev = safe_val(fi.previous_close)
         change = (last - prev) if (last is not None and prev) else None
@@ -138,9 +146,14 @@ def get_price(ticker):
         _cache_set(('price', key), data)
         return jsonify({'success': True, 'data': data})
     except Exception as e:
+        stale = _cache_get_stale(('price', key))
+        if stale is not None:
+            log(f'price {key} 조회 실패 → stale 캐시 반환: {e}', 'WARN')
+            return jsonify({'success': True, 'data': stale, 'stale': True})
         log(f'price {key} 실패: {e}', 'ERROR')
         traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
+        status = 429 if is_rate_limited(e) else 500
+        return jsonify({'success': False, 'error': str(e)}), status
 
 
 @app.route('/api/batch')
@@ -195,7 +208,8 @@ def _benchmark_closes(symbol):
         return cached
     try:
         with timed(f'yf.history(지수 {symbol})', warn_ms=2000, slow_ms=4000):
-            h = yf.Ticker(symbol).history(period='1y', interval='1d')
+            h = yf_call(lambda: yf.Ticker(symbol).history(period='1y', interval='1d'),
+                        f'yf.history(지수 {symbol})')
         closes = [float(v) for v in h['Close'].tolist()] if not h.empty else []
     except Exception as e:
         log(f'지수 {symbol} 조회 실패: {e}', 'WARN')
@@ -216,8 +230,17 @@ def _signal_base(ticker):
 
     t = yf.Ticker(ticker)
     # 200일선·기울기 판정을 위해 2년치 일봉 확보 (signal의 핵심 비용)
-    with timed(f'yf.history(2y) {ticker}'):
-        hist = t.history(period='2y', interval='1d')
+    try:
+        with timed(f'yf.history(2y) {ticker}'):
+            hist = yf_call(lambda: t.history(period='2y', interval='1d'),
+                           f'yf.history(2y) {ticker}')
+    except Exception as e:
+        # 레이트리밋 등으로 일봉을 못 받으면 만료된 base라도 재사용 (신호 유지)
+        stale = _cache_get_stale(('sigbase', ticker))
+        if stale is not None:
+            log(f'signal_base {ticker} 조회 실패 → stale base 재사용: {e}', 'WARN')
+            return stale
+        raise
     if hist.empty or len(hist) < 60:
         log(f'signal_base {ticker} 데이터 부족 (rows={len(hist)})', 'WARN')
         return None
@@ -238,9 +261,9 @@ def _signal_base(ticker):
 
     # 펀더멘털 info + 야후 PER/PBR (분기 재무 기반, 장중 불변)
     with timed(f'yf.info(signal) {ticker}'):
-        info = t.info
+        info = yf_call(lambda: t.info, f'yf.info(signal) {ticker}')
     try:
-        fi = t.fast_info
+        fi = yf_call(lambda: t.fast_info, f'yf.fast_info(signal) {ticker}')
         if fi.last_price:
             info['currentPrice'] = fi.last_price
     except Exception:
@@ -366,7 +389,8 @@ def signal(ticker):
     except Exception as e:
         log(f'signal {ticker} 실패: {e}', 'ERROR')
         traceback.print_exc()
-        return jsonify({'success': False, 'error': str(e)}), 500
+        status = 429 if is_rate_limited(e) else 500
+        return jsonify({'success': False, 'error': str(e)}), status
 
 
 @app.route('/api/backtest/<path:ticker>')
@@ -381,7 +405,8 @@ def backtest(ticker):
     try:
         t = yf.Ticker(ticker)
         with timed(f'yf.history(2y,backtest) {ticker}'):
-            hist = t.history(period='2y', interval='1d')
+            hist = yf_call(lambda: t.history(period='2y', interval='1d'),
+                           f'yf.history(2y,backtest) {ticker}')
         if hist.empty or len(hist) < 120:
             return jsonify({'success': False, 'error': '데이터 부족 (최소 120거래일 필요)'}), 422
 

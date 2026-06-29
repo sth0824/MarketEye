@@ -7,6 +7,7 @@ app.py·providers.py 등 모든 모듈이 이 인프라를 공유한다(순환 i
 import os
 import time
 import math
+import random
 import threading
 import contextlib
 from itertools import count
@@ -88,4 +89,53 @@ def _cache_get(key, ttl):
 def _cache_set(key, val):
     with _cache_lock:
         _cache[key] = (time.time(), val)
+
+def _cache_get_stale(key):
+    """TTL을 무시하고 캐시에 남아 있는 값을 반환 (없으면 None).
+    야후 레이트리밋으로 신규 조회가 실패했을 때, 만료된 값이라도 빈 화면·달러
+    표기 대신 보여주기 위한 graceful degradation 폴백용."""
+    with _cache_lock:
+        e = _cache.get(key)
+        return e[1] if e else None
+
+
+# ── 야후(yfinance) 레이트리밋 완화 ────────────────────────────────────
+# 동시 다발 호출이 'Too Many Requests'(429)를 유발해 종목 조회가 통째로 500나던
+# 문제를 완화한다: ① 전역 최소 간격으로 호출 폭주를 막고 ② 429면 백오프 재시도.
+def is_rate_limited(exc):
+    """야후/yfinance 레이트리밋(429) 예외인지 판별."""
+    s = str(exc).lower()
+    return 'too many requests' in s or 'rate limit' in s or '429' in s
+
+# 전역 최소 호출 간격(초). 0이면 비활성. 동시 요청이 야후를 때리는 빈도를 낮춘다.
+YF_MIN_INTERVAL = float(os.environ.get('YF_MIN_INTERVAL', '0.35'))
+YF_RETRIES = int(os.environ.get('YF_RETRIES', '2'))
+_yf_lock = threading.Lock()
+_yf_last = [0.0]
+
+def yf_call(fn, label='yf', retries=None):
+    """yfinance 네트워크 호출(fn: 인자 없는 callable)을 전역 간격 제한 + 레이트리밋
+    백오프 재시도로 감싼다. 호출부는 yf_call(lambda: t.info, 'yf.info AAPL') 형태.
+    레이트리밋이 아닌 예외는 즉시 전파한다."""
+    retries = YF_RETRIES if retries is None else retries
+    last_exc = None
+    for attempt in range(retries + 1):
+        if YF_MIN_INTERVAL > 0:
+            # 진입 시점만 전역적으로 띄운다(실제 네트워크 대기까지 직렬화하진 않음).
+            with _yf_lock:
+                wait = YF_MIN_INTERVAL - (time.time() - _yf_last[0])
+                if wait > 0:
+                    time.sleep(wait)
+                _yf_last[0] = time.time()
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if is_rate_limited(e) and attempt < retries:
+                back = (2 ** attempt) * 0.5 + random.random() * 0.4
+                log(f'{label} 레이트리밋 — {back:.1f}s 후 재시도 ({attempt + 1}/{retries})', 'WARN')
+                time.sleep(back)
+                continue
+            raise
+    raise last_exc
 

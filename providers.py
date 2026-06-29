@@ -15,7 +15,7 @@ import concurrent.futures
 import requests
 import yfinance as yf
 
-from infra import log, timed, set_tag, _tag, _cache_get, _cache_set
+from infra import log, timed, set_tag, _tag, _cache_get, _cache_set, yf_call, is_rate_limited
 from signals import safe_val
 
 # 네이버 실시간 시세 캐시 TTL(초). 같은 종목 연속 조회 시 재호출을 막되,
@@ -290,9 +290,9 @@ def _calc_per_pbr(info, t):
             EQ_KEYS = ('Common Stock Equity', 'Stockholders Equity',
                        'Total Equity Gross Minority Interest')
 
-            # 분기 재무제표로 TTM 계산
-            qfin = t.quarterly_financials
-            qbs  = t.quarterly_balance_sheet
+            # 분기 재무제표로 TTM 계산 (yf_call로 레이트리밋 완화)
+            qfin = yf_call(lambda: t.quarterly_financials, 'yf.qfin')
+            qbs  = yf_call(lambda: t.quarterly_balance_sheet, 'yf.qbs')
 
             if eps is None and qfin is not None and not qfin.empty:
                 # 1순위: 분기 EPS 4개 합 (min_count=4 → 4분기 모두 있어야 계산)
@@ -325,20 +325,34 @@ def _calc_per_pbr(info, t):
     return per, pbr, eps, bps
 
 
-def _fetch_stock(ticker):
-    """yfinance에서 종목 데이터를 조회해 dict로 반환 (실패 시 예외)."""
+def _kr_skeleton(ticker):
+    """야후 조회가 레이트리밋 등으로 실패했을 때 한국 종목용 빈 골격 dict.
+    이후 _fetch_naver 오버레이가 가격·펀더멘털을 채운다. 통화는 KRW로 고정해
+    야후 결측 시 'USD' 기본값으로 달러 표기되던 문제를 막는다."""
+    return {
+        'ticker': ticker.upper(),
+        'name': _krx_name(ticker) or ticker.upper(),
+        'sector': '-', 'industry': '-', 'currency': 'KRW', 'exchange': '-',
+        'history': [],
+    }
+
+
+def _fetch_stock_yahoo(ticker):
+    """yfinance에서 종목 데이터를 조회해 dict로 반환 (실패 시 예외).
+    레이트리밋이 잦은 야후 호출은 yf_call로 전역 간격 제한·백오프 재시도한다."""
     _t = ticker.upper()
+    is_kr = _t.endswith('.KS') or _t.endswith('.KQ')
     t = yf.Ticker(_t)
 
     # info: 야후 스크레이프 — 보통 stock 응답에서 가장 무거운 단계
     with timed(f'yf.info {_t}'):
-        info = t.info
+        info = yf_call(lambda: t.info, f'yf.info {_t}')
     log(f'yf.info {_t} keys={len(info)}', 'DEBUG')
 
     # fast_info로 실시간에 가까운 가격 보완 (price 계산 전에 먼저 반영)
     try:
         with timed(f'yf.fast_info {_t}', warn_ms=1500, slow_ms=3000):
-            fi = t.fast_info
+            fi = yf_call(lambda: t.fast_info, f'yf.fast_info {_t}')
             if fi.last_price:
                 info['currentPrice'] = fi.last_price
             if fi.previous_close:
@@ -374,7 +388,7 @@ def _fetch_stock(ticker):
 
     # 최근 1년 종가 히스토리 (차트용 - 월별)
     with timed(f'yf.history(1y) {_t}', warn_ms=2000, slow_ms=4000):
-        hist = t.history(period='1y', interval='1mo')
+        hist = yf_call(lambda: t.history(period='1y', interval='1mo'), f'yf.history {_t}')
     history = []
     if not hist.empty:
         for dt, row in hist.iterrows():
@@ -388,7 +402,8 @@ def _fetch_stock(ticker):
             'name': _krx_name(ticker) or info.get('longName') or info.get('shortName') or ticker.upper(),
             'sector': info.get('sector', '-'),
             'industry': info.get('industry', '-'),
-            'currency': info.get('currency', 'USD'),
+            # 한국 종목(.KS/.KQ)은 야후 info 결측 시에도 KRW로 고정 (달러 표기 방지)
+            'currency': info.get('currency') or ('KRW' if is_kr else 'USD'),
             'exchange': info.get('exchange', '-'),
 
             # 가격
@@ -464,11 +479,33 @@ def _fetch_stock(ticker):
 
             'history': history,
     }
+    return data
+
+
+def _fetch_stock(ticker):
+    """종목 데이터를 조립해 반환. 한국 종목은 네이버 실시간으로 보강하며,
+    야후가 레이트리밋 등으로 실패해도 네이버 단독으로 응답을 구성한다.
+
+    레이트리밋 동작:
+      · 한국 종목: 야후 실패 → 빈 골격 + 네이버 오버레이로 KRW 시세·펀더멘털 제공.
+        (야후가 죽어도 가격·PER/PBR·시총이 정상 표기 — 달러·빈값 문제 해소)
+      · 해외 종목: 폴백이 없으므로 예외를 그대로 전파(호출부가 stale 캐시로 폴백).
+    """
+    tk = ticker.upper()
+    is_kr = tk.endswith('.KS') or tk.endswith('.KQ')
+
+    try:
+        data = _fetch_stock_yahoo(ticker)
+    except Exception as e:
+        if not is_kr:
+            raise
+        # 한국 종목: 야후가 죽어도 네이버로 응답을 만든다.
+        lvl = 'WARN' if is_rate_limited(e) else 'ERROR'
+        log(f'야후 조회 {tk} 실패 — 네이버 단독 폴백: {e}', lvl)
+        data = _kr_skeleton(ticker)
 
     # 한국 종목은 네이버 실시간 시세·펀더멘털로 보강 (야후 KRX 15~20분 지연 해소).
-    # 네이버 조회 실패 시 위에서 만든 야후 값을 그대로 사용한다(폴백).
-    tk = ticker.upper()
-    if tk.endswith('.KS') or tk.endswith('.KQ'):
+    if is_kr:
         try:
             with timed(f'네이버 보강 {tk}', warn_ms=2000, slow_ms=4000):
                 nv = _fetch_naver(tk.split('.')[0])
@@ -477,6 +514,9 @@ def _fetch_stock(ticker):
                     data[k] = v
         except Exception as e:
             log(f'네이버 보강 {tk} 실패(야후값 폴백): {e}', 'WARN')
+            # 야후도 실패해 골격뿐인데 네이버까지 실패하면 가격이 전혀 없다 → 예외 전파
+            if data.get('price') is None:
+                raise
 
     return data
 
