@@ -547,6 +547,13 @@ def sync_put(code):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+# keep-alive 핑/상태 점검용 — 외부 의존(yfinance·Supabase) 없이 즉시 응답한다.
+# Render 무료 플랜의 spin-down을 막으려 외부 cron이 주기적으로 호출하는 용도.
+@app.route('/api/health')
+def health():
+    return jsonify({'ok': True})
+
+
 # 프론트엔드(index.html) 서빙 — API와 같은 서버에서 제공
 @app.route('/')
 def index():

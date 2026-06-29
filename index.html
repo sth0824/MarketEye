@@ -299,14 +299,17 @@ const _isLocal = location.protocol === 'file:'
 const API = _isLocal ? 'http://localhost:5001/api' : '/api';
 
 // ── 디버그 fetch 래퍼 (타임아웃 30s + 단계별 콘솔 로그) ──────────
+// Render 무료 플랜은 미사용 시 인스턴스를 내려, 첫 요청(콜드 스타트)이 최대 ~60초
+// 걸린다. 그 첫 요청에만 넉넉한 타임아웃을 주려고 timeoutMs를 호출부에서 덮어쓸 수
+// 있게 했다. (인자를 생략하면 기존과 100% 동일하게 30초로 동작)
 const FETCH_TIMEOUT_MS = 30000;
-async function apiFetch(url, options = {}) {
+async function apiFetch(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
   const label = url.replace(API, '');
   const controller = new AbortController();
   const tid = setTimeout(() => {
     controller.abort();
-    console.error(`[MarketEye] ⏰ TIMEOUT (${FETCH_TIMEOUT_MS/1000}s): ${label}`);
-  }, FETCH_TIMEOUT_MS);
+    console.error(`[MarketEye] ⏰ TIMEOUT (${timeoutMs/1000}s): ${label}`);
+  }, timeoutMs);
   const t0 = performance.now();
   console.log(`[MarketEye] ▶ 요청: ${label}`);
   try {
@@ -322,7 +325,7 @@ async function apiFetch(url, options = {}) {
   } catch(e) {
     const ms = Math.round(performance.now() - t0);
     if (e.name === 'AbortError') {
-      throw new Error(`요청 타임아웃 (${FETCH_TIMEOUT_MS/1000}초 초과) — 서버가 응답하지 않습니다`);
+      throw new Error(`요청 타임아웃 (${timeoutMs/1000}초 초과) — 서버가 응답하지 않습니다`);
     }
     console.error(`[MarketEye] ✖ 실패 (${ms}ms): ${label} — ${e.message}`);
     throw e;
@@ -567,7 +570,18 @@ async function pullSync(pushIfEmpty) {
   if (!syncCode) return;
   updateSyncUI('불러오는 중...');
   try {
-    const res = await apiFetch(`${API}/sync/${encodeURIComponent(syncCode)}`);
+    // Render 콜드 스타트(서버 깨우기, 최대 ~60초) 대응: 이 첫 로드 요청만 타임아웃을
+    // 75초로 늘리고, 깨우는 도중 첫 시도가 끊기면 1회 재시도한다. (총 2회 시도)
+    let res;
+    for (let attempt = 0; attempt <= 1; attempt++) {
+      try {
+        res = await apiFetch(`${API}/sync/${encodeURIComponent(syncCode)}`, {}, 75000);
+        break;
+      } catch (e) {
+        if (attempt === 0) { updateSyncUI('서버 깨우는 중... (최초 접속은 시간이 걸릴 수 있어요)'); continue; }
+        throw e;
+      }
+    }
     const json = await res.json();
     if (!json.success) throw new Error(json.error || '불러오기 실패');
     if (json.data && Array.isArray(json.data.groups) && json.data.groups.length) {
