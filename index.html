@@ -415,26 +415,65 @@ async function addTicker(ticker) {
   stocks[ticker] = null;
   saveState();
   renderLoadingCard(ticker);
-  fetchStock(ticker);
+  fetchStock(ticker, true); // 방금 추가 → 잘못된 심볼이면 제거 허용
   fetchSignal(ticker);
 }
 
-// 단일 티커 데이터 fetch → 캐시에 저장 후 렌더 (실패 시 그룹에서 제거)
-async function fetchStock(ticker) {
+// 일시적(=재시도하면 복구되는) 실패인지 판정한다.
+// 레이트리밋(429)·서버오류(5xx)·네트워크/타임아웃(status 0)은 일시 오류로 보고
+// 절대 종목을 삭제하지 않는다. (야후 "Too Many Requests"가 대표적)
+function _isTransient(status, msg) {
+  msg = msg || '';
+  return status === 429 || status >= 500 || status === 0
+    || /rate limit|too many requests|429|503|타임아웃|temporarily|일시/i.test(msg);
+}
+
+// 일시 오류로 비어 있는 카드를 지수 백오프로 자동 재시도한다(레이트리밋 해소되면 복구).
+// 그룹에 아직 살아있는 종목만, 최대 4회까지. (loadActiveGroup이 매번 카운터를 초기화)
+let _retryCount = {};
+function scheduleRetry(ticker) {
+  const n = (_retryCount[ticker] || 0) + 1;
+  if (n > 4) return;
+  _retryCount[ticker] = n;
+  const delay = Math.min(2500 * 2 ** (n - 1), 20000); // 2.5s, 5s, 10s, 20s
+  setTimeout(() => {
+    const g = curGroup();
+    if (!g || !g.tickers.includes(ticker)) return; // 사용자가 지운 종목은 재시도 안 함
+    if (!stocks[ticker]) fetchStock(ticker);
+    if (!signals[ticker]) fetchSignal(ticker);
+  }, delay);
+}
+
+// 단일 티커 데이터 fetch → 캐시에 저장 후 렌더.
+// isNew=true(사용자가 방금 추가): '진짜 잘못된 심볼'일 때만 그룹에서 제거.
+// isNew=false(저장된 목록 로드): 어떤 실패에도 절대 자동 삭제하지 않는다(데이터 보호).
+async function fetchStock(ticker, isNew = false) {
   setLoadingBar(30);
+  let status = 0;
   try {
     const res = await apiFetch(`${API}/stock/${ticker}`);
+    status = res.status;
     const json = await res.json();
     if (!json.success) throw new Error(json.error || '데이터 로드 실패');
     stocks[ticker] = json.data;
     setLoadingBar(100);
     renderAll();
   } catch(e) {
+    const msg = e.message || '';
+    // 일시 오류이거나, 저장된 종목이면 → 절대 삭제하지 않고 보존 후 자동 재시도.
+    if (_isTransient(status, msg) || !isNew) {
+      console.warn(`[MarketEye] stock 보존(미삭제): ${ticker} — ${msg}`);
+      scheduleRetry(ticker);
+      setLoadingBar(0);
+      renderAll();
+      return;
+    }
+    // 여기까지 오면 '사용자가 방금 추가한 잘못된 심볼'만 해당 → 정리한다.
     const g = curGroup();
     g.tickers = g.tickers.filter(t => t !== ticker);
     delete stocks[ticker];
     saveState();
-    showError(`${ticker}: ${e.message}`);
+    showError(`${ticker}: ${msg}`);
     setLoadingBar(0);
     renderAll();
     if (!curGroup().tickers.length) document.getElementById('empty-state').style.display = '';
@@ -639,17 +678,21 @@ async function pushSyncNow() {
 function loadActiveGroup() {
   stocks = {};
   signals = {};
+  _retryCount = {}; // 새 로드 → 재시도 예산 초기화
   const g = curGroup();
   const tickers = g ? g.tickers.slice() : [];
   document.getElementById('empty-state').style.display = tickers.length ? 'none' : '';
   tickers.forEach(t => { stocks[t] = null; });
   renderAll();
-  tickers.forEach(t => { fetchStock(t); fetchSignal(t); });
+  // 한꺼번에 쏟아내면 야후가 레이트리밋(429)하므로 종목마다 시차를 둔다.
+  tickers.forEach((t, i) => setTimeout(() => { fetchStock(t); fetchSignal(t); }, i * 250));
 }
 
 async function fetchSignal(ticker) {
+  let status = 0;
   try {
     const res = await apiFetch(`${API}/signal/${encodeURIComponent(ticker)}`);
+    status = res.status;
     const json = await res.json();
     if (json.success) {
       signals[ticker] = json.data;
@@ -658,12 +701,16 @@ async function fetchSignal(ticker) {
       // 신호 탭이 열려 있으면 재렌더
       if (activeTab === 'signal') renderSignalTab();
     } else {
-      console.warn(`[MarketEye] signal 실패: ${ticker} — ${json.error || '알 수 없음'}`);
+      const msg = json.error || '알 수 없음';
+      console.warn(`[MarketEye] signal 실패: ${ticker} — ${msg}`);
+      // 레이트리밋 등 일시 오류면 점수만 잠시 비고, 잠시 후 자동 재시도된다.
+      if (_isTransient(status, msg)) scheduleRetry(ticker);
     }
   } catch(e) {
     // 과거엔 여기서 에러를 통째로 삼켜, 렌더 예외가 나도 카드가 '분석 중'에
     // 영원히 멈춰 콘솔에 단서조차 없었다. 이제는 반드시 남긴다.
     console.error(`[MarketEye] fetchSignal 예외: ${ticker}`, e);
+    if (_isTransient(status, e.message)) scheduleRetry(ticker);
   }
 }
 
