@@ -240,20 +240,23 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
             else:                       structure_s, structure_label = 50, '전환/혼조'
         below = [p for _, p in pl if p < price]
         above = [p for _, p in ph if p > price]
-        # 프랙탈 피벗(_pivots)은 좌우 PIV_K봉이 모두 있어야 스윙고점을 '확정'하므로
-        # 최근 PIV_K봉은 어떤 경우에도 저항으로 잡히지 않는다. 그 사이 가격이 직전
-        # 고점에 바짝 붙어 있어도 '위쪽 저항 없음'으로 보이고, 저항이 없으면 목표가가
-        # '진입가+위험폭×2'로 임의 설정돼 손익비(rr)가 늘 2.0으로 부풀려진다. 그러다
-        # 한 봉 더 지나 피벗이 확정되는 순간 저항이 갑자기 나타나며, 가격 변동이 전혀
-        # 없어도 rr이 2.0→1 미만으로, 기술점수가 하루 사이 급락(예: 72→50)한다.
-        # 이 불연속을 없애기 위해 '현재(미완성) 봉 직전의 최근 PIV_K봉' 최고가도
-        # 미확정 저항 후보로 즉시 반영한다(직전 고점은 5봉 뒤가 아니라 지금의 저항).
-        # 지지·손절(below/support) 로직은 건드리지 않아 위험폭 산정은 종전과 동일하다.
+        # 프랙탈 피벗(_pivots)은 좌우 PIV_K봉이 모두 있어야 스윙을 '확정'하므로 최근
+        # PIV_K봉은 어떤 경우에도 지지/저항으로 잡히지 않는다. 그 사각지대 탓에 가격이
+        # 직전 고점·저점에 붙어 있어도 저항·지지가 비어 보이다가, 한 봉 더 지나 피벗이
+        # 확정되는 순간 갑자기 나타나며 가격 변동이 전혀 없어도 손익비가 급변한다.
+        #  · 목표(저항)가 비면 → 목표가가 '진입가+위험폭×2'로 임의 설정돼 rr이 2.0으로
+        #    부풀고, 피벗 확정 순간 저항이 잡히며 rr 2.0→1 미만, 점수 72→50처럼 급락.
+        #  · 손절(지지)이 비면 → 위험폭이 2×ATR로 잡혔다가 직전 저점이 확정되며 분모가 튐.
+        # 이를 '대칭'으로 막기 위해 현재(미완성) 봉 직전 최근 PIV_K봉의 최고가·최저가도
+        # 미확정 저항·지지 후보로 즉시 반영한다(직전 고점·저점은 5봉 뒤가 아닌 지금의 벽).
         tail = max(0, n - 1 - PIV_K)
         if n - 1 > tail:
             recent_high = max(highs[tail:n - 1])
+            recent_low = min(lows[tail:n - 1])
             if recent_high > price:
                 above.append(recent_high)
+            if recent_low < price:
+                below.append(recent_low)
         support = max(below) if below else None
         resistance = min(above) if above else None
     except Exception:
