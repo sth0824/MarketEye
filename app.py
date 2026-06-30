@@ -286,6 +286,12 @@ def _signal_base(ticker):
 
 @app.route('/api/signal/<path:ticker>')
 def signal(ticker):
+    # 신호 계산 결과 5분 캐시 (Render 배포 성능 개선)
+    cached = _cache_get(('signal', ticker), 300)
+    if cached:
+        log(f'signal {ticker} 캐시 히트', 'DEBUG')
+        return jsonify({'success': True, 'data': cached})
+
     try:
         with timed(f'signal_base {ticker}'):
             base = _signal_base(ticker)
@@ -410,6 +416,7 @@ def signal(ticker):
             'plan': ts['plan'],
             'fundamentals': fs,
         }
+        _cache_set(('signal', ticker), data)
         return jsonify({'success': True, 'data': data})
     except Exception as e:
         log(f'signal {ticker} 실패: {e}', 'ERROR')
@@ -638,5 +645,5 @@ def index():
 
 if __name__ == '__main__':
     debug = os.environ.get('FLASK_DEBUG', '0') == '1'
-    port = int(os.environ.get('PORT', '5001'))
+    port = int(os.environ.get('PORT', '5000'))
     app.run(debug=debug, host='0.0.0.0', port=port)

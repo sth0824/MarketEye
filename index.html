@@ -685,7 +685,12 @@ function loadActiveGroup() {
   tickers.forEach(t => { stocks[t] = null; });
   renderAll();
   // 한꺼번에 쏟아내면 야후가 레이트리밋(429)하므로 종목마다 시차를 둔다.
-  tickers.forEach((t, i) => setTimeout(() => { fetchStock(t); fetchSignal(t); }, i * 250));
+  // 주식 가격 데이터만 먼저 로드 (빠른 응답), 신호는 나중에 백그라운드에서 로드
+  tickers.forEach((t, i) => setTimeout(() => { fetchStock(t); }, i * 250));
+  // 신호 계산은 모든 주식 데이터가 로드된 후 더 긴 지연으로 시작 (Render 과부하 방지)
+  setTimeout(() => {
+    tickers.forEach((t, i) => setTimeout(() => { fetchSignal(t); }, i * 500));
+  }, tickers.length * 250 + 1000);
 }
 
 async function fetchSignal(ticker) {
