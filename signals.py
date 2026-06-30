@@ -270,6 +270,12 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
                 target = resistance if (resistance and resistance > price) else (price + 2 * risk)
                 if target <= price:
                     target = price + 2 * risk
+                # 강한 상승추세는 직전 고점(저항)을 곧 돌파하는 경향이 있어, 저항이 목표가를
+                # 과도하게 끌어내려 손익비를 보수적으로 만들면 추세주를 과소평가하게 된다.
+                # 이 경우엔 측정된 손익비 목표(진입가+위험폭×2)까지는 목표를 확장해 둔다.
+                # (저항이 그보다 더 멀면 그 저항을 그대로 목표로 유지 → 더 큰 손익비)
+                if regime == 'strong_up':
+                    target = max(target, price + 2 * risk)
                 rr = (target - price) / risk
                 stop_pct = (price - stop) / price * 100
                 target_pct = (target - price) / price * 100
