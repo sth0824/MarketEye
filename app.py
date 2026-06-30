@@ -90,6 +90,9 @@ def search_ticker():
 # 전체 데이터 TTL (초). 환경변수로 조정 가능.
 STOCK_TTL = int(os.environ.get('STOCK_TTL', '60'))
 PRICE_TTL = int(os.environ.get('PRICE_TTL', '15'))
+# 백테스트 검증 기간 — 길수록 더 많은 시장 국면(강세·약세·횡보)을 포함해 신뢰도↑.
+# 기본 5년(2022 약세장 포함). 너무 느리면 '3y' 등으로 낮출 수 있다.
+BACKTEST_PERIOD = os.environ.get('BACKTEST_PERIOD', '5y')
 
 
 @app.route('/api/stock/<ticker>')
@@ -426,9 +429,9 @@ def backtest(ticker):
         return jsonify({'success': True, 'data': cached})
     try:
         t = yf.Ticker(ticker)
-        with timed(f'yf.history(2y,backtest) {ticker}'):
-            hist = yf_call(lambda: t.history(period='2y', interval='1d'),
-                           f'yf.history(2y,backtest) {ticker}')
+        with timed(f'yf.history({BACKTEST_PERIOD},backtest) {ticker}'):
+            hist = yf_call(lambda: t.history(period=BACKTEST_PERIOD, interval='1d'),
+                           f'yf.history({BACKTEST_PERIOD},backtest) {ticker}')
         if hist.empty or len(hist) < 120:
             return jsonify({'success': False, 'error': '데이터 부족 (최소 120거래일 필요)'}), 422
 
@@ -439,17 +442,26 @@ def backtest(ticker):
         n = len(closes)
 
         BUY_TH, HOLD_MAX, START = 68, 20, 70   # 매수기준 / 최대보유(거래일) / 시작 인덱스
+        COST_PCT = 0.35   # 왕복 매매비용(수수료+거래세+슬리피지) 가정 — 보수적. 순수익에 반영.
+
+        # 신호 엔진을 매 거래일 1회만 계산해 매매시뮬·구간검증이 공유한다.
+        # (예전엔 두 단계가 각각 O(n²)로 따로 돌려 장기간이 부담 → 한 번만 계산해 재사용)
+        _bt0 = time.time()
+        day_sig = [None] * n
+        for k in range(START, n):
+            day_sig[k] = _technical_signal(closes[:k + 1], highs[:k + 1], lows[:k + 1],
+                                           vols[:k + 1], rs_60=None, weekly_up=None, with_reasons=False)
+        log(f'backtest 점수계산 {ticker} {int((time.time()-_bt0)*1000)}ms (n={n})',
+            'WARN' if (time.time() - _bt0) > 3.0 else 'INFO')
+
+        # ── 매매 시뮬레이션 (점수>=기준 진입, 손절/목표/보유만료 청산, 왕복비용 차감) ──
         trades = []
         i = START
-        # 과거 전 구간에 신호 엔진을 반복 적용 — backtest의 핵심 CPU 비용 (O(n²))
-        _bt0 = time.time()
         while i < n - 1:
-            sub = _technical_signal(closes[:i + 1], highs[:i + 1], lows[:i + 1],
-                                    vols[:i + 1], rs_60=None, weekly_up=None, with_reasons=False)
+            sub = day_sig[i]
             if sub['tech_score'] >= BUY_TH:
                 entry = closes[i]
-                plan = sub['plan']
-                stop, target = plan['stop'], plan['target']
+                stop, target = sub['plan']['stop'], sub['plan']['target']
                 exit_price, exit_reason, bars = None, None, 0
                 for j in range(i + 1, min(i + 1 + HOLD_MAX, n)):
                     bars = j - i
@@ -459,36 +471,39 @@ def backtest(ticker):
                         exit_price, exit_reason = target, '목표'; break
                 if exit_price is None:
                     exit_price, exit_reason = closes[min(i + HOLD_MAX, n - 1)], '기간만료'
-                ret = (exit_price / entry - 1) * 100 if entry else 0
+                ret = ((exit_price / entry - 1) * 100 - COST_PCT) if entry else 0
                 trades.append({'ret': ret, 'reason': exit_reason, 'bars': bars or 1})
                 i += (bars or 1)        # 보유기간 동안 중복 진입 방지
             else:
                 i += 1
-        log(f'backtest 매매시뮬 {ticker} {int((time.time()-_bt0)*1000)}ms ({len(trades)}건)',
-            'WARN' if (time.time() - _bt0) > 1.5 else 'INFO')
 
-        # ── 점수 구간별 미래수익 검증 (점수의 단조성: 높은 점수 = 높은 미래수익?) ──
-        # 매 거래일의 기술점수와 그 시점 이후 HOLD_MAX일 단순 수익률을 짝지어 구간 통계.
-        _bk0 = time.time()
+        # ── 점수 구간별 미래수익 + '기준선' 대비 초과수익 ──
+        # 기준선(base_fwd) = 아무 날이나(무작위 시점) 사서 20일 보유한 평균수익. 강세 종목은
+        # 이 값이 크게 양수라 모든 점수구간이 그냥 플러스로 보인다(=점수가 좋아서가 아님).
+        # 그래서 각 구간이 '기준선을 얼마나 넘었나(excess)'를 함께 본다 — excess가 0 근처면
+        # 그 점수는 변별력이 없다는 뜻. 미래수익은 끝에서 HOLD_MAX일을 잘라 항상 '완전한
+        # 20일 창'만 사용한다(끝부분 절단편향 제거 → 더 정확).
         BUCKETS = [(0, 40), (40, 55), (55, 68), (68, 80), (80, 101)]
         bkt = {f'{lo}-{hi if hi <= 100 else 100}': [] for lo, hi in BUCKETS}
-        for k in range(START, n - 1):
-            s = _technical_signal(closes[:k + 1], highs[:k + 1], lows[:k + 1],
-                                  vols[:k + 1], rs_60=None, weekly_up=None, with_reasons=False)['tech_score']
-            fwd = (closes[min(k + HOLD_MAX, n - 1)] / closes[k] - 1) * 100 if closes[k] else 0
+        all_fwd = []
+        for k in range(START, max(START, n - HOLD_MAX)):
+            s = day_sig[k]['tech_score']
+            fwd = (closes[k + HOLD_MAX] / closes[k] - 1) * 100 if closes[k] else 0
+            all_fwd.append(fwd)
             for lo, hi in BUCKETS:
                 if lo <= s < hi:
                     bkt[f'{lo}-{hi if hi <= 100 else 100}'].append(fwd)
                     break
+        base_fwd = round(sum(all_fwd) / len(all_fwd), 2) if all_fwd else None
         score_buckets = [
             {'range': key,
              'n': len(v),
              'avg_fwd': round(sum(v) / len(v), 2) if v else None,
+             'excess': round(sum(v) / len(v) - base_fwd, 2) if (v and base_fwd is not None) else None,
              'win_rate': round(sum(1 for x in v if x > 0) / len(v) * 100, 1) if v else None}
             for key, v in bkt.items()
         ]
-        log(f'backtest 구간검증 {ticker} {int((time.time()-_bk0)*1000)}ms', 'DEBUG')
-        # 단조성 점검: 인접 구간 평균수익이 우상향하는 비율 (1.0이면 완전 단조)
+        # 단조성: 점수가 오를수록 미래수익(=기준선 초과수익)도 오르는가. 1.0이면 완전 단조.
         avgs = [b['avg_fwd'] for b in score_buckets if b['avg_fwd'] is not None]
         monotonic = (round(sum(1 for a, b in zip(avgs, avgs[1:]) if b >= a) / (len(avgs) - 1), 2)
                      if len(avgs) >= 2 else None)
@@ -504,28 +519,42 @@ def backtest(ticker):
             eq *= (1 + r / 100)
             peak = max(peak, eq)
             mdd = min(mdd, eq / peak - 1)
-        bh = (closes[-1] / closes[START] - 1) * 100   # 동일기간 단순보유 수익률
+        bh = (closes[-1] / closes[START] - 1) * 100 - COST_PCT   # 단순보유(왕복비용 1회 차감)
+
+        # 간이 아웃오브샘플: 거래를 시간순 전·후반으로 갈라 기대수익이 둘 다 양수인지(일관성).
+        half = total // 2
+        fh = [t['ret'] for t in trades[:half]]
+        sh = [t['ret'] for t in trades[half:]]
 
         data = {
             'trades': total,
+            'reliable': total >= 30,                                       # 표본 충분 여부(통계 신뢰)
             'win_rate': round(len(wins) / total * 100, 1) if total else None,
             'avg_return': round(sum(rets) / total, 2) if total else None,
             'avg_win': round(sum(wins) / len(wins), 2) if wins else None,
             'avg_loss': round(sum(losses) / len(losses), 2) if losses else None,
-            'expectancy': round(sum(rets) / total, 2) if total else None,   # 1회 기대수익(%)
+            'expectancy': round(sum(rets) / total, 2) if total else None,   # 1회 기대수익(%, 비용차감 순)
             'profit_factor': round(gp / gl, 2) if gl > 0 else None,
-            'strategy_return': round((eq - 1) * 100, 1),                    # 전략 누적(복리)
+            'strategy_return': round((eq - 1) * 100, 1),                    # 전략 누적(복리, 순)
             'buy_hold_return': round(bh, 1),
             'max_drawdown': round(mdd * 100, 1),
+            'base_fwd': base_fwd,                                           # 기준선: 무작위 시점 평균 미래수익
+            'oos': {'first': round(sum(fh) / len(fh), 2) if fh else None,   # 전반 기대수익
+                    'second': round(sum(sh) / len(sh), 2) if sh else None}, # 후반 기대수익
             'exits': {
                 'target': sum(1 for tr in trades if tr['reason'] == '목표'),
                 'stop':   sum(1 for tr in trades if tr['reason'] == '손절'),
                 'time':   sum(1 for tr in trades if tr['reason'] == '기간만료'),
             },
-            'params': {'buy_threshold': BUY_TH, 'max_hold_days': HOLD_MAX, 'period': '2y'},
-            'score_buckets': score_buckets,   # 점수 구간별 미래 20일 수익·승률 (단조성 검증용)
+            'params': {'buy_threshold': BUY_TH, 'max_hold_days': HOLD_MAX,
+                       'period': BACKTEST_PERIOD, 'cost_pct': COST_PCT},
+            'score_buckets': score_buckets,   # 점수 구간별 미래 20일 수익·기준선초과·승률
             'monotonic': monotonic,           # 인접 구간 우상향 비율 (1.0=완전 단조)
-            'note': '수수료·슬리피지 미반영. 상대강도·주봉 필터는 백테스트에서 제외(중립). 과거 성과가 미래를 보장하지 않음. 점수 구간 검증은 차트(기술) 점수 한정 — 가치 점수는 과거 시점 데이터 제약으로 검증 불가.',
+            'note': (f'왕복 매매비용 {COST_PCT}% 반영(수수료·세금·슬리피지 가정). '
+                     '기준선=무작위 시점에 사서 20일 보유한 평균수익 — 각 점수구간이 이 기준선을 '
+                     '넘어야(excess>0) 점수에 변별력이 있는 것. 거래 30건 미만은 표본 부족(참고용). '
+                     '상대강도·주봉 필터는 백테스트 제외(중립). 가치 점수는 과거 데이터 제약으로 미검증. '
+                     '과거 성과가 미래를 보장하지 않음.'),
         }
         _cache_set(('backtest', ticker), data)
         return jsonify({'success': True, 'data': data})

@@ -944,40 +944,51 @@ function renderSignalCard(ticker) {
     ${planHtml}
     ${reasonsHtml}
     <div style="margin-top:12px">
-      <button class="secondary" style="font-size:12px;padding:6px 12px;width:100%" onclick="runBacktest('${ticker}')">📊 이 전략 2년 백테스트</button>
+      <button class="secondary" style="font-size:12px;padding:6px 12px;width:100%" onclick="runBacktest('${ticker}')">📊 이 전략 5년 백테스트</button>
       <div id="bt-${ticker}" style="margin-top:8px"></div>
     </div>
     ${fundBlock}
   </div>`;
 }
 
-// 점수 구간별 미래수익 검증 표 — "점수가 높을수록 실제로 더 벌었나"(단조성)를 눈으로
+// 점수 구간별 미래수익 검증 표 — 막대는 '기준선 초과수익(excess)'을 표시한다.
+// 절대수익은 강세 종목이면 다 +라 무의미 → '아무 날이나 산 평균(기준선)'을 얼마나
+// 넘었나가 진짜 변별력. excess가 0 근처면 그 점수는 의미 없다는 뜻.
 function bucketHtml(d) {
   const bks = d.score_buckets;
   if (!bks || !bks.length) return '';
-  const max = Math.max(1, ...bks.map(b => Math.abs(b.avg_fwd || 0)));
+  const useEx = bks.some(b => b.excess != null);   // 신버전(excess) 우선, 없으면 절대수익 폴백
+  const valOf = b => (useEx ? b.excess : b.avg_fwd);
+  const max = Math.max(1, ...bks.map(b => Math.abs(valOf(b) || 0)));
   const rows = bks.map(b => {
     if (!b.n) return `<div class="signal-bar-row" style="opacity:.4"><span class="signal-bar-label">${b.range}점</span><span class="signal-bar-track"></span><span class="signal-bar-val">표본없음</span></div>`;
-    const pos = b.avg_fwd >= 0;
-    const w = Math.round(Math.abs(b.avg_fwd) / max * 100);
+    const val = valOf(b) || 0;
+    const pos = val >= 0;
+    const w = Math.round(Math.abs(val) / max * 100);
     const col = pos ? 'var(--green)' : 'var(--red)';
-    return `<div class="signal-bar-row" title="표본 ${b.n}개 · 승률 ${b.win_rate}%">
+    const tip = `표본 ${b.n}개 · 평균 ${b.avg_fwd >= 0 ? '+' : ''}${b.avg_fwd}% · 승률 ${b.win_rate}%`;
+    return `<div class="signal-bar-row" title="${tip}">
       <span class="signal-bar-label">${b.range}점</span>
       <span class="signal-bar-track"><span class="signal-bar-fill" style="width:${w}%;background:${col}"></span></span>
-      <span class="signal-bar-val" style="color:${col}">${pos ? '+' : ''}${b.avg_fwd}%</span>
+      <span class="signal-bar-val" style="color:${col}">${pos ? '+' : ''}${val}%</span>
     </div>`;
   }).join('');
   const mono = d.monotonic != null
     ? `<span style="color:${d.monotonic >= 0.67 ? 'var(--green)' : d.monotonic >= 0.5 ? 'var(--yellow)' : 'var(--red)'}">단조성 ${Math.round(d.monotonic * 100)}%</span>`
     : '';
+  const baseLine = (useEx && d.base_fwd != null)
+    ? `<div style="color:var(--muted);font-size:10px;margin-bottom:6px">📏 기준선(아무 날이나 매수): <b style="color:var(--text)">${d.base_fwd >= 0 ? '+' : ''}${d.base_fwd}%</b> · 막대=<b>기준선 초과분</b> (0 근처면 점수 변별력 없음)</div>`
+    : '';
+  const label = useEx ? '미래 20일 <b>초과수익</b>(기준선 대비)' : '미래 20일 수익';
   return `<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
-    <div style="font-weight:700;margin-bottom:6px">🔬 점수 구간별 미래 20일 수익 ${mono}
+    <div style="font-weight:700;margin-bottom:6px">🔬 점수 구간별 ${label} ${mono}
       <span style="color:var(--muted);font-weight:400;font-size:10px">차트점수 실증</span></div>
+    ${baseLine}
     <div class="signal-bars">${rows}</div>
   </div>`;
 }
 
-// 백테스트: 동일 매수 규칙을 과거 2년에 적용한 성과를 카드 안에 표시
+// 백테스트: 동일 매수 규칙을 과거 장기(기본 5년)에 적용한 성과를 카드 안에 표시
 async function runBacktest(ticker) {
   const box = document.getElementById('bt-' + ticker);
   if (!box) return;
@@ -988,17 +999,25 @@ async function runBacktest(ticker) {
     if (!json.success) throw new Error(json.error || '백테스트 실패');
     const d = json.data;
     const beat = d.strategy_return >= d.buy_hold_return;
+    const relWarn = (d.reliable === false) ? ' <span style="color:var(--yellow);font-size:10px">(표본부족)</span>' : '';
+    const oos = d.oos || {};
+    const hasOos = oos.first != null && oos.second != null;
+    const oosOk = hasOos && oos.first > 0 && oos.second > 0;   // 전·후반 둘 다 양수 = 일관성
+    const oosTxt = hasOos
+      ? `<span style="color:${oosOk ? 'var(--green)' : 'var(--yellow)'}">${oos.first >= 0 ? '+' : ''}${oos.first}% / ${oos.second >= 0 ? '+' : ''}${oos.second}%</span>`
+      : '-';
     box.innerHTML = `
       <div style="padding:10px;background:var(--surface2);border-radius:8px;font-size:12px">
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px">
-          <div>거래 횟수 <b>${d.trades}</b></div>
+          <div>거래 횟수 <b>${d.trades}</b>${relWarn}</div>
           <div>승률 <b>${d.win_rate != null ? d.win_rate + '%' : '-'}</b></div>
           <div>1회 기대수익 <b style="color:${d.expectancy >= 0 ? 'var(--green)' : 'var(--red)'}">${d.expectancy != null ? d.expectancy + '%' : '-'}</b></div>
           <div>수익팩터 <b>${d.profit_factor != null ? d.profit_factor : '-'}</b></div>
           <div>전략 누적 <b style="color:${beat ? 'var(--green)' : 'var(--yellow)'}">${d.strategy_return}%</b></div>
           <div>단순보유 <b>${d.buy_hold_return}%</b></div>
           <div>최대낙폭 <b style="color:var(--red)">${d.max_drawdown}%</b></div>
-          <div>청산 🎯${d.exits.target} 🛑${d.exits.stop} ⏰${d.exits.time}</div>
+          <div title="거래를 시간순 전·후반으로 나눈 기대수익 — 둘 다 +면 일관성 있음">전·후반 기대 ${oosTxt}</div>
+          <div style="grid-column:1/3">청산 🎯${d.exits.target} 🛑${d.exits.stop} ⏰${d.exits.time}</div>
         </div>
         ${bucketHtml(d)}
         <div style="margin-top:8px;color:var(--muted);font-size:10px;line-height:1.5">${esc(d.note)}</div>
