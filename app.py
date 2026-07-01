@@ -414,6 +414,7 @@ def signal(ticker):
             'reasons': ts['reasons'],
             'indicators': ts['indicators'],
             'plan': ts['plan'],
+            'buy_zone': ts.get('buy_zone'),   # 다수 기법 합의 추천 매수 구간(신규)
             'fundamentals': fs,
         }
         _cache_set(('signal', ticker), data)

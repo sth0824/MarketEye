@@ -834,13 +834,31 @@ function renderSignalCard(ticker) {
     ? `${ind.rs_60 > 0 ? '+' : ''}${ind.rs_60}%p ${ind.rs_60 > 3 ? '💪강세' : ind.rs_60 < -5 ? '🔻약세' : ''}`
     : '-';
 
+  // 참고 지표(점수 미반영, 판단 보조) — ADX(추세강도)·CMF(자금흐름)·추세품질(R²)·변동성 응축
+  const adxTxt = ind.adx != null
+    ? `${ind.adx} ${ind.adx >= 25 ? (ind.plus_di > ind.minus_di ? '💪추세강' : '🔻하방강') : ind.adx < 20 ? '약함(횡보)' : '보통'}`
+    : '-';
+  const cmfTxt = ind.cmf != null
+    ? `${ind.cmf > 0 ? '+' : ''}${ind.cmf} ${ind.cmf > 0.1 ? '🟢유입' : ind.cmf < -0.1 ? '🔴유출' : '중립'}`
+    : '-';
+  const sqzTxt = ind.squeeze_fired ? '💥 분출 시작'
+               : ind.squeeze_on ? '🌀 응축(대기)'
+               : '정상';
+  const r2Txt = ind.trend_r2 != null
+    ? `${ind.trend_r2} ${ind.trend_r2 >= 0.7 ? '매끈✨' : ind.trend_r2 < 0.3 ? '불규칙' : ''}`
+    : '-';
+
   const techItems =
     indItem('추세', `<span style="color:${rg.color}">${rg.emoji} ${esc(sig.regime_label || '-')}</span>`) +
+    indItem('추세강도 (ADX)', adxTxt) +
     indItem('RSI (14)', `${ind.rsi} ${ind.rsi < 30 ? '📉 과매도' : ind.rsi > 70 ? '📈 과매수' : ''}`) +
     indItem('MACD', ind.macd_cross ? '🔔 골든크로스' : ind.macd > ind.macd_signal ? '상승세' : '하락세') +
     indItem('이동평균', maStatus) +
     indItem('볼린저 위치', `${ind.bb_pct}% ${ind.bb_pct < 25 ? '🔵 하단' : ind.bb_pct > 75 ? '🔴 상단' : '중립'}`) +
     indItem('거래량', `${volTxt}${ind.bull_div ? ' · ✨다이버전스' : ''}`) +
+    indItem('자금흐름 (CMF)', cmfTxt) +
+    indItem('변동성 응축', sqzTxt) +
+    indItem('추세 품질 (R²)', r2Txt) +
     indItem('시장 상대강도', rsTxt) +
     indItem('가격 구조', esc(ind.structure || '-'));
 
@@ -865,6 +883,22 @@ function renderSignalCard(ticker) {
         </div>
         <div style="text-align:center;margin-top:8px;color:var(--muted)">손익비 <b style="color:${rrColor}">${plan.rr != null ? plan.rr + ' : 1' : '-'}</b></div>
         ${plan.size_per_1pct != null ? `<div style="text-align:center;margin-top:6px;color:var(--muted);font-size:10px">자본 1% 리스크 기준 권장 비중 <b style="color:var(--text)">${plan.size_per_1pct > 100 ? '100%+' : plan.size_per_1pct + '%'}</b> · 주당 위험 ${fmt(plan.risk_per_share, cur)}</div>` : ''}
+      </div>`
+    : '';
+
+  // 추천 매수존 (confluence) — 피보·이동평균·VWAP·볼린저·지지선이 겹치는 고확률 구간
+  const bz = sig.buy_zone;
+  const bzColor = bz ? (bz.strength_label === '강함' ? 'var(--green)' : bz.strength_label === '보통' ? 'var(--yellow)' : 'var(--muted)') : '';
+  const buyZoneHtml = bz
+    ? `<div style="margin-top:12px;padding:10px;background:var(--surface2);border-radius:8px;font-size:12px;border:1px solid ${bzColor}">
+        <div style="font-weight:700;margin-bottom:8px;color:var(--text)">🛒 추천 매수존 <span style="color:var(--muted);font-weight:400;font-size:10px">다수 기법 합의(confluence)</span>
+          <span style="float:right;color:${bzColor};font-weight:700">${bz.strength_label} · ${bz.strength}</span></div>
+        <div style="text-align:center;font-size:16px;font-weight:700;color:var(--text)">${fmt(bz.low, cur)} ~ ${fmt(bz.high, cur)}</div>
+        <div style="text-align:center;margin-top:4px;color:var(--muted)">대표 진입가 <b style="color:var(--text)">${fmt(bz.entry, cur)}</b> · ${bz.in_zone ? '<span style="color:var(--green)">현재가 매수존 진입 ✓</span>' : `현재가 대비 <b style="color:var(--text)">${bz.dist_pct > 0 ? '+' : ''}${bz.dist_pct}%</b> 눌림 대기`}</div>
+        <div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap;justify-content:center">
+          ${bz.methods.map(mm => `<span style="font-size:10px;padding:2px 7px;background:var(--surface);border-radius:10px;color:var(--muted)">${esc(mm)}</span>`).join('')}
+        </div>
+        ${bz.avwap != null ? `<div style="text-align:center;margin-top:6px;color:var(--muted);font-size:10px">기관 평균매입선(VWAP) ${fmt(bz.avwap, cur)}</div>` : ''}
       </div>`
     : '';
 
@@ -947,6 +981,7 @@ function renderSignalCard(ticker) {
     ${compHtml}
     ${block('📈 기술적 분석 (차트)', sig.tech_score, techItems)}
     ${planHtml}
+    ${buyZoneHtml}
     ${reasonsHtml}
     <div style="margin-top:12px">
       <button class="secondary" style="font-size:12px;padding:6px 12px;width:100%" onclick="runBacktest('${ticker}')">📊 이 전략 5년 백테스트</button>

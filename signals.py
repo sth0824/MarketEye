@@ -82,6 +82,240 @@ def _pivots(highs, lows, k=5):
             pl.append((i, lows[i]))
     return ph, pl
 
+def _fmt_price(p):
+    """근거 문장용 가격 표기. 통화 스케일에 맞춰 소수 자릿수를 조절(원화 정수·달러 소수)."""
+    if p is None:
+        return '-'
+    if abs(p) >= 1000:
+        return f'{p:,.0f}'
+    if abs(p) >= 100:
+        return f'{p:.1f}'
+    return f'{p:.2f}'
+
+
+def _adx(highs, lows, closes, period=14):
+    """방향성 지수(ADX/DMI, Wilder). 추세의 '방향'이 아니라 '강도'를 재는 표준 지표.
+    반환 {adx, plus_di, minus_di} 또는 데이터 부족 시 None. ADX>25 추세장, <20 횡보.
+    이동평균 기울기와 직교하는 신호라 레짐 판단의 참고축으로 쓴다(점수엔 반영 안 함)."""
+    n = len(closes)
+    if n < period * 2 + 1:
+        return None
+    plus_dm, minus_dm, tr = [], [], []
+    for i in range(1, n):
+        up = highs[i] - highs[i - 1]
+        dn = lows[i - 1] - lows[i]
+        plus_dm.append(up if (up > dn and up > 0) else 0.0)
+        minus_dm.append(dn if (dn > up and dn > 0) else 0.0)
+        tr.append(max(highs[i] - lows[i],
+                      abs(highs[i] - closes[i - 1]),
+                      abs(lows[i] - closes[i - 1])))
+    if len(tr) < period:
+        return None
+
+    def _wilder(arr):
+        s = sum(arr[:period])
+        out = [s]
+        for v in arr[period:]:
+            s = s - s / period + v          # Wilder 누적 평활
+            out.append(s)
+        return out
+
+    str_ = _wilder(tr); sp = _wilder(plus_dm); sm = _wilder(minus_dm)
+    plus_di  = [100 * p / t if t else 0.0 for p, t in zip(sp, str_)]
+    minus_di = [100 * m / t if t else 0.0 for m, t in zip(sm, str_)]
+    dx = []
+    for p, m in zip(plus_di, minus_di):
+        s = p + m
+        dx.append(100 * abs(p - m) / s if s else 0.0)
+    if not dx:
+        return None
+    if len(dx) < period:
+        adx = sum(dx) / len(dx)
+    else:
+        adx = sum(dx[:period]) / period
+        for v in dx[period:]:
+            adx = (adx * (period - 1) + v) / period
+    return {'adx': adx, 'plus_di': plus_di[-1], 'minus_di': minus_di[-1]}
+
+
+def _squeeze(closes, highs, lows, period=20, bb_mult=2.0, kc_mult=1.5, look=12):
+    """TTM 스퀴즈(변동성 응축). 볼린저 밴드가 켈트너 채널 '안'으로 들어오면 응축(on) →
+    곧 큰 움직임. on→off로 바뀌는 순간이 '분출(fired)'. 방향은 다른 지표로 판단.
+    반환 {on, fired, on_streak} 또는 None. BB '위치'만 보는 기존 로직과 직교(타이밍축)."""
+    n = len(closes)
+    if n < period + 1:
+        return None
+    states = []
+    start = max(period, n - look)
+    for end in range(start, n + 1):
+        r = closes[end - period:end]
+        mid = sum(r) / period
+        std = (sum((x - mid) ** 2 for x in r) / period) ** 0.5
+        bb_up, bb_lo = mid + bb_mult * std, mid - bb_mult * std
+        atr = _atr(highs[:end], lows[:end], closes[:end], period)
+        if atr is None:
+            states.append(None); continue
+        kc_up, kc_lo = mid + kc_mult * atr, mid - kc_mult * atr
+        states.append(bb_up < kc_up and bb_lo > kc_lo)
+    cur = states[-1]
+    prev = states[-2] if len(states) >= 2 else None
+    streak = 0
+    for s in reversed(states):
+        if s:
+            streak += 1
+        else:
+            break
+    return {'on': bool(cur), 'fired': bool(prev is True and cur is False), 'on_streak': streak}
+
+
+def _cmf(highs, lows, closes, vols, period=20):
+    """차이킨 자금흐름(CMF). 종가가 봉의 어디에 찍혔는지×거래량으로 매집/분산을 잰다.
+    −1~+1, >0 매집(자금 유입)·<0 분산(유출). 단순 거래량비와 직교하는 '스마트머니'축."""
+    n = len(closes)
+    if n < period:
+        return None
+    mfv = vol = 0.0
+    for i in range(n - period, n):
+        rng = highs[i] - lows[i]
+        mfm = (((closes[i] - lows[i]) - (highs[i] - closes[i])) / rng) if rng > 0 else 0.0
+        mfv += mfm * vols[i]
+        vol += vols[i]
+    return (mfv / vol) if vol else None
+
+
+def _lin_reg_r2(closes, period=60):
+    """가격을 시간에 선형회귀해 R²(추세 '품질')와 봉당 기울기(%)를 반환. R²≈1 매끈한
+    추세, ≈0 톱니(종잡을 수 없음). 급등락 종목의 추세 과신을 억제하는 참고축. 부족 시 None."""
+    n = len(closes)
+    m = min(period, n)
+    if m < 10:
+        return None
+    y = closes[-m:]
+    xbar = (m - 1) / 2
+    ybar = sum(y) / m
+    sxx = sum((i - xbar) ** 2 for i in range(m))
+    ss_tot = sum((v - ybar) ** 2 for v in y)
+    if sxx == 0 or ss_tot == 0:
+        return None
+    slope = sum((i - xbar) * (y[i] - ybar) for i in range(m)) / sxx
+    intercept = ybar - slope * xbar
+    ss_res = sum((y[i] - (slope * i + intercept)) ** 2 for i in range(m))
+    return {'r2': 1 - ss_res / ss_tot, 'slope_pct': slope / ybar * 100 if ybar else 0.0}
+
+
+def _anchored_vwap(highs, lows, closes, vols, anchor):
+    """앵커(보통 최근 스윙 저점) 이후의 거래량가중평균가(VWAP). 기관의 평균 매입단가
+    근사 → 되돌림 시 강력한 지지·매수 기준선. typical=(H+L+C)/3."""
+    num = den = 0.0
+    for i in range(max(0, anchor), len(closes)):
+        num += ((highs[i] + lows[i] + closes[i]) / 3) * vols[i]
+        den += vols[i]
+    return (num / den) if den else None
+
+
+def _buy_zone(closes, highs, lows, vols, ma20, ma60, bb_mid, bb_lower, price, tol=0.015):
+    """여러 기법이 겹치는 '추천 매수 구간(confluence zone)'을 산출한다.
+    피보나치 되돌림·이동평균·Anchored VWAP·볼린저·피벗 지지의 후보 가격을 모아
+    tol(=1.5%) 이내로 군집화하고, 가장 많은 기법이 겹치는 구간을 매수존으로 반환한다.
+    단일 지표 우연이 아니라 다수 합의 지점을 잡는 게 핵심. 반환 dict 또는 None."""
+    n = len(closes)
+    cands = []   # {'price','w','label'}
+
+    def add(p, w, label):
+        # 현실적 되돌림 범위(현재가의 −30%~+2%)만 후보로. 너무 먼 과거 레벨 배제.
+        if p and p > 0 and price * 0.70 <= p <= price * 1.02:
+            cands.append({'price': float(p), 'w': w, 'label': label})
+
+    # 1) 피보나치 되돌림 — 최근 랠리(스윙 저 → 고) 기준
+    fib = None
+    lb = min(n, 160)
+    seg_h, seg_l = highs[n - lb:], lows[n - lb:]
+    hi_rel = seg_h.index(max(seg_h))
+    swing_high = seg_h[hi_rel]
+    swing_low = min(seg_l[:hi_rel + 1])
+    if swing_high > swing_low:
+        rng = swing_high - swing_low
+        fib = {}
+        for r, w in ((0.382, 0.9), (0.5, 1.0), (0.618, 1.1), (0.786, 0.8)):
+            lvl = swing_high - rng * r
+            fib[f'{int(r * 100)}%'] = round(lvl, 2)
+            add(lvl, w, f'피보{int(r * 100)}')
+
+    # 2) 이동평균 눌림목
+    add(ma20, 1.0, 'MA20')
+    add(ma60, 1.1, 'MA60')
+
+    # 3) Anchored VWAP — 최근 스윙 저점 앵커 (피벗 없으면 120봉 전)
+    avwap = None
+    try:
+        _, pl = _pivots(highs, lows, 5)
+    except Exception:
+        pl = []
+    try:
+        anchor = pl[-1][0] if pl else max(0, n - 120)
+        avwap = _anchored_vwap(highs, lows, closes, vols, anchor)
+        add(avwap, 1.2, 'VWAP')
+    except Exception:
+        pass
+
+    # 4) 볼린저 하단·중심
+    add(bb_lower, 0.7, 'BB하단')
+    add(bb_mid, 0.6, 'BB중심')
+
+    # 5) 피벗 지지선 (현재가 아래 스윙 저점)
+    for _, lp in pl:
+        add(lp, 0.9, '지지선')
+
+    if not cands:
+        return None
+
+    # 가격 tol 이내로 군집화
+    tol_abs = price * tol
+    cands.sort(key=lambda c: c['price'])
+    clusters, cur = [], [cands[0]]
+    for c in cands[1:]:
+        if c['price'] - cur[-1]['price'] <= tol_abs:
+            cur.append(c)
+        else:
+            clusters.append(cur); cur = [c]
+    clusters.append(cur)
+
+    # 클러스터 강도 = 서로 다른 기법의 가중합(같은 기법 중복은 1회만)
+    best = None
+    for cl in clusters:
+        seen = {}
+        for c in cl:
+            seen[c['label']] = max(seen.get(c['label'], 0), c['w'])
+        strength = sum(seen.values())
+        wsum = sum(c['w'] for c in cl)
+        center = sum(c['price'] * c['w'] for c in cl) / wsum
+        info = {'center': center,
+                'low': min(c['price'] for c in cl),
+                'high': max(c['price'] for c in cl),
+                'strength': strength, 'methods': list(seen.keys())}
+        if best is None or strength > best['strength']:
+            best = info
+
+    # 단일 지표(우연) 수준이면 매수존으로 인정하지 않음
+    if best is None or best['strength'] < 1.5:
+        return None
+
+    nd = 0 if price >= 500 else 2
+    label = '강함' if best['strength'] >= 3.0 else ('보통' if best['strength'] >= 2.0 else '약함')
+    return {
+        'entry': round(best['center'], nd),
+        'low': round(best['low'], nd),
+        'high': round(best['high'], nd),
+        'strength': round(best['strength'], 1),
+        'strength_label': label,
+        'methods': best['methods'],
+        'dist_pct': round((best['center'] / price - 1) * 100, 1),   # 현재가 대비 위치(음수=아래)
+        'in_zone': best['low'] <= price <= best['high'],            # 현재가가 매수존 안?
+        'fib': fib,
+        'avwap': round(avwap, nd) if avwap else None,
+    }
+
+
 def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, with_reasons=True, mom_12_1=None):
     """가격/거래량 배열만으로 기술적 매수 점수를 계산 (네트워크·펀더멘털 불필요).
     배열의 '마지막 시점' 기준으로 평가 → 실시간 신호와 백테스트가 동일 로직을 공유한다.
@@ -313,6 +547,38 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
         tech_score -= 5
     tech_score = max(0, min(100, tech_score))
 
+    # ── 참고 지표(표시 전용) + 추천 매수존 — 실시간 신호에서만 계산 ──
+    # tech_score·백테스트에는 일절 반영하지 않는다(with_reasons=False인 백테스트는
+    # 이 블록을 건너뛰어 기존 동작·성능 그대로). ADX·스퀴즈·CMF·R²는 기존 축과
+    # 직교하는 '확인용' 지표, buy_zone은 다수 기법이 겹치는 추천 매수 구간.
+    adx_v = di_plus = di_minus = cmf_v = r2_v = None
+    squeeze = buy_zone = None
+    if with_reasons:
+        try:
+            _a = _adx(highs, lows, closes)
+            if _a:
+                adx_v, di_plus, di_minus = _a['adx'], _a['plus_di'], _a['minus_di']
+        except Exception:
+            pass
+        try:
+            squeeze = _squeeze(closes, highs, lows)
+        except Exception:
+            pass
+        try:
+            cmf_v = _cmf(highs, lows, closes, vols)
+        except Exception:
+            pass
+        try:
+            _lr = _lin_reg_r2(closes)
+            if _lr:
+                r2_v = _lr['r2']
+        except Exception:
+            pass
+        try:
+            buy_zone = _buy_zone(closes, highs, lows, vols, ma20, ma60, bb_mid, bb_lower, price)
+        except Exception:
+            pass
+
     # 근거 문장 (차트를 몰라도 읽히게)
     reasons = []
     if with_reasons:
@@ -367,6 +633,31 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
             else:          reasons.append(f'손익비 {rr:.1f}:1 — 손절 -{stop_pct:.0f}% / 목표 +{target_pct:.0f}%')
         if ext > 0.15:
             reasons.append(f'20일선 대비 +{ext*100:.0f}% 과열 — 추격 주의')
+        # ── 참고 지표 근거 (점수엔 미반영, 판단 보조) ──
+        if adx_v is not None:
+            if adx_v >= 25 and di_plus is not None and di_plus > di_minus:
+                reasons.append(f'ADX {adx_v:.0f} — 추세 강함(+DI 우위), 추세추종 유리')
+            elif adx_v >= 25 and di_minus is not None and di_minus > di_plus:
+                reasons.append(f'ADX {adx_v:.0f} — 하방 추세 강함(−DI 우위), 매수 신중')
+            elif adx_v < 20:
+                reasons.append(f'ADX {adx_v:.0f} — 추세 미약(횡보권), 돌파 확인 필요')
+        if squeeze and squeeze.get('fired'):
+            reasons.append('변동성 스퀴즈 해제 — 응축 후 방향성 분출 시작(돌파 주시)')
+        elif squeeze and squeeze.get('on'):
+            reasons.append(f"변동성 응축(스퀴즈 {squeeze['on_streak']}봉) — 큰 움직임 예비 구간")
+        if cmf_v is not None:
+            if cmf_v > 0.1:
+                reasons.append(f'자금 유입(CMF +{cmf_v:.2f}) — 매집 우위')
+            elif cmf_v < -0.1:
+                reasons.append(f'자금 유출(CMF {cmf_v:.2f}) — 분산·매도 우위')
+        if r2_v is not None and r2_v < 0.3 and not is_down:
+            reasons.append(f'추세 품질 낮음(R² {r2_v:.2f}) — 방향성 불명확, 변동성 주의')
+        if buy_zone:
+            _mz = ', '.join(buy_zone['methods'][:3])
+            _tag = ('현재가가 매수존 안 — 분할 진입 고려' if buy_zone['in_zone']
+                    else f"현재가 대비 {buy_zone['dist_pct']:+.1f}% 눌림 대기")
+            reasons.append(f"추천 매수존 {_fmt_price(buy_zone['low'])}~{_fmt_price(buy_zone['high'])} "
+                           f"(confluence {buy_zone['strength_label']}: {_mz}) — {_tag}")
         if gated:
             reasons.append('※ 하락추세 미확인 반전 → 매수등급 제한(관망 이하)')
 
@@ -398,7 +689,16 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
             'trend_strength': round(trend_strength * 100, 2),
             'structure': structure_label,
             'weekly': weekly_label,
+            # 참고 지표(표시 전용, 점수 미반영)
+            'adx': round(adx_v, 1) if adx_v is not None else None,
+            'plus_di': round(di_plus, 1) if di_plus is not None else None,
+            'minus_di': round(di_minus, 1) if di_minus is not None else None,
+            'cmf': round(cmf_v, 3) if cmf_v is not None else None,
+            'trend_r2': round(r2_v, 2) if r2_v is not None else None,
+            'squeeze_on': (squeeze or {}).get('on'),
+            'squeeze_fired': (squeeze or {}).get('fired'),
         },
+        'buy_zone': buy_zone,
         'plan': {
             'entry':      round(price, 2),
             'stop':       round(stop, 2)       if stop       is not None else None,
