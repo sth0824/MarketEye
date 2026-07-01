@@ -213,64 +213,141 @@ def _anchored_vwap(highs, lows, closes, vols, anchor):
     return (num / den) if den else None
 
 
-def _buy_zone(closes, highs, lows, vols, ma20, ma60, bb_mid, bb_lower, price, tol=0.015):
-    """여러 기법이 겹치는 '추천 매수 구간(confluence zone)'을 산출한다.
-    피보나치 되돌림·이동평균·Anchored VWAP·볼린저·피벗 지지의 후보 가격을 모아
-    tol(=1.5%) 이내로 군집화하고, 가장 많은 기법이 겹치는 구간을 매수존으로 반환한다.
-    단일 지표 우연이 아니라 다수 합의 지점을 잡는 게 핵심. 반환 dict 또는 None."""
+def _volume_profile(closes, highs, lows, vols, lookback=120, bins=40):
+    """거래량 프로파일. 최근 lookback봉을 가격 구간(bins)으로 나눠 각 구간의 누적
+    거래량을 구하고 POC(최다거래 가격)·밸류에어리어(VAL~VAH: 거래량 70% 밀집구간)를
+    반환한다. 기관이 보는 '실제로 물량이 쌓인 공정가치'대 — 이동평균·밴드보다 강한
+    자석/지지. 각 봉 거래량은 그 봉의 [저,고] 범위 빈들에 균등 분배. 부족 시 None."""
     n = len(closes)
+    s = max(0, n - lookback)
+    seg_lo, seg_hi = min(lows[s:]), max(highs[s:])
+    if seg_hi <= seg_lo:
+        return None
+    width = (seg_hi - seg_lo) / bins
+    vol_at = [0.0] * bins
+    for i in range(s, n):
+        b0 = max(0, min(bins - 1, int((lows[i] - seg_lo) / width)))
+        b1 = max(0, min(bins - 1, int((highs[i] - seg_lo) / width)))
+        share = vols[i] / (b1 - b0 + 1)
+        for b in range(b0, b1 + 1):
+            vol_at[b] += share
+    total = sum(vol_at)
+    if total <= 0:
+        return None
+    poc_b = max(range(bins), key=lambda b: vol_at[b])
+    # 밸류에어리어: POC에서 좌우로 확장하며 누적거래량 70% 도달까지
+    lo_b = hi_b = poc_b
+    acc, target = vol_at[poc_b], total * 0.70
+    while acc < target and (lo_b > 0 or hi_b < bins - 1):
+        d = vol_at[lo_b - 1] if lo_b > 0 else -1.0
+        u = vol_at[hi_b + 1] if hi_b < bins - 1 else -1.0
+        if u >= d:
+            hi_b += 1; acc += max(u, 0.0)
+        else:
+            lo_b -= 1; acc += max(d, 0.0)
+    return {'poc': seg_lo + (poc_b + 0.5) * width,
+            'val': seg_lo + lo_b * width,
+            'vah': seg_lo + (hi_b + 1) * width}
+
+
+def _anchored_vwap_bands(highs, lows, closes, vols, anchor):
+    """앵커(보통 최근 스윙 저점) 이후 거래량가중평균가(AVWAP)와 ±1σ 밴드.
+    기관 평균 매입단가와 그 표준편차 밴드 — 되돌림 시 강한 지지대. 부족 시 None."""
+    num = den = 0.0
+    rows = []
+    for i in range(max(0, anchor), len(closes)):
+        tp = (highs[i] + lows[i] + closes[i]) / 3
+        num += tp * vols[i]; den += vols[i]; rows.append((tp, vols[i]))
+    if den <= 0:
+        return None
+    vw = num / den
+    sd = (sum(v * (tp - vw) ** 2 for tp, v in rows) / den) ** 0.5
+    return {'vwap': vw, 'lower': vw - sd, 'upper': vw + sd}
+
+
+def _buy_zone(closes, highs, lows, vols, ma20, ma60, ma120, bb_mid, bb_lower, price,
+              atr=None, regime='range'):
+    """퀀트식 추천 매수 구간(confluence zone).
+
+    독립적인 지지 기법들의 후보 가격을 모아 ① 변동성(ATR)에 비례한 허용오차로
+    군집화하고 ② '실제로 그 가격을 저가로 시험한 횟수(touch)'로 가중해, 가장 강하게
+    겹치는 구간을 매수존으로 반환한다. 기법(가중치는 퀀트 중요도순):
+      · 거래량프로파일 POC/VAL — 실제 물량이 쌓인 공정가치대(최강 자석)
+      · Anchored VWAP ±σ — 기관 평균 매입단가
+      · 피보나치 되돌림(피벗 임펄스 기반) — 38.2/50/61.8
+      · 이동평균 20/60/120 — 장기선일수록 강한 눌림목
+      · 볼린저 하단/중심 · 피벗 스윙 지지
+    추세 국면을 반영: 하락추세면 '낙하칼 위험'으로 표기(맹목 추천 방지). 반환 dict/None."""
+    n = len(closes)
+    if n < 30:
+        return None
+    # 변동성 비례 허용오차(군집·터치 판정): 저변동은 촘촘히, 고변동은 넉넉히(0.6~2.0%)
+    tol_abs = min(max(0.6 * atr, 0.006 * price), 0.02 * price) if atr else 0.012 * price
+
+    try:
+        ph, pl = _pivots(highs, lows, 5)
+    except Exception:
+        ph, pl = [], []
+
+    def touches(level):
+        # 그 가격을 '저가'로 시험한 봉 수 = 지지 실전 강도(많을수록 신뢰↑)
+        return sum(1 for lo in lows if abs(lo - level) <= tol_abs)
+
     cands = []   # {'price','w','label'}
-
     def add(p, w, label):
-        # 현실적 되돌림 범위(현재가의 −30%~+2%)만 후보로. 너무 먼 과거 레벨 배제.
-        if p and p > 0 and price * 0.70 <= p <= price * 1.02:
-            cands.append({'price': float(p), 'w': w, 'label': label})
+        # 현실적 되돌림 범위(현재가 −28%~+1%)만 후보로. 터치 횟수로 가중 보정(최대 ×1.4).
+        if p and p > 0 and price * 0.72 <= p <= price * 1.01:
+            mult = 1.0 + min(touches(p), 8) * 0.05
+            cands.append({'price': float(p), 'w': w * mult, 'label': label})
 
-    # 1) 피보나치 되돌림 — 최근 랠리(스윙 저 → 고) 기준
+    # 1) 거래량 프로파일 POC/VAL — 기관 공정가치대
+    vp = _volume_profile(closes, highs, lows, vols)
+    if vp:
+        add(vp['poc'], 1.6, 'POC')
+        add(vp['val'], 1.2, 'VAL')
+
+    # 2) Anchored VWAP ±σ — 최근 스윙 저점 앵커
+    anchor = pl[-1][0] if pl else max(0, n - 120)
+    try:
+        avb = _anchored_vwap_bands(highs, lows, closes, vols, anchor)
+    except Exception:
+        avb = None
+    if avb:
+        add(avb['vwap'], 1.4, 'VWAP')
+        add(avb['lower'], 0.9, 'VWAP−σ')
+
+    # 3) 피보나치 되돌림 — 최근 임펄스(피벗 저→고, 실패 시 윈도우 최대/최소로 폴백)
     fib = None
-    lb = min(n, 160)
-    seg_h, seg_l = highs[n - lb:], lows[n - lb:]
-    hi_rel = seg_h.index(max(seg_h))
-    swing_high = seg_h[hi_rel]
-    swing_low = min(seg_l[:hi_rel + 1])
+    swing_high = swing_low = None
+    if ph and pl:
+        swing_high = ph[-1][1]
+        lows_before = [p for idx, p in pl if idx < ph[-1][0]]
+        swing_low = lows_before[-1] if lows_before else None
+    if swing_high is None or swing_low is None or swing_high <= swing_low:
+        lb = min(n, 160); seg_h, seg_l = highs[n - lb:], lows[n - lb:]
+        hi_rel = seg_h.index(max(seg_h))
+        swing_high, swing_low = seg_h[hi_rel], min(seg_l[:hi_rel + 1])
     if swing_high > swing_low:
-        rng = swing_high - swing_low
-        fib = {}
-        for r, w in ((0.382, 0.9), (0.5, 1.0), (0.618, 1.1), (0.786, 0.8)):
+        rng = swing_high - swing_low; fib = {}
+        for r, w in ((0.382, 0.9), (0.5, 1.0), (0.618, 1.2)):
             lvl = swing_high - rng * r
             fib[f'{int(r * 100)}%'] = round(lvl, 2)
             add(lvl, w, f'피보{int(r * 100)}')
 
-    # 2) 이동평균 눌림목
-    add(ma20, 1.0, 'MA20')
-    add(ma60, 1.1, 'MA60')
+    # 4) 이동평균 눌림목 (장기선일수록 강한 지지)
+    add(ma20, 0.9, 'MA20'); add(ma60, 1.1, 'MA60'); add(ma120, 1.2, 'MA120')
 
-    # 3) Anchored VWAP — 최근 스윙 저점 앵커 (피벗 없으면 120봉 전)
-    avwap = None
-    try:
-        _, pl = _pivots(highs, lows, 5)
-    except Exception:
-        pl = []
-    try:
-        anchor = pl[-1][0] if pl else max(0, n - 120)
-        avwap = _anchored_vwap(highs, lows, closes, vols, anchor)
-        add(avwap, 1.2, 'VWAP')
-    except Exception:
-        pass
+    # 5) 볼린저 하단·중심
+    add(bb_lower, 0.7, 'BB하단'); add(bb_mid, 0.5, 'BB중심')
 
-    # 4) 볼린저 하단·중심
-    add(bb_lower, 0.7, 'BB하단')
-    add(bb_mid, 0.6, 'BB중심')
-
-    # 5) 피벗 지지선 (현재가 아래 스윙 저점)
+    # 6) 피벗 스윙 지지선
     for _, lp in pl:
         add(lp, 0.9, '지지선')
 
     if not cands:
         return None
 
-    # 가격 tol 이내로 군집화
-    tol_abs = price * tol
+    # ATR 비례 오차로 군집화
     cands.sort(key=lambda c: c['price'])
     clusters, cur = [], [cands[0]]
     for c in cands[1:]:
@@ -280,7 +357,7 @@ def _buy_zone(closes, highs, lows, vols, ma20, ma60, bb_mid, bb_lower, price, to
             clusters.append(cur); cur = [c]
     clusters.append(cur)
 
-    # 클러스터 강도 = 서로 다른 기법의 가중합(같은 기법 중복은 1회만)
+    # 클러스터 강도 = 서로 다른 기법의 가중합(같은 기법 중복은 최고값 1회만)
     best = None
     for cl in clusters:
         seen = {}
@@ -289,30 +366,42 @@ def _buy_zone(closes, highs, lows, vols, ma20, ma60, bb_mid, bb_lower, price, to
         strength = sum(seen.values())
         wsum = sum(c['w'] for c in cl)
         center = sum(c['price'] * c['w'] for c in cl) / wsum
-        info = {'center': center,
-                'low': min(c['price'] for c in cl),
-                'high': max(c['price'] for c in cl),
-                'strength': strength, 'methods': list(seen.keys())}
+        info = {'center': center, 'low': min(c['price'] for c in cl),
+                'high': max(c['price'] for c in cl), 'strength': strength,
+                'methods': sorted(seen.keys(), key=lambda k: -seen[k])}
         if best is None or strength > best['strength']:
             best = info
 
-    # 단일 지표(우연) 수준이면 매수존으로 인정하지 않음
-    if best is None or best['strength'] < 1.5:
+    if best is None or best['strength'] < 1.0:
         return None
 
     nd = 0 if price >= 500 else 2
-    label = '강함' if best['strength'] >= 3.0 else ('보통' if best['strength'] >= 2.0 else '약함')
+    # 라벨은 '겹친 서로 다른 기법 수'로 판정(가중합보다 해석이 명확). 5+ 강함/3~4 보통/그 외 약함
+    nm = len(best['methods'])
+    label = '강함' if nm >= 5 else ('보통' if nm >= 3 else '약함')
+    is_down = regime in ('down', 'strong_down')
+    if is_down:
+        note = '하락추세 — 지지 매수는 낙하칼 위험, 반등 확인 후 진입'
+    elif best['low'] <= price <= best['high']:
+        note = '현재가가 매수존 안 — 분할 진입 고려'
+    else:
+        note = f"현재가 대비 {round((best['center'] / price - 1) * 100, 1):+.1f}% 눌림 대기"
     return {
         'entry': round(best['center'], nd),
         'low': round(best['low'], nd),
         'high': round(best['high'], nd),
-        'strength': round(best['strength'], 1),
+        'strength': round(s, 1),
         'strength_label': label,
         'methods': best['methods'],
-        'dist_pct': round((best['center'] / price - 1) * 100, 1),   # 현재가 대비 위치(음수=아래)
-        'in_zone': best['low'] <= price <= best['high'],            # 현재가가 매수존 안?
+        'dist_pct': round((best['center'] / price - 1) * 100, 1),   # 현재가 대비(음수=아래)
+        'in_zone': best['low'] <= price <= best['high'],
+        'caution': is_down,
+        'note': note,
         'fib': fib,
-        'avwap': round(avwap, nd) if avwap else None,
+        'poc': round(vp['poc'], nd) if vp else None,
+        'val': round(vp['val'], nd) if vp else None,
+        'vah': round(vp['vah'], nd) if vp else None,
+        'avwap': round(avb['vwap'], nd) if avb else None,
     }
 
 
@@ -575,7 +664,8 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
         except Exception:
             pass
         try:
-            buy_zone = _buy_zone(closes, highs, lows, vols, ma20, ma60, bb_mid, bb_lower, price)
+            buy_zone = _buy_zone(closes, highs, lows, vols, ma20, ma60, ma120,
+                                 bb_mid, bb_lower, price, atr=atr, regime=regime)
         except Exception:
             pass
 
@@ -657,10 +747,8 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
             reasons.append(f'추세 품질 낮음(R² {r2_v:.2f}) — 방향성 불명확, 변동성 주의')
         if buy_zone:
             _mz = ', '.join(buy_zone['methods'][:3])
-            _tag = ('현재가가 매수존 안 — 분할 진입 고려' if buy_zone['in_zone']
-                    else f"현재가 대비 {buy_zone['dist_pct']:+.1f}% 눌림 대기")
             reasons.append(f"추천 매수존 {_fmt_price(buy_zone['low'])}~{_fmt_price(buy_zone['high'])} "
-                           f"(confluence {buy_zone['strength_label']}: {_mz}) — {_tag}")
+                           f"(confluence {buy_zone['strength_label']}: {_mz}) — {buy_zone['note']}")
 
     return {
         'tech_score': tech_score,

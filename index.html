@@ -917,19 +917,26 @@ function renderSignalCard(ticker) {
       </div>`
     : '';
 
-  // 추천 매수존 (confluence) — 피보·이동평균·VWAP·볼린저·지지선이 겹치는 고확률 구간
+  // 추천 매수존 (퀀트 confluence) — 거래량프로파일·VWAP·피보·이동평균·지지선이 겹치는 고확률 구간
   const bz = sig.buy_zone;
-  const bzColor = bz ? (bz.strength_label === '강함' ? 'var(--green)' : bz.strength_label === '보통' ? 'var(--yellow)' : 'var(--muted)') : '';
+  const bzColor = bz ? (bz.caution ? 'var(--red)' : bz.strength_label === '강함' ? 'var(--green)' : bz.strength_label === '보통' ? 'var(--yellow)' : 'var(--muted)') : '';
+  // 거래량프로파일·VWAP 참고선 (있는 것만 표시)
+  const bzRefs = bz ? [
+    bz.poc != null ? `POC ${fmt(bz.poc, cur)}` : '',
+    (bz.val != null && bz.vah != null) ? `밸류 ${fmt(bz.val, cur)}~${fmt(bz.vah, cur)}` : '',
+    bz.avwap != null ? `VWAP ${fmt(bz.avwap, cur)}` : '',
+  ].filter(Boolean).join(' · ') : '';
   const buyZoneHtml = bz
     ? `<div style="margin-top:12px;padding:10px;background:var(--surface2);border-radius:8px;font-size:12px;border:1px solid ${bzColor}">
-        <div style="font-weight:700;margin-bottom:8px;color:var(--text)">🛒 추천 매수존 <span style="color:var(--muted);font-weight:400;font-size:10px">다수 기법 합의(confluence)</span>
-          <span style="float:right;color:${bzColor};font-weight:700">${bz.strength_label} · ${bz.strength}</span></div>
+        <div style="font-weight:700;margin-bottom:8px;color:var(--text)">🛒 추천 매수존 <span style="color:var(--muted);font-weight:400;font-size:10px">퀀트 다기법 합의(confluence)</span>
+          <span style="float:right;color:${bzColor};font-weight:700">${bz.caution ? '⚠ ' : ''}${bz.strength_label} · ${bz.methods.length}기법</span></div>
         <div style="text-align:center;font-size:16px;font-weight:700;color:var(--text)">${fmt(bz.low, cur)} ~ ${fmt(bz.high, cur)}</div>
-        <div style="text-align:center;margin-top:4px;color:var(--muted)">대표 진입가 <b style="color:var(--text)">${fmt(bz.entry, cur)}</b> · ${bz.in_zone ? '<span style="color:var(--green)">현재가 매수존 진입 ✓</span>' : `현재가 대비 <b style="color:var(--text)">${bz.dist_pct > 0 ? '+' : ''}${bz.dist_pct}%</b> 눌림 대기`}</div>
+        <div style="text-align:center;margin-top:4px;color:var(--muted)">대표 진입가 <b style="color:var(--text)">${fmt(bz.entry, cur)}</b> · ${bz.in_zone ? '<span style="color:var(--green)">현재가 매수존 진입 ✓</span>' : `현재가 대비 <b style="color:var(--text)">${bz.dist_pct > 0 ? '+' : ''}${bz.dist_pct}%</b>`}</div>
         <div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap;justify-content:center">
           ${bz.methods.map(mm => `<span style="font-size:10px;padding:2px 7px;background:var(--surface);border-radius:10px;color:var(--muted)">${esc(mm)}</span>`).join('')}
         </div>
-        ${bz.avwap != null ? `<div style="text-align:center;margin-top:6px;color:var(--muted);font-size:10px">기관 평균매입선(VWAP) ${fmt(bz.avwap, cur)}</div>` : ''}
+        ${bzRefs ? `<div style="text-align:center;margin-top:6px;color:var(--muted);font-size:10px">${bzRefs}</div>` : ''}
+        ${bz.note ? `<div style="text-align:center;margin-top:6px;color:${bz.caution ? 'var(--red)' : 'var(--muted)'};font-size:11px">${bz.caution ? '⚠ ' : ''}${esc(bz.note)}</div>` : ''}
       </div>`
     : '';
 
