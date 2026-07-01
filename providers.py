@@ -15,7 +15,7 @@ import concurrent.futures
 import requests
 import yfinance as yf
 
-from infra import log, timed, set_tag, _tag, _cache_get, _cache_set, yf_call, is_rate_limited
+from infra import log, timed, set_tag, _tag, _cache_get, _cache_set, _cache_get_stale, yf_call, is_rate_limited
 from signals import safe_val
 
 # 네이버 실시간 시세 캐시 TTL(초). 같은 종목 연속 조회 시 재호출을 막되,
@@ -482,6 +482,35 @@ def _fetch_stock_yahoo(ticker):
     return data
 
 
+def _card_fundamentals(info):
+    """야후 info에서 '네이버가 주지 않는' 카드 펀더멘털 필드만 뽑아 반환(None 제외).
+    야후 조회 실패 시 직전값·신호용 sigbase의 info로 카드를 보강해, ROE·마진·부채·
+    매출·Beta 등이 '-'로 사라지는 문제와 '카드엔 없고 신호엔 있는' 불일치를 없앤다.
+    이 값들은 분기 재무 기반이라 장중 실시간이 필요 없다."""
+    g = lambda k: safe_val(info.get(k))
+    out = {
+        'roe': g('returnOnEquity'), 'roa': g('returnOnAssets'),
+        'grossMargin': g('grossMargins'), 'operatingMargin': g('operatingMargins'),
+        'netMargin': g('profitMargins'), 'ebitdaMargin': g('ebitdaMargins'),
+        'revenueGrowth': g('revenueGrowth'), 'earningsGrowth': g('earningsGrowth'),
+        'earningsQuarterlyGrowth': g('earningsQuarterlyGrowth'),
+        'debtToEquity': g('debtToEquity'), 'currentRatio': g('currentRatio'),
+        'quickRatio': g('quickRatio'), 'totalCash': g('totalCash'),
+        'totalDebt': g('totalDebt'), 'freeCashflow': g('freeCashflow'),
+        'revenue': g('totalRevenue'), 'ebitda': g('ebitda'),
+        'enterpriseValue': g('enterpriseValue'), 'evRevenue': g('enterpriseToRevenue'),
+        'beta': g('beta'), 'sharesOutstanding': g('sharesOutstanding'),
+        'floatShares': g('floatShares'), 'shortRatio': g('shortRatio'),
+        'payoutRatio': g('payoutRatio'), 'targetPrice': g('targetMeanPrice'),
+        'recommendationMean': g('recommendationMean'),
+    }
+    if info.get('sector'):
+        out['sector'] = info.get('sector')
+    if info.get('industry'):
+        out['industry'] = info.get('industry')
+    return {k: v for k, v in out.items() if v is not None}
+
+
 def _fetch_stock(ticker):
     """종목 데이터를 조립해 반환. 한국 종목은 네이버 실시간으로 보강하며,
     야후가 레이트리밋 등으로 실패해도 네이버 단독으로 응답을 구성한다.
@@ -502,7 +531,16 @@ def _fetch_stock(ticker):
         # 한국 종목: 야후가 죽어도 네이버로 응답을 만든다.
         lvl = 'WARN' if is_rate_limited(e) else 'ERROR'
         log(f'야후 조회 {tk} 실패 — 네이버 단독 폴백: {e}', lvl)
-        data = _kr_skeleton(ticker)
+        # 스켈레톤만 쓰면 ROE·마진·부채·매출·Beta 등 야후 info 필드가 '-'로 사라지고
+        # 다음 캐시에 덮여 유실된다(카드=신호 불일치). 직전 정상값에서 살려온다:
+        #  ① 직전 stock 캐시 → ② 신호용 sigbase의 야후 info(신호가 이미 받아둔 값).
+        stale = _cache_get_stale(('stock', tk))
+        data = dict(stale) if isinstance(stale, dict) else _kr_skeleton(ticker)
+        if data.get('roe') is None:
+            sb = _cache_get_stale(('sigbase', tk))
+            if isinstance(sb, dict) and isinstance(sb.get('info'), dict):
+                data.update(_card_fundamentals(sb['info']))
+                log(f'{tk} 펀더멘털을 신호 sigbase에서 보강', 'DEBUG')
 
     # 한국 종목은 네이버 실시간 시세·펀더멘털로 보강 (야후 KRX 15~20분 지연 해소).
     if is_kr:
