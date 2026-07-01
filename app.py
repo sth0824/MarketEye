@@ -347,6 +347,42 @@ def signal(ticker):
                     info['forwardPE'] = nv_fpe
             except Exception as e:
                 log(f'네이버 실시간 {ticker} 실패(야후값 폴백): {e}', 'WARN')
+        else:
+            # 해외 종목: 네이버 같은 폴백 소스가 없으므로 야후 fast_info 실시간가로
+            # 마지막 봉·현재가·시총을 갱신한다(한국주 네이버 오버레이에 대응). sigbase의
+            # 일봉 마지막값은 장중 지연·30분 캐시라 그대로 쓰면 신호가 실시간이 아니었다.
+            # 야후가 막히면 하드타임아웃 후 예외 → 캐시된 일봉값 그대로 사용(회귀 없음).
+            try:
+                yft = yf.Ticker(ticker.upper())
+                with timed(f'야후 실시간 {ticker}', warn_ms=1500, slow_ms=3000):
+                    fi = yf_call(lambda: yft.fast_info, f'yf.fast_info(signal-rt) {ticker}')
+                rt = safe_val(fi.last_price)
+                if rt and rt > 0:
+                    dh, dl = safe_val(fi.day_high), safe_val(fi.day_low)
+                    closes[-1] = rt
+                    highs[-1] = max(highs[-1], dh or rt, rt)
+                    lows[-1] = min(lows[-1], dl or rt, rt)
+                    info['currentPrice'] = rt
+                    # 실시간가 기준으로 PER/PBR 재계산 (EPS·BPS는 분기 고정)
+                    eps = safe_val(info.get('trailingEps'))
+                    bps = safe_val(info.get('bookValue'))
+                    if eps and eps > 0:
+                        per = rt / eps
+                    if bps and bps > 0:
+                        pbr = rt / bps
+                    # 실시간 시총으로 시총 파생 밸류에이션 최신화 (PSR·EV/EBITDA)
+                    mcap = safe_val(getattr(fi, 'market_cap', None))
+                    if mcap and mcap > 0:
+                        info['marketCap'] = mcap
+                        rev = safe_val(info.get('totalRevenue'))
+                        if rev and rev > 0:
+                            info['priceToSalesTrailing12Months'] = mcap / rev
+                        ebitda = safe_val(info.get('ebitda'))
+                        if ebitda and ebitda > 0:
+                            ev = mcap + (safe_val(info.get('totalDebt')) or 0) - (safe_val(info.get('totalCash')) or 0)
+                            info['enterpriseToEbitda'] = ev / ebitda
+            except Exception as e:
+                log(f'야후 실시간 {ticker} 실패(캐시 일봉값 폴백): {e}', 'WARN')
 
         # 시장 대비 상대강도 (지수 종가는 1시간 캐시)
         rs_60 = None
