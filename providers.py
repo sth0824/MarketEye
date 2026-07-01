@@ -12,7 +12,9 @@ import re
 import unicodedata
 import threading
 import concurrent.futures
+from datetime import datetime, timedelta
 import requests
+import pandas as pd
 import yfinance as yf
 
 from infra import log, timed, set_tag, _tag, _cache_get, _cache_set, _cache_get_stale, yf_call, is_rate_limited
@@ -242,6 +244,40 @@ def _fetch_naver(code):
     out['marketCap'] = _naver_won(ti.get('marketValue'))
     _cache_set(('naver', code), out)
     return out
+
+
+def _naver_history_df(code, days=760):
+    """네이버 증권 일봉 OHLCV를 야후 t.history()와 같은 형태의 DataFrame으로 반환.
+
+    야후 2년 일봉이 '콜드스타트에 레이트리밋/무응답'이어서 한국 종목 신호·추천
+    매수존이 아예 안 뜨던 문제의 폴백. 야후처럼 데이터센터 IP를 차단하지 않는
+    네이버 시세 API를 써서, 야후가 죽어도 국내 종목은 일봉을 확보한다.
+    컬럼: Open/High/Low/Close/Volume, index=DatetimeIndex(오름차순). 실패 시 예외.
+
+    응답은 헤더 행이 홑따옴표인 파이썬 리스트 리터럴 형태라(예:
+    [['날짜','시가',...],["20240102",79600,...],...]) 홑→겹따옴표 치환 후 JSON 파싱한다."""
+    end = datetime.now()
+    start = end - timedelta(days=days)
+    url = 'https://api.finance.naver.com/siseJson.naver'
+    params = {'symbol': code, 'requestType': 1,
+              'startTime': start.strftime('%Y%m%d'),
+              'endTime': end.strftime('%Y%m%d'), 'timeframe': 'day'}
+    with timed(f'네이버 일봉 {code}', warn_ms=2000, slow_ms=4000):
+        res = requests.get(url, params=params, headers=_NAVER_HEADERS, timeout=8)
+    rows = json.loads(res.text.strip().replace("'", '"'))
+    recs = []
+    for r in rows[1:]:            # rows[0]은 헤더
+        if not r or len(r) < 6:
+            continue
+        try:
+            d = datetime.strptime(str(r[0]), '%Y%m%d')
+            recs.append((d, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
+        except (ValueError, TypeError):
+            continue
+    if len(recs) < 60:
+        raise ValueError(f'네이버 일봉 부족: {len(recs)}행')
+    df = pd.DataFrame(recs, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
+    return df.set_index('Date').sort_index()
 
 
 def _yahoo_search(query):

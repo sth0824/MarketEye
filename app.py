@@ -16,7 +16,7 @@ from infra import (
 # 외부 데이터 수집층(KRX·네이버·야후 조회)은 providers.py로 분리.
 from providers import (
     _search_krx, _is_korean, _yahoo_search,
-    _fetch_stock, _calc_per_pbr, _fetch_naver,
+    _fetch_stock, _calc_per_pbr, _fetch_naver, _naver_history_df,
 )
 # 순수 신호 엔진은 signals.py로 분리 (동작 동일). app.py는 라우트·조립 담당.
 from signals import (
@@ -231,6 +231,8 @@ def _signal_base(ticker):
         log(f'signal_base {ticker} 캐시 히트', 'DEBUG')
         return cached
 
+    tk = ticker.upper()
+    is_kr = tk.endswith('.KS') or tk.endswith('.KQ')
     t = yf.Ticker(ticker)
     # 200일선·기울기 판정을 위해 2년치 일봉 확보 (signal의 핵심 비용)
     try:
@@ -243,7 +245,18 @@ def _signal_base(ticker):
         if stale is not None:
             log(f'signal_base {ticker} 조회 실패 → stale base 재사용: {e}', 'WARN')
             return stale
-        raise
+        # 한국 종목: 콜드스타트라 stale조차 없으면 네이버 일봉으로 폴백한다.
+        # (야후가 KRX를 차단·무응답할 때 신호·추천 매수존이 아예 안 뜨던 문제 해소)
+        if is_kr:
+            try:
+                with timed(f'네이버 일봉 폴백 {ticker}', warn_ms=2000, slow_ms=4000):
+                    hist = _naver_history_df(tk.split('.')[0])
+                log(f'signal_base {ticker} 야후 실패 → 네이버 일봉 폴백 ({len(hist)}행)', 'WARN')
+            except Exception as ne:
+                log(f'signal_base {ticker} 네이버 일봉 폴백도 실패: {ne}', 'ERROR')
+                raise e
+        else:
+            raise
     if hist.empty or len(hist) < 60:
         log(f'signal_base {ticker} 데이터 부족 (rows={len(hist)})', 'WARN')
         return None
@@ -262,9 +275,16 @@ def _signal_base(ticker):
     except Exception:
         pass
 
-    # 펀더멘털 info + 야후 PER/PBR (분기 재무 기반, 장중 불변)
-    with timed(f'yf.info(signal) {ticker}'):
-        info = yf_call(lambda: t.info, f'yf.info(signal) {ticker}')
+    # 펀더멘털 info + 야후 PER/PBR (분기 재무 기반, 장중 불변).
+    # 야후가 막히면(네이버 일봉 폴백 상황) info 없이 진행 — 신호·매수존은 가격·거래량
+    # 만으로 계산되므로 영향이 없고, 한국주는 signal 라우트에서 네이버 PER/PBR·
+    # 펀더멘털로 보강된다. info를 못 받는다고 신호 전체가 죽지 않게 한다.
+    try:
+        with timed(f'yf.info(signal) {ticker}'):
+            info = yf_call(lambda: t.info, f'yf.info(signal) {ticker}')
+    except Exception as e:
+        log(f'yf.info(signal) {ticker} 실패 — info 없이 진행: {e}', 'WARN')
+        info = {}
     try:
         fi = yf_call(lambda: t.fast_info, f'yf.fast_info(signal) {ticker}')
         if fi.last_price:
