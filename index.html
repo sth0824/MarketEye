@@ -706,8 +706,18 @@ function loadActiveGroup() {
   // 3개 동시 → 모두 끝난 뒤 신호(무거움) 최대 2개 동시. fetchStock/Signal은 예외를
   // 자체 처리·백그라운드 재시도하므로 풀이 막히지 않는다(동작 의미는 기존과 동일).
   (async () => {
+    const t0 = performance.now();
+    console.log(`[MarketEye] ⏳ 그룹 로드 시작: ${tickers.length}종목 [${tickers.join(', ')}]`);
     await runPool(tickers, t => fetchStock(t), 3);
+    const okS = tickers.filter(t => stocks[t]).length;
+    console.log(`[MarketEye] 📊 주식 ${okS}/${tickers.length} 성공${okS < tickers.length ? ` · 실패 ${tickers.filter(t => !stocks[t]).join(', ')}` : ''} (${Math.round(performance.now() - t0)}ms)`);
     await runPool(tickers, t => fetchSignal(t), 2);
+    const okG = tickers.filter(t => signals[t]).length;
+    console.log(`[MarketEye] 📊 신호 ${okG}/${tickers.length} 성공${okG < tickers.length ? ` · 실패 ${tickers.filter(t => !signals[t]).join(', ')}` : ''} · 총 ${Math.round(performance.now() - t0)}ms`);
+    // 진단 요약: 대량 타임아웃이면 서버-야후 구간 문제일 가능성이 큼(서버 Render 로그 확인)
+    if (okS < tickers.length || okG < tickers.length) {
+      console.warn('[MarketEye] ⚠ 일부 로드 실패 — 반복되면 Render 서버 로그에서 "야후 …s 무응답/느림" 확인. 한국주는 네이버 폴백으로 시세는 떠야 정상.');
+    }
   })();
 }
 

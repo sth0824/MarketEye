@@ -110,13 +110,42 @@ def is_rate_limited(exc):
 # 전역 최소 호출 간격(초). 0이면 비활성. 동시 요청이 야후를 때리는 빈도를 낮춘다.
 YF_MIN_INTERVAL = float(os.environ.get('YF_MIN_INTERVAL', '0.35'))
 YF_RETRIES = int(os.environ.get('YF_RETRIES', '2'))
+# 야후 호출 하드 타임아웃(초). 0이면 비활성.
+#   증상: 야후가 Render 등 데이터센터 IP를 레이트리밋/차단하면 응답 없이 소켓을
+#   물고 늘어져(hang) 요청이 30초+ 매달리고, 한국 종목은 네이버 폴백까지 도달조차
+#   못 한다. 이 시간을 넘기면 강제로 TimeoutError를 던져(→ 한국주는 네이버로 폴백,
+#   그 외는 stale/에러) 프론트가 빠르게 응답을 받게 한다. 재시도는 하지 않는다
+#   (행을 다시 쌓기 때문). 값이 큰 콜드 조회를 죽이지 않도록 기본 10초로 여유.
+YF_CALL_TIMEOUT = float(os.environ.get('YF_CALL_TIMEOUT', '10'))
 _yf_lock = threading.Lock()
 _yf_last = [0.0]
 
+
+def _run_with_timeout(fn, timeout, label):
+    """fn()을 데몬 스레드에서 실행하고 timeout초 안에 못 끝나면 TimeoutError.
+    호출당 스레드라 공유 풀 고갈이 없고, 야후가 requests든 curl_cffi든 무엇으로
+    매달리든 wall-clock 상한이 보장된다(막힌 스레드는 데몬이라 종료를 안 막음)."""
+    box = {}
+    def _run():
+        try:
+            box['v'] = fn()
+        except Exception as e:  # noqa: BLE001 — 원 예외를 그대로 호출부로 전파
+            box['e'] = e
+    th = threading.Thread(target=_run, name=f'yf:{label[:20]}', daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        raise TimeoutError(f'{label} {timeout:.0f}s 무응답 — 야후 차단/레이트리밋 의심(폴백 전환)')
+    if 'e' in box:
+        raise box['e']
+    return box.get('v')
+
+
 def yf_call(fn, label='yf', retries=None):
-    """yfinance 네트워크 호출(fn: 인자 없는 callable)을 전역 간격 제한 + 레이트리밋
-    백오프 재시도로 감싼다. 호출부는 yf_call(lambda: t.info, 'yf.info AAPL') 형태.
-    레이트리밋이 아닌 예외는 즉시 전파한다."""
+    """yfinance 네트워크 호출(fn: 인자 없는 callable)을 전역 간격 제한 + 하드 타임아웃
+    + 레이트리밋 백오프 재시도로 감싼다. 호출부는 yf_call(lambda: t.info, 'yf.info AAPL').
+    타임아웃/레이트리밋이 아닌 예외는 즉시 전파한다. 경과시간을 로그로 남겨 어느
+    호출이 느린지/막히는지 Render 로그에서 바로 보이게 한다."""
     retries = YF_RETRIES if retries is None else retries
     last_exc = None
     for attempt in range(retries + 1):
@@ -127,15 +156,27 @@ def yf_call(fn, label='yf', retries=None):
                 if wait > 0:
                     time.sleep(wait)
                 _yf_last[0] = time.time()
+        t0 = time.time()
         try:
-            return fn()
+            result = _run_with_timeout(fn, YF_CALL_TIMEOUT, label) if YF_CALL_TIMEOUT > 0 else fn()
+            el = time.time() - t0
+            if el > 2.0:   # 성공했지만 느린 야후 호출 — 병목 후보로 기록
+                log(f'{label} 야후 응답 {el:.1f}s (느림)', 'WARN')
+            return result
         except Exception as e:
             last_exc = e
+            el = time.time() - t0
+            # 하드 타임아웃(=행)은 재시도하지 않는다: 재시도하면 행을 다시 쌓아
+            # 총 대기가 timeout×(retries+1)로 불어나 프론트 타임아웃을 못 막는다.
+            if isinstance(e, TimeoutError):
+                log(f'{label} 타임아웃 {el:.1f}s — 재시도 없이 폴백: {e}', 'WARN')
+                raise
             if is_rate_limited(e) and attempt < retries:
                 back = (2 ** attempt) * 0.5 + random.random() * 0.4
-                log(f'{label} 레이트리밋 — {back:.1f}s 후 재시도 ({attempt + 1}/{retries})', 'WARN')
+                log(f'{label} 레이트리밋 {el:.1f}s — {back:.1f}s 후 재시도 ({attempt + 1}/{retries})', 'WARN')
                 time.sleep(back)
                 continue
+            log(f'{label} 실패 {el:.1f}s: {type(e).__name__}: {e}', 'WARN')
             raise
     raise last_exc
 
