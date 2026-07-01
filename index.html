@@ -674,6 +674,23 @@ async function pushSyncNow() {
   }
 }
 
+// 동시 실행 개수를 limit개로 제한하는 작업 풀. items를 worker로 처리하되 항상
+// 최대 limit개만 '동시에' 진행한다(하나 끝나면 다음 것을 당겨온다). 시차(stagger)와
+// 달리 콜드스타트로 요청이 오래 걸려도 서버에 몰리는 최대 동시 요청 수가 고정된다.
+// worker는 예외를 자체 처리하는 게 원칙이나, 혹시 던져도 풀이 멈추지 않게 감싼다.
+async function runPool(items, worker, limit) {
+  let idx = 0;
+  async function lane() {
+    while (idx < items.length) {
+      const cur = idx++;
+      try { await worker(items[cur], cur); } catch (e) {}
+    }
+  }
+  const lanes = [];
+  for (let i = 0; i < Math.min(limit, items.length); i++) lanes.push(lane());
+  await Promise.all(lanes);
+}
+
 // 현재 그룹의 종목 데이터를 모두 불러옴
 function loadActiveGroup() {
   stocks = {};
@@ -684,19 +701,23 @@ function loadActiveGroup() {
   document.getElementById('empty-state').style.display = tickers.length ? 'none' : '';
   tickers.forEach(t => { stocks[t] = null; });
   renderAll();
-  // 한꺼번에 쏟아내면 야후가 레이트리밋(429)하므로 종목마다 시차를 둔다.
-  // 주식 가격 데이터만 먼저 로드 (빠른 응답), 신호는 나중에 백그라운드에서 로드
-  tickers.forEach((t, i) => setTimeout(() => { fetchStock(t); }, i * 250));
-  // 신호 계산은 모든 주식 데이터가 로드된 후 더 긴 지연으로 시작 (Render 과부하 방지)
-  setTimeout(() => {
-    tickers.forEach((t, i) => setTimeout(() => { fetchSignal(t); }, i * 500));
-  }, tickers.length * 250 + 1000);
+  // 한꺼번에 쏟아내면 콜드스타트·야후 레이트리밋(429) 시 요청이 몰려 전부 타임아웃난다.
+  // 시차 대신 '동시 요청 수'를 고정(풀)해 서버 부하를 낮춘다. 주식(가벼움) 먼저 최대
+  // 3개 동시 → 모두 끝난 뒤 신호(무거움) 최대 2개 동시. fetchStock/Signal은 예외를
+  // 자체 처리·백그라운드 재시도하므로 풀이 막히지 않는다(동작 의미는 기존과 동일).
+  (async () => {
+    await runPool(tickers, t => fetchStock(t), 3);
+    await runPool(tickers, t => fetchSignal(t), 2);
+  })();
 }
 
+// 신호는 첫 콜드스타트에서 2년 일봉+재무 조회로 가장 무겁다 → 기본 30초로는 첫 파도가
+// 끊기기 쉬워 45초로 여유를 준다(apiFetch의 timeoutMs 오버라이드 사용, 타 요청엔 무영향).
+const SIGNAL_TIMEOUT_MS = 45000;
 async function fetchSignal(ticker) {
   let status = 0;
   try {
-    const res = await apiFetch(`${API}/signal/${encodeURIComponent(ticker)}`);
+    const res = await apiFetch(`${API}/signal/${encodeURIComponent(ticker)}`, {}, SIGNAL_TIMEOUT_MS);
     status = res.status;
     const json = await res.json();
     if (json.success) {
