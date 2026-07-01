@@ -457,6 +457,7 @@ async function fetchStock(ticker, isNew = false) {
     if (!json.success) throw new Error(json.error || '데이터 로드 실패');
     stocks[ticker] = json.data;
     setLoadingBar(100);
+    persistCache();   // 성공값을 로컬에 저장(다음 콜드스타트 때 즉시 표시용)
     renderAll();
   } catch(e) {
     const msg = e.message || '';
@@ -499,9 +500,10 @@ async function refreshPrices() {
       // 경량 엔드포인트: 가격·등락률만 (재무지표·히스토리는 유지)
       const res = await apiFetch(`${API}/price/${ticker}`);
       const json = await res.json();
-      if (json.success) Object.assign(stocks[ticker], json.data);
+      if (json.success && stocks[ticker]) Object.assign(stocks[ticker], json.data);
     } catch(e) {}
   }));
+  persistCache();   // 갱신된 최신 가격도 로컬 캐시에 반영
 
   const now = new Date();
   document.getElementById('last-updated').textContent =
@@ -692,6 +694,46 @@ async function runPool(items, worker, limit) {
 }
 
 // 현재 그룹의 종목 데이터를 모두 불러옴
+// ── 직전 값 로컬 캐시 (stale-while-revalidate) ──────────────────────────
+// 배포/재접속 시 서버 인메모리 캐시가 비어(콜드스타트) 첫 요청이 느리거나 실패하면
+// 카드가 무한 '로딩 중'에 갇혔다. 마지막으로 성공한 stocks/signals를 localStorage에
+// 저장해두고, 로드 즉시 그 값으로 카드를 채운 뒤 백그라운드에서 갱신한다. 서버가
+// 콜드여도 사용자는 직전 데이터를 바로 본다(무한 스피너 원천 차단). 순수 클라이언트.
+const _CACHE_KEY = 'marketeye_data_cache_v1';
+let _persistTimer = null;
+function persistCache() {
+  clearTimeout(_persistTimer);
+  _persistTimer = setTimeout(() => {
+    try {
+      const s = {}, g = {};
+      for (const k in stocks) if (stocks[k]) s[k] = stocks[k];   // null(로딩중) 제외
+      for (const k in signals) if (signals[k]) g[k] = signals[k];
+      localStorage.setItem(_CACHE_KEY, JSON.stringify({ ts: Date.now(), stocks: s, signals: g }));
+    } catch (e) { /* 용량 초과·비활성 등은 무시(캐시는 부가기능) */ }
+  }, 1200);
+}
+function hydrateFromCache(tickers) {
+  let hit = 0;
+  try {
+    const raw = localStorage.getItem(_CACHE_KEY);
+    if (!raw) return 0;
+    const c = JSON.parse(raw) || {};
+    tickers.forEach(t => {
+      if (!stocks[t] && c.stocks && c.stocks[t]) { stocks[t] = c.stocks[t]; hit++; }
+      if (!signals[t] && c.signals && c.signals[t]) { signals[t] = c.signals[t]; }
+    });
+    if (hit) console.log(`[MarketEye] 💾 캐시 복원: ${hit}종목 즉시 표시(백그라운드 갱신 중)`);
+  } catch (e) { /* 손상된 캐시는 무시 */ }
+  return hit;
+}
+// 무한로딩 카드의 '다시 시도' 버튼 → 재시도 예산 리셋 후 재요청
+function retryTicker(ticker) {
+  _retryCount[ticker] = 0;
+  if (!stocks[ticker]) fetchStock(ticker);
+  if (!signals[ticker]) fetchSignal(ticker);
+  renderAll();
+}
+
 function loadActiveGroup() {
   stocks = {};
   signals = {};
@@ -700,6 +742,7 @@ function loadActiveGroup() {
   const tickers = g ? g.tickers.slice() : [];
   document.getElementById('empty-state').style.display = tickers.length ? 'none' : '';
   tickers.forEach(t => { stocks[t] = null; });
+  hydrateFromCache(tickers);   // 직전 값으로 즉시 채움 → 무한 '로딩 중' 방지
   renderAll();
   // 한꺼번에 쏟아내면 콜드스타트·야후 레이트리밋(429) 시 요청이 몰려 전부 타임아웃난다.
   // 시차 대신 '동시 요청 수'를 고정(풀)해 서버 부하를 낮춘다. 주식(가벼움) 먼저 최대
@@ -732,6 +775,7 @@ async function fetchSignal(ticker) {
     const json = await res.json();
     if (json.success) {
       signals[ticker] = json.data;
+      persistCache();   // 성공 신호를 로컬에 저장(콜드스타트 때 즉시 표시용)
       // 개요 탭 카드 배지 갱신
       if (activeTab === 'overview') updateSignalBadge(ticker, json.data);
       // 신호 탭이 열려 있으면 재렌더
@@ -1183,7 +1227,16 @@ function renderLoadingCard(ticker) {
     el.className = 'loading-card';
     c.appendChild(el);
   }
-  el.innerHTML = `<div class="spinner"></div><span>${ticker} 로딩 중...</span>`;
+  // 재시도 예산(4회)을 다 쓰고도 데이터가 없으면 무한 스피너 대신 '다시 시도' 카드.
+  // (직전 값이 로컬 캐시에 있으면 애초에 이 카드가 아니라 데이터 카드가 그려진다)
+  const exhausted = (_retryCount[ticker] || 0) > 4;
+  el.innerHTML = exhausted
+    ? `<div style="text-align:center;color:var(--muted);font-size:13px;padding:8px">
+         <div style="font-weight:600;color:var(--text)">${esc(ticker)}</div>
+         <div style="margin:8px 0">⚠ 지금 불러올 수 없어요<br><span style="font-size:11px">(서버·시세 지연)</span></div>
+         <button class="secondary" style="font-size:12px;padding:5px 14px" onclick="retryTicker('${esc(ticker)}')">다시 시도</button>
+       </div>`
+    : `<div class="spinner"></div><span>${esc(ticker)} 로딩 중...</span>`;
 }
 
 function renderCards() {
