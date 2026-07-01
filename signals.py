@@ -390,7 +390,7 @@ def _buy_zone(closes, highs, lows, vols, ma20, ma60, ma120, bb_mid, bb_lower, pr
         'entry': round(best['center'], nd),
         'low': round(best['low'], nd),
         'high': round(best['high'], nd),
-        'strength': round(s, 1),
+        'strength': round(best['strength'], 1),
         'strength_label': label,
         'methods': best['methods'],
         'dist_pct': round((best['center'] / price - 1) * 100, 1),   # 현재가 대비(음수=아래)
