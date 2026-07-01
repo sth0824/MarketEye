@@ -633,7 +633,10 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
             else:          reasons.append(f'손익비 {rr:.1f}:1 — 손절 -{stop_pct:.0f}% / 목표 +{target_pct:.0f}%')
         if ext > 0.15:
             reasons.append(f'20일선 대비 +{ext*100:.0f}% 과열 — 추격 주의')
-        # ── 참고 지표 근거 (점수엔 미반영, 판단 보조) ──
+        if gated:
+            reasons.append('※ 하락추세 미확인 반전 → 매수등급 제한(관망 이하)')
+        # ── 참고 지표 근거 (점수엔 미반영, 판단 보조) — 기존 근거 뒤에만 덧붙인다 ──
+        # (기존 문장 순서를 절대 바꾸지 않도록 반드시 맨 마지막에 append)
         if adx_v is not None:
             if adx_v >= 25 and di_plus is not None and di_plus > di_minus:
                 reasons.append(f'ADX {adx_v:.0f} — 추세 강함(+DI 우위), 추세추종 유리')
@@ -658,8 +661,6 @@ def _technical_signal(closes, highs, lows, vols, rs_60=None, weekly_up=None, wit
                     else f"현재가 대비 {buy_zone['dist_pct']:+.1f}% 눌림 대기")
             reasons.append(f"추천 매수존 {_fmt_price(buy_zone['low'])}~{_fmt_price(buy_zone['high'])} "
                            f"(confluence {buy_zone['strength_label']}: {_mz}) — {_tag}")
-        if gated:
-            reasons.append('※ 하락추세 미확인 반전 → 매수등급 제한(관망 이하)')
 
     return {
         'tech_score': tech_score,
