@@ -6,6 +6,11 @@ import traceback
 import os
 import time
 import threading
+from datetime import datetime, time as dtime
+try:
+    from zoneinfo import ZoneInfo   # 표준 라이브러리(3.9+). tzdata 패키지로 데이터 보장.
+except Exception:                    # 극단적 폴백(사실상 도달 안 함)
+    ZoneInfo = None
 
 # 공용 인프라(로깅·타이밍·TTL 캐시·JSON 방어막)는 infra.py로 분리.
 from infra import (
@@ -284,10 +289,35 @@ def _signal_base(ticker):
     return base
 
 
+# 신호 결과 캐시 TTL(초). 자동 새로고침은 /api/price(경량)만 폴링하고 /api/signal은
+# 사용자 이동(그룹 진입·탭 전환·종목 추가) 시에만 요청하므로, 짧게 잡아도 야후 부하가
+# 급증하지 않는다. 기본 30초 → 장중 점수가 화면 가격 갱신 주기(30초)와 비슷하게 최신
+# 유지되면서, 그룹을 빠르게 오갈 때의 중복 재계산·동시요청은 여전히 흡수한다.
+SIGNAL_TTL = int(os.environ.get('SIGNAL_TTL', '30'))
+
+# 미국 정규장 개장 시각(ET). '새 세션 시작' 판정에만 쓰이며 조기폐장일은 영향 없음.
+_US_MARKET_OPEN = dtime(9, 30)
+
+def _exchange_now(info, fi):
+    """종목 거래소 시간대 기준의 현재 시각(tz-aware datetime)을 반환. 확정 실패 시 None.
+    실시간 오버레이에서 '캐시 일봉의 마지막 봉이 오늘인지/이전 거래일인지'를 판정해
+    어제 종가를 오늘가로 덮어쓰는 오염을 막는 데 쓴다."""
+    if ZoneInfo is None:
+        return None
+    tz = getattr(fi, 'timezone', None) or info.get('exchangeTimezoneName') \
+        or info.get('timeZoneFullName') or 'America/New_York'
+    for cand in (tz, 'America/New_York'):
+        try:
+            return datetime.now(ZoneInfo(cand))
+        except Exception:
+            continue
+    return None
+
+
 @app.route('/api/signal/<path:ticker>')
 def signal(ticker):
-    # 신호 계산 결과 5분 캐시 (Render 배포 성능 개선)
-    cached = _cache_get(('signal', ticker), 300)
+    # 신호 계산 결과 캐시 (SIGNAL_TTL초). 짧게 잡아 장중 점수를 실시간에 가깝게 유지.
+    cached = _cache_get(('signal', ticker), SIGNAL_TTL)
     if cached:
         log(f'signal {ticker} 캐시 히트', 'DEBUG')
         return jsonify({'success': True, 'data': cached})
@@ -351,6 +381,11 @@ def signal(ticker):
             # 해외 종목: 네이버 같은 폴백 소스가 없으므로 야후 fast_info 실시간가로
             # 마지막 봉·현재가·시총을 갱신한다(한국주 네이버 오버레이에 대응). sigbase의
             # 일봉 마지막값은 장중 지연·30분 캐시라 그대로 쓰면 신호가 실시간이 아니었다.
+            #
+            # ⚠️ 정합성: 캐시 일봉의 마지막 봉이 '이전 거래일'인 상태(개장 직전/직후 +
+            # 캐시가 아직 어제 것)에서 무조건 closes[-1]=rt로 덮으면 어제 종가가 오늘가로
+            # 오염된다(한국주는 네이버 tradeDate로 이를 구분). 거래소 시간대 기준으로
+            # ①오늘 봉 교체 ②새 봉 추가 ③(개장 전·주말·휴장) 계열 보존 을 구분한다.
             # 야후가 막히면 하드타임아웃 후 예외 → 캐시된 일봉값 그대로 사용(회귀 없음).
             try:
                 yft = yf.Ticker(ticker.upper())
@@ -359,28 +394,53 @@ def signal(ticker):
                 rt = safe_val(fi.last_price)
                 if rt and rt > 0:
                     dh, dl = safe_val(fi.day_high), safe_val(fi.day_low)
-                    closes[-1] = rt
-                    highs[-1] = max(highs[-1], dh or rt, rt)
-                    lows[-1] = min(lows[-1], dl or rt, rt)
-                    info['currentPrice'] = rt
-                    # 실시간가 기준으로 PER/PBR 재계산 (EPS·BPS는 분기 고정)
-                    eps = safe_val(info.get('trailingEps'))
-                    bps = safe_val(info.get('bookValue'))
-                    if eps and eps > 0:
-                        per = rt / eps
-                    if bps and bps > 0:
-                        pbr = rt / bps
-                    # 실시간 시총으로 시총 파생 밸류에이션 최신화 (PSR·EV/EBITDA)
-                    mcap = safe_val(getattr(fi, 'market_cap', None))
-                    if mcap and mcap > 0:
-                        info['marketCap'] = mcap
-                        rev = safe_val(info.get('totalRevenue'))
-                        if rev and rev > 0:
-                            info['priceToSalesTrailing12Months'] = mcap / rev
-                        ebitda = safe_val(info.get('ebitda'))
-                        if ebitda and ebitda > 0:
-                            ev = mcap + (safe_val(info.get('totalDebt')) or 0) - (safe_val(info.get('totalCash')) or 0)
-                            info['enterpriseToEbitda'] = ev / ebitda
+                    exch_now = _exchange_now(info, fi)
+                    today_ex = exch_now.date().isoformat() if exch_now else None
+                    # 정규장이 이미 시작된 평일인지(개장 전/주말이면 '새 세션' 아님).
+                    new_session = bool(exch_now and exch_now.weekday() < 5
+                                       and exch_now.time() >= _US_MARKET_OPEN)
+
+                    apply_rt = True  # 밸류에이션(per/pbr/시총)을 실시간가로 갱신할지
+                    if today_ex is None:
+                        # 시간대 확정 실패(사실상 도달 안 함) → 기존 동작(마지막 봉 교체)로 폴백
+                        closes[-1] = rt
+                        highs[-1] = max(highs[-1], dh or rt, rt)
+                        lows[-1] = min(lows[-1], dl or rt, rt)
+                    elif base['last_date'] == today_ex:
+                        # ① 캐시 일봉에 이미 오늘 봉 있음 → 실시간가로 교체
+                        closes[-1] = rt
+                        highs[-1] = max(highs[-1], dh or rt, rt)
+                        lows[-1] = min(lows[-1], dl or rt, rt)
+                    elif base['last_date'] < today_ex and new_session:
+                        # ② 캐시가 어제 봉까지인데 오늘 정규장이 시작됨 → 새 봉 추가(어제 종가 보존)
+                        closes.append(rt); highs.append(dh or rt); lows.append(dl or rt)
+                        vols.append(safe_val(getattr(fi, 'last_volume', None)) or 0.0)
+                        n = len(closes)
+                    else:
+                        # ③ 개장 전·주말·휴장: 새 세션이 아니므로 어제 봉을 훼손하지 않고
+                        #    점수 계열을 그대로 둔다(오염 방지). 밸류에이션도 캐시값 유지.
+                        apply_rt = False
+
+                    if apply_rt:
+                        info['currentPrice'] = rt
+                        # 실시간가 기준으로 PER/PBR 재계산 (EPS·BPS는 분기 고정)
+                        eps = safe_val(info.get('trailingEps'))
+                        bps = safe_val(info.get('bookValue'))
+                        if eps and eps > 0:
+                            per = rt / eps
+                        if bps and bps > 0:
+                            pbr = rt / bps
+                        # 실시간 시총으로 시총 파생 밸류에이션 최신화 (PSR·EV/EBITDA)
+                        mcap = safe_val(getattr(fi, 'market_cap', None))
+                        if mcap and mcap > 0:
+                            info['marketCap'] = mcap
+                            rev = safe_val(info.get('totalRevenue'))
+                            if rev and rev > 0:
+                                info['priceToSalesTrailing12Months'] = mcap / rev
+                            ebitda = safe_val(info.get('ebitda'))
+                            if ebitda and ebitda > 0:
+                                ev = mcap + (safe_val(info.get('totalDebt')) or 0) - (safe_val(info.get('totalCash')) or 0)
+                                info['enterpriseToEbitda'] = ev / ebitda
             except Exception as e:
                 log(f'야후 실시간 {ticker} 실패(캐시 일봉값 폴백): {e}', 'WARN')
 
