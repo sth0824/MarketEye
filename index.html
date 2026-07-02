@@ -580,10 +580,41 @@ function clearAll() {
   document.getElementById('empty-state').style.display = '';
 }
 
-// ---- 상태 저장/복원 (Supabase 전용, 로컬 저장 없음) ----
-// 모든 종목/그룹 데이터는 서버(Supabase)에만 저장된다. localStorage에는
-// 로그인 코드(marketeye_sync_code)만 보관해서 재방문 시 자동 로그인에 쓴다.
+// ---- 그룹 목록 로컬 스냅샷 (stale-while-revalidate) ────────────────────
+// 종목(stocks/signals)은 직전 값을 로컬에 캐시해 즉시 표시하지만, 정작 "어떤
+// 그룹에 어떤 종목이 있는지"는 캐시가 없어 매번 서버(Supabase) 응답을 기다려야
+// 했다. 배포 직후(콜드스타트)엔 이 대기가 최대 150초까지 걸릴 수 있고, 그 동안
+// groups가 비어있어 그룹 바·카드가 전혀 그려지지 않아 '무한 로딩'처럼 보였다.
+// → 그룹 목록도 동일하게 로컬에 캐시해두고, 새로고침 시 캐시로 즉시 그려준 뒤
+// 백그라운드에서 서버 최신값으로 갱신한다. 로그인 코드가 다르면(다른 사용자)
+// 캐시를 신뢰하지 않도록 code를 함께 저장해 대조한다.
+const _GROUPS_CACHE_KEY = 'marketeye_groups_cache_v1';
+function persistGroupsCache() {
+  if (!syncCode) return;
+  try {
+    const g = groups.filter(x => x.id !== QUICK_ID); // 빠른 조회는 임시 그룹이라 캐시 제외
+    localStorage.setItem(_GROUPS_CACHE_KEY, JSON.stringify({ code: syncCode, groups: g, activeId, selectedMarket }));
+  } catch (e) { /* 용량 초과·비활성 등은 무시(캐시는 부가기능) */ }
+}
+function hydrateGroupsFromCache() {
+  try {
+    const raw = localStorage.getItem(_GROUPS_CACHE_KEY);
+    if (!raw) return false;
+    const c = JSON.parse(raw);
+    if (!c || c.code !== syncCode || !Array.isArray(c.groups) || !c.groups.length) return false;
+    groups = c.groups;
+    activeId = c.activeId;
+    selectedMarket = c.selectedMarket === 'us' ? 'us' : 'kr';
+    return true;
+  } catch (e) { return false; }
+}
+
+// ---- 상태 저장/복원 (Supabase가 최종 저장소, 로컬은 캐시 용도) ----
+// 로그인 코드(marketeye_sync_code)와 그룹 목록 스냅샷만 로컬에 보관한다.
+// 서버(Supabase)가 항상 최종 진실 소스이며, 로컬 캐시는 새로고침 시 화면을
+// 즉시 채우기 위한 부가 장치일 뿐이다.
 function saveState() {
+  persistGroupsCache(); // 로컬 스냅샷도 즉시 갱신 (다음 새로고침 때 무한 로딩 방지)
   pushSync(); // 로그인 코드가 있으면 서버에 저장 (디바운스)
 }
 function restoreState() {
@@ -644,7 +675,19 @@ function logout() {
 // 서버 → 화면: 서버 데이터를 불러온다. 신규 코드(서버가 비었음)면 기본 그룹을 만들어 올린다.
 async function pullSync(pushIfEmpty) {
   if (!syncCode) return;
-  updateSyncUI('불러오는 중...');
+  // 직전 그룹 스냅샷(같은 로그인 코드)이 있으면 서버 응답을 기다리지 않고 즉시
+  // 화면부터 채운다 — 배포 직후 콜드스타트로 서버가 느려도 화면이 계속 비어
+  // '무한 로딩'처럼 보이는 일을 막는다. 서버 응답이 오면 최신값으로 덮어쓴다.
+  const hadCache = groups.length === 0 && hydrateGroupsFromCache();
+  if (hadCache) {
+    ensureFav();
+    ensureQuick();
+    migrateGroupMarkets();
+    if (!groups.some(g => g.id === activeId)) activeId = (groups.find(g => !isSpecialGroup(g.id)) || groups[0]).id;
+    renderGroupBar();
+    loadActiveGroup();
+  }
+  updateSyncUI(hadCache ? '최신 데이터 동기화 중...' : '불러오는 중...');
   try {
     // Render 콜드 스타트(서버 깨우기, 최대 ~60초) 대응: 이 첫 로드 요청만 타임아웃을
     // 75초로 늘리고, 깨우는 도중 첫 시도가 끊기면 1회 재시도한다. (총 2회 시도)
@@ -654,7 +697,7 @@ async function pullSync(pushIfEmpty) {
         res = await apiFetch(`${API}/sync/${encodeURIComponent(syncCode)}`, {}, 75000);
         break;
       } catch (e) {
-        if (attempt === 0) { updateSyncUI('서버 깨우는 중... (최초 접속은 시간이 걸릴 수 있어요)'); continue; }
+        if (attempt === 0) { updateSyncUI(hadCache ? '최신 데이터 동기화 중... (서버 깨우는 중)' : '서버 깨우는 중... (최초 접속은 시간이 걸릴 수 있어요)'); continue; }
         throw e;
       }
     }
@@ -679,12 +722,18 @@ async function pullSync(pushIfEmpty) {
     // 활성 그룹이 실제 그룹이면 그 시장에 맞춰 선택 시장을 정렬(활성 그룹이 안 보이는 일 방지).
     const _ag = groups.find(g => g.id === activeId);
     if (_ag && !isSpecialGroup(_ag.id)) selectedMarket = groupMarket(_ag);
+    persistGroupsCache(); // 최신 서버 데이터로 로컬 스냅샷 갱신
     renderGroupBar();
     loadActiveGroup();
     updateSyncUI();
   } catch(e) {
-    updateSyncUI('불러오기 실패');
-    showError('불러오기 실패: ' + e.message);
+    if (hadCache) {
+      // 캐시로 이미 화면을 채워둔 상태 — 무한 로딩은 아니므로 조용히 동기화 실패만 알린다.
+      updateSyncUI('동기화 실패 (직전 데이터 표시 중)');
+    } else {
+      updateSyncUI('불러오기 실패');
+      showError('불러오기 실패: ' + e.message);
+    }
   }
 }
 
