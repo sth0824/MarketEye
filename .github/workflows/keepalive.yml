@@ -1,0 +1,52 @@
+name: Keep Render awake
+
+# ─────────────────────────────────────────────────────────────
+# Render 무료 플랜은 15분간 외부 요청이 없으면 서버를 재웁니다(spin-down).
+# 다시 깨어나는 데 30~60초가 걸려, 그 사이 접속하면 브라우저가
+# "사이트에 연결할 수 없음 / 응답 시간 초과"로 실패합니다.
+#
+# 이 워크플로가 5분마다 /api/health 를 찔러 서버를 계속 깨워 둡니다.
+# (public 리포라 GitHub Actions 사용 분은 무료·무제한)
+#
+# 서비스 URL이 바뀌면 코드 수정 없이 리포 Variable 로 덮어쓸 수 있습니다:
+#   Settings → Secrets and variables → Actions → Variables →
+#   New repository variable →  Name: KEEPALIVE_URL
+#   Value: https://<your-service>.onrender.com/api/health
+# ─────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    # 5분마다. GitHub cron은 부하 시 지연될 수 있어(특히 정시 근처)
+    # spin-down 임계(15분)보다 훨씬 짧게 잡아 여유를 둔다.
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}   # 필요 시 수동 실행 버튼
+
+# 실행이 겹쳐 쌓이지 않도록 한 번에 하나만.
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+permissions: {}           # 이 워크플로는 리포에 아무 권한도 필요 없음
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Ping health endpoint
+        env:
+          URL: ${{ vars.KEEPALIVE_URL || 'https://marketeye-y3fb.onrender.com/api/health' }}
+        run: |
+          echo "pinging $URL"
+          # 콜드스타트 부팅에 최대 ~60초가 걸릴 수 있어 넉넉히 대기하고,
+          # 첫 요청이 부팅 대기로 실패해도 재시도해 확실히 깨운다.
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                   --connect-timeout 20 --max-time 120 \
+                   --retry 4 --retry-delay 15 --retry-all-errors \
+                   "$URL" || echo "000")
+          echo "HTTP $code"
+          # 2xx/3xx 면 성공. 그 외(부팅 지연 등)는 실패로 남겨 알림이 뜨게 한다.
+          case "$code" in
+            2*|3*) echo "✅ 서버 응답 정상" ;;
+            *)     echo "⚠️ 서버가 응답하지 않음 (HTTP $code)"; exit 1 ;;
+          esac
