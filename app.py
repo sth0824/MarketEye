@@ -21,7 +21,7 @@ from infra import (
 # 외부 데이터 수집층(KRX·네이버·야후 조회)은 providers.py로 분리.
 from providers import (
     _search_krx, _is_korean, _yahoo_search,
-    _fetch_stock, _calc_per_pbr, _fetch_naver,
+    _fetch_stock, _calc_per_pbr, _fetch_naver, _fetch_naver_world,
 )
 # 순수 신호 엔진은 signals.py로 분리 (동작 동일). app.py는 라우트·조립 담당.
 from signals import (
@@ -133,6 +133,29 @@ def get_price(ticker):
     if cached is not None:
         log(f'price {key} 캐시 히트', 'DEBUG')
         return jsonify({'success': True, 'data': cached})
+    # 해외(미국) 종목: 야후 fast_info도 무료 지연가라 네이버 해외 실시간 피드를 우선 시도.
+    # (국내는 signal 경로에서 네이버 오버레이. price 폴링은 기존 야후 유지) 실패 시 아래
+    # 야후 경로로 폴백 — 조용한 폴백을 감지할 수 있게 source/delayTime을 응답에 실어 둔다.
+    if not key.endswith(('.KS', '.KQ')):
+        try:
+            with timed(f'네이버 해외 price {key}', warn_ms=2000, slow_ms=4000):
+                nv = _fetch_naver_world(key)
+            if nv and nv.get('price'):
+                data = {
+                    'price': nv.get('price'),
+                    'change': nv.get('change'),
+                    'changePercent': nv.get('changePercent'),
+                    'open': nv.get('open'),
+                    'prevClose': nv.get('prevClose'),
+                    'dayLow': nv.get('dayLow'),
+                    'dayHigh': nv.get('dayHigh'),
+                    'volume': nv.get('volume'),
+                    'source': 'naver', 'delayTime': nv.get('delayTime'),
+                }
+                _cache_set(('price', key), data)
+                return jsonify({'success': True, 'data': data})
+        except Exception as e:
+            log(f'네이버 해외 price {key} 실패(야후 폴백): {e}', 'WARN')
     try:
         t = yf.Ticker(key)
         with timed(f'yf.fast_info(price) {key}', warn_ms=1500, slow_ms=3000):
@@ -378,9 +401,61 @@ def signal(ticker):
             except Exception as e:
                 log(f'네이버 실시간 {ticker} 실패(야후값 폴백): {e}', 'WARN')
         else:
-            # 해외 종목: 네이버 같은 폴백 소스가 없으므로 야후 fast_info 실시간가로
-            # 마지막 봉·현재가·시총을 갱신한다(한국주 네이버 오버레이에 대응). sigbase의
-            # 일봉 마지막값은 장중 지연·30분 캐시라 그대로 쓰면 신호가 실시간이 아니었다.
+            # 해외(미국) 종목: 우선 네이버 해외 실시간으로 오버레이한다(야후 무료 지연 해소).
+            # 네이버는 tradeDate가 실제 마지막 세션이라, 국내 오버레이와 동일하게
+            # tradeDate==last_date면 오늘 봉 교체·아니면 새 봉 추가로 개장 전 오염을 피한다.
+            # 네이버가 값을 못 주면(미상 종목·실패·미검증 스키마) 아래 야후 경로로 폴백한다.
+            nv_applied = False
+            try:
+                with timed(f'네이버 해외 실시간 {ticker}', warn_ms=2000, slow_ms=4000):
+                    nv = _fetch_naver_world(ticker, info)
+                rt = nv.get('price') if nv else None
+                if rt:
+                    dh, dl, vol = nv.get('dayHigh'), nv.get('dayLow'), nv.get('volume')
+                    if nv.get('tradeDate') == base['last_date']:
+                        closes[-1] = rt
+                        highs[-1] = max(highs[-1], dh or rt, rt)
+                        lows[-1] = min(lows[-1], dl or rt, rt)
+                        if vol:
+                            vols[-1] = vol
+                    else:
+                        closes.append(rt); highs.append(dh or rt)
+                        lows.append(dl or rt); vols.append(vol or 0.0)
+                    n = len(closes)
+                    info['currentPrice'] = rt
+                    # PER/PBR: 네이버 제공값 우선, 없으면 실시간가로 재계산 (EPS·BPS 분기 고정)
+                    if nv.get('per') is not None:
+                        per = nv.get('per')
+                    else:
+                        eps = safe_val(info.get('trailingEps'))
+                        if eps and eps > 0:
+                            per = rt / eps
+                    if nv.get('pbr') is not None:
+                        pbr = nv.get('pbr')
+                    else:
+                        bps = safe_val(info.get('bookValue'))
+                        if bps and bps > 0:
+                            pbr = rt / bps
+                    # 네이버 실시간 시총으로 시총 파생 밸류에이션 최신화 (PSR·EV/EBITDA)
+                    nv_mcap, nv_fpe = nv.get('marketCap'), nv.get('forwardPer')
+                    if nv_mcap is not None:
+                        info['marketCap'] = nv_mcap
+                        rev = safe_val(info.get('totalRevenue'))
+                        if rev and rev > 0:
+                            info['priceToSalesTrailing12Months'] = nv_mcap / rev
+                        ebitda = safe_val(info.get('ebitda'))
+                        if ebitda and ebitda > 0:
+                            ev = nv_mcap + (safe_val(info.get('totalDebt')) or 0) - (safe_val(info.get('totalCash')) or 0)
+                            info['enterpriseToEbitda'] = ev / ebitda
+                    if nv_fpe is not None:
+                        info['forwardPE'] = nv_fpe
+                    nv_applied = True
+            except Exception as e:
+                log(f'네이버 해외 실시간 {ticker} 실패(야후 폴백): {e}', 'WARN')
+
+        if (not ticker.upper().endswith(('.KS', '.KQ'))) and not nv_applied:
+            # 야후 fast_info 폴백: 네이버 해외가 값을 못 준 경우에만 실행(기존 로직 유지).
+            # sigbase 일봉 마지막값은 장중 지연·30분 캐시라 그대로 쓰면 신호가 실시간이 아니다.
             #
             # ⚠️ 정합성: 캐시 일봉의 마지막 봉이 '이전 거래일'인 상태(개장 직전/직후 +
             # 캐시가 아직 어제 것)에서 무조건 closes[-1]=rt로 덮으면 어제 종가가 오늘가로

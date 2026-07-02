@@ -244,6 +244,133 @@ def _fetch_naver(code):
     return out
 
 
+# ── 네이버 증권 해외(미국) 실시간 시세 ────────────────────────────────
+# 야후 미국 시세도 무료 지연가라 실시간 증권사와 차이가 난다. 네이버 해외 개별종목
+# 피드(로이터코드 기반)로 마지막 봉·현재가·밸류에이션을 오버레이한다(국내 패턴과 동일).
+# 네이버 해외 심볼 = SYMBOL.거래소접미사(로이터코드): 나스닥 .O, 뉴욕 .N, AMEX .A, ARCA .P.
+#
+# ⚠️ 이 경로는 네트워크 정책상 개발 샌드박스에서 검증 불가(네이버 403 차단)했다. 스키마·
+#    접미사 매핑은 배포 환경 실측으로 확정해야 하며, 어떤 실패(스키마 불일치·미상 종목·
+#    네트워크)에서도 예외를 던져 호출부가 야후로 폴백하도록 한다(회귀 없음). 응답에
+#    delayTime을 실어 실제로 실시간 피드가 붙었는지 확인 가능하게 한다(조용한 폴백 방지).
+_YF_EXCH_TO_SUFFIX = {
+    'NMS': 'O', 'NGM': 'O', 'NCM': 'O', 'NAS': 'O', 'NASDAQ': 'O', 'NASDAQGS': 'O',
+    'NYQ': 'N', 'NYSE': 'N',
+    'ASE': 'A', 'AMEX': 'A', 'NYSEAMERICAN': 'A',
+    'PCX': 'P', 'ARCA': 'P', 'NYSEARCA': 'P',
+    'BTS': 'O', 'BATS': 'O',
+}
+# 거래소 미상일 때 순차 시도할 접미사(미국 대부분 .O/.N). 시도 결과는 길게 캐시.
+_NAVER_WORLD_SUFFIXES = ('O', 'N', 'P', 'A')
+# 해석된 로이터코드(및 부재)의 캐시 TTL. 매 폴링마다 4개 접미사 프로빙하지 않도록 길게 잡음.
+NAVER_SYM_TTL = int(os.environ.get('NAVER_SYM_TTL', '86400'))
+
+
+def _naver_world_suffix(info):
+    """yfinance info의 거래소 코드를 네이버 로이터 접미사로 매핑 (모르면 None)."""
+    ex = str((info or {}).get('exchange') or '').upper().replace(' ', '')
+    return _YF_EXCH_TO_SUFFIX.get(ex)
+
+
+def _naver_world_get(reuters_code, kind, timeout=4):
+    """네이버 해외 종목 엔드포인트 JSON 조회 (basic=실시간 시세, integration=펀더멘털)."""
+    return requests.get(f'https://api.stock.naver.com/stock/{reuters_code}/{kind}',
+                        headers=_NAVER_HEADERS, timeout=timeout).json()
+
+
+def _resolve_naver_world_symbol(ticker, info=None):
+    """미국 티커 → 네이버 로이터코드(예: 'AAPL' → 'AAPL.O'). 실패 시 '' 캐시로 재시도 억제.
+    info의 거래소로 접미사를 먼저 특정하고(있으면 1회 조회), 미상이면 후보를 순차 프로빙한다.
+    반환값을 NAVER_SYM_TTL초 캐시 — 부재('')도 캐시해 매 폴링 4연속 조회를 막는다."""
+    key = ('nvw_sym', ticker.upper())
+    cached = _cache_get(key, NAVER_SYM_TTL)
+    if cached is not None:
+        return cached or None
+    base = ticker.upper().split('.')[0]
+    candidates = []
+    suf = _naver_world_suffix(info)
+    if suf:
+        candidates.append(suf)
+    for s in _NAVER_WORLD_SUFFIXES:
+        if s not in candidates:
+            candidates.append(s)
+    for s in candidates:
+        rc = f'{base}.{s}'
+        try:
+            b = _naver_world_get(rc, 'basic')
+            if b and b.get('closePrice') is not None:
+                _cache_set(key, rc)
+                log(f'네이버 해외 심볼 해석 {ticker} → {rc}', 'DEBUG')
+                return rc
+        except Exception:
+            continue
+    _cache_set(key, '')   # 네이버에 없는 종목 → 재시도 억제(야후 전용)
+    log(f'네이버 해외 심볼 해석 실패 {ticker} (야후 폴백)', 'DEBUG')
+    return None
+
+
+def _fetch_naver_world(ticker, info=None):
+    """네이버 해외(미국) 실시간 시세·펀더멘털을 국내 _fetch_naver와 같은 dict 형태로 반환.
+    조회 불가/실패 시 None 반환(예외 아님) → 호출부는 기존 야후 경로를 그대로 탄다.
+    price가 USD인 점 외 구조는 국내와 동일. delayTime을 함께 실어 실시간 여부를 노출한다."""
+    rc = _resolve_naver_world_symbol(ticker, info)
+    if not rc:
+        return None
+    cached = _cache_get(('nvw', rc), NAVER_TTL)
+    if cached is not None:
+        return cached
+
+    out = {'reutersCode': rc}
+    parent = _tag()
+
+    def _get(kind):
+        set_tag(parent)
+        with timed(f'네이버 해외 {kind} {rc}', warn_ms=1500, slow_ms=3000):
+            return _naver_world_get(rc, kind)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f_basic = ex.submit(_get, 'basic')
+        f_integ = ex.submit(_get, 'integration')
+        b = f_basic.result()
+        i = f_integ.result()
+
+    # 1) 실시간 시세 (현재가·등락) — basic 엔드포인트 (국내와 동일 필드명)
+    price = _naver_num(b.get('closePrice'))
+    chg = _naver_num(b.get('compareToPreviousClosePrice'))
+    pct = _naver_num(b.get('fluctuationsRatio'))
+    out['tradeDate'] = ((b.get('localTradedAt') or '')[:10]) or None  # 'YYYY-MM-DD'
+    out['delayTime'] = b.get('delayTime')          # 0이면 실시간, >0이면 지연(분)
+    out['marketStatus'] = b.get('marketStatus')
+    dir_code = str((b.get('compareToPreviousPrice') or {}).get('code') or '')
+    if price is not None and chg is not None and pct is not None:
+        sign = -1 if dir_code in ('4', '5') else (0 if dir_code == '3' else 1)
+        out['price'] = price
+        out['change'] = sign * chg
+        out['changePercent'] = sign * pct
+        out['prevClose'] = price - sign * chg
+
+    # 2) 펀더멘털 + 당일 OHLC·52주 — integration 엔드포인트 (없는 코드는 None-세이프)
+    ti = {x.get('code'): x.get('value') for x in (i.get('totalInfos') or [])}
+    out['open'] = _naver_num(ti.get('openPrice'))
+    out['dayHigh'] = _naver_num(ti.get('highPrice'))
+    out['dayLow'] = _naver_num(ti.get('lowPrice'))
+    out['volume'] = _naver_num(ti.get('accumulatedTradingVolume'))
+    out['high52'] = _naver_num(ti.get('highPriceOf52Weeks'))
+    out['low52'] = _naver_num(ti.get('lowPriceOf52Weeks'))
+    out['per'] = _naver_num(ti.get('per'))
+    out['forwardPer'] = _naver_num(ti.get('cnsPer'))
+    out['eps'] = _naver_num(ti.get('eps'))
+    out['forwardEps'] = _naver_num(ti.get('cnsEps'))
+    out['pbr'] = _naver_num(ti.get('pbr'))
+    out['bookValue'] = _naver_num(ti.get('bps'))
+    dy = _naver_num(ti.get('dividendYieldRatio'))
+    out['dividendYield'] = dy / 100 if dy is not None else None
+    out['dividendRate'] = _naver_num(ti.get('dividend'))
+    out['marketCap'] = _naver_won(ti.get('marketValue'))   # 조/억/만 단위 파싱(통화 무관)
+    _cache_set(('nvw', rc), out)
+    return out
+
+
 def _yahoo_search(query):
     url = 'https://query1.finance.yahoo.com/v1/finance/search'
     params = {'q': query, 'lang': 'en-US', 'region': 'US',
