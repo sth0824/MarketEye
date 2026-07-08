@@ -108,6 +108,54 @@ def _search_krx(query, limit=10):
             contains.append(s)
     return (exact + starts + contains)[:limit]
 
+# ── 인기 지수/ETF 별칭 검색 ──────────────────────────────────
+# 야후는 순수 한글 ETF명('나스닥','미국배당')을 거의 못 찾고, KRX 번들에는 ETF가
+# 없다. 그래서 대표 지수 ETF는 한국어 별칭으로도 바로 노출되도록 정적 테이블로 둔다.
+# (정적 인메모리 — 야후 호출·콜드스타트 부담 없음. 실제 데이터는 클릭 후 기존 경로로 조회)
+# 형식: (티커, 표시이름, 거래소, [검색 별칭들])
+POPULAR_ETFS = [
+    # 미국 상장 (지수/섹터/자산)
+    ('QQQ',  'Invesco QQQ Trust (나스닥100)',    'NASDAQ', ['나스닥', '나스닥100', 'nasdaq', 'nasdaq100', 'qqq']),
+    ('QQQM', 'Invesco 나스닥100 ETF (저비용)',    'NASDAQ', ['나스닥', '나스닥100', 'qqqm']),
+    ('SPY',  'SPDR S&P 500 ETF',                 'NYSE',   ['sp500', 's&p500', 'snp500', '에스앤피', '에스앤피500', '스파이', 'spy']),
+    ('VOO',  'Vanguard S&P 500 ETF',             'NYSE',   ['sp500', 's&p500', 'snp500', '에스앤피', '에스앤피500', 'voo']),
+    ('IVV',  'iShares Core S&P 500 ETF',         'NYSE',   ['sp500', 's&p500', 'snp500', '에스앤피', 'ivv']),
+    ('DIA',  'SPDR 다우존스 산업평균 ETF',        'NYSE',   ['다우', '다우존스', 'dow', 'dowjones', 'dia']),
+    ('IWM',  'iShares 러셀2000 ETF',              'NYSE',   ['러셀', '러셀2000', 'russell', 'russell2000', 'iwm']),
+    ('VTI',  'Vanguard 미국 전체시장 ETF',        'NYSE',   ['미국전체', '토탈마켓', 'totalmarket', 'vti']),
+    ('SCHD', 'Schwab 미국배당 ETF',               'NYSE',   ['미국배당', '배당', 'dividend', 'schd']),
+    ('SOXX', 'iShares 반도체 ETF',                'NASDAQ', ['반도체', 'semiconductor', 'soxx']),
+    ('SMH',  'VanEck 반도체 ETF',                 'NASDAQ', ['반도체', 'semiconductor', 'smh']),
+    ('GLD',  'SPDR 금 ETF',                       'NYSE',   ['금', '골드', 'gold', 'gld']),
+    ('TLT',  'iShares 미국채 20년+ ETF',          'NASDAQ', ['미국채', '장기국채', '국채', 'treasury', 'tlt']),
+    ('VWO',  'Vanguard 신흥국 ETF',               'NYSE',   ['신흥국', '이머징', 'emerging', 'vwo']),
+    # 한국 상장
+    ('069500.KS', 'KODEX 200',            'KOSPI', ['코스피200', '코덱스200', 'kodex200', '코스피']),
+    ('133690.KS', 'TIGER 미국나스닥100',  'KOSPI', ['타이거나스닥', '미국나스닥', 'tiger나스닥', 'tigernasdaq']),
+    ('360750.KS', 'TIGER 미국S&P500',     'KOSPI', ['타이거sp500', '미국sp500', '미국에스앤피', 'tigersp500']),
+]
+
+def _search_etf_aliases(query, limit=5):
+    """인기 지수/ETF 별칭 매칭. 한국어/영문 별칭·티커·표시이름으로 검색."""
+    q = _normalize(query)
+    if not q:
+        return []
+    out = []
+    for ticker, name, exch, aliases in POPULAR_ETFS:
+        norm_aliases = [_normalize(a) for a in aliases]
+        matched = (
+            q == ticker.lower()
+            or any(q == a for a in norm_aliases)
+            or (len(q) >= 2 and (
+                any(a.startswith(q) or q in a for a in norm_aliases)
+                or q in _normalize(name)))
+        )
+        if matched:
+            out.append({'ticker': ticker, 'name': name, 'exchange': exch})
+        if len(out) >= limit:
+            break
+    return out
+
 def _krx_name(ticker):
     """티커에 해당하는 KRX 한글 종목명을 반환 (없으면 None)."""
     tl = (ticker or '').lower()

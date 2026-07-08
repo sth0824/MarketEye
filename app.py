@@ -20,7 +20,7 @@ from infra import (
 )
 # 외부 데이터 수집층(KRX·네이버·야후 조회)은 providers.py로 분리.
 from providers import (
-    _search_krx, _is_korean, _yahoo_search,
+    _search_krx, _is_korean, _yahoo_search, _search_etf_aliases,
     _fetch_stock, _calc_per_pbr, _fetch_naver,
 )
 # 순수 신호 엔진은 signals.py로 분리 (동작 동일). app.py는 라우트·조립 담당.
@@ -72,12 +72,16 @@ def search_ticker():
                 seen.add(ticker)
                 results.append({'ticker': ticker, 'name': name, 'exchange': exchange, 'type': typ})
 
-        # 1차: KRX 로컬 검색 (한국어/종목코드 모두 커버)
+        # 1차: 인기 지수/ETF 별칭 (한국어 '나스닥'·'미국배당' 등으로도 대표 ETF 노출)
+        for e in _search_etf_aliases(query, limit=5):
+            add(e['ticker'], e['name'], e['exchange'], 'ETF')
+
+        # 2차: KRX 로컬 검색 (한국어/종목코드 모두 커버)
         for s in _search_krx(query, limit=8):
             add(s['ticker'], s['name'], s['market'])
-        log(f'검색 "{query}" → KRX 로컬 {len(results)}건', 'DEBUG')
+        log(f'검색 "{query}" → 별칭+KRX 로컬 {len(results)}건', 'DEBUG')
 
-        # 2차: 한국어가 아니면 야후 글로벌 검색으로 해외 종목 추가
+        # 3차: 한국어가 아니면 야후 글로벌 검색으로 해외 종목 추가
         if not _is_korean(query) and len(results) < 10:
             for q in _yahoo_search(query):
                 qtype = q.get('quoteType', '')
