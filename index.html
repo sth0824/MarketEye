@@ -906,10 +906,14 @@ function signalBadgeHtml(ticker) {
   const compBadge = c
     ? `<div class="signal-badge ${scoreLabel(c.score).cls}" style="margin-top:0;font-weight:700">🎯 종합 ${c.score} ${c.verdict_emoji}</div>`
     : '';
+  // ETF(지수·자산)는 개별 재무가 없어 '가치' 대신 ETF 칩을 표시(오해 방지)
+  const fundOrEtfBadge = sig.is_etf
+    ? `<div class="signal-badge" style="margin-top:0;background:transparent;border:1px solid var(--muted);color:var(--muted)">🧺 ETF</div>`
+    : `<div class="signal-badge ${f.cls}" style="margin-top:0">💰 가치 ${sig.fund_score} ${f.emoji}</div>`;
   return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
     ${compBadge}
     <div class="signal-badge ${t.cls}" style="margin-top:0">📈 차트 ${sig.tech_score} ${t.emoji}</div>
-    <div class="signal-badge ${f.cls}" style="margin-top:0">💰 가치 ${sig.fund_score} ${f.emoji}</div>
+    ${fundOrEtfBadge}
   </div>`;
 }
 
@@ -1106,6 +1110,35 @@ function renderSignalCard(ticker) {
        </ul>`
     : '';
 
+  // ETF 개요 블록 — 지수·자산 ETF는 개별 재무 대신 운용보수·AUM·분배율·기간수익률·
+  // 낙폭·이격도가 핵심 판단 재료다. (백엔드 sig.etf, 값은 모두 '퍼센트 숫자'로 정규화됨)
+  const etf = sig.etf;
+  const etfBlock = (sig.is_etf && etf) ? (() => {
+    const cur2 = (stocks[ticker] && stocks[ticker].currency) || 'USD';
+    const row = (k, v) => (v == null || v === '') ? '' : indItem(k, v);
+    const signed = (v, d = 1) => v == null ? null
+      : `<span style="color:${v >= 0 ? 'var(--green)' : 'var(--red)'}">${v > 0 ? '+' : ''}${v.toFixed(d)}%</span>`;
+    const items =
+      row('운용보수', etf.expenseRatio != null ? etf.expenseRatio.toFixed(2) + '%' : null) +
+      row('순자산 (AUM)', etf.aum != null ? '$' + bigNum(etf.aum) : null) +
+      row('분배율', etf.yield != null ? etf.yield.toFixed(2) + '%' : null) +
+      row('카테고리', etf.category ? esc(etf.category) : null) +
+      row('운용사', etf.fundFamily ? esc(etf.fundFamily) : null) +
+      row('베타', etf.beta != null ? etf.beta.toFixed(2) : null) +
+      row('YTD 수익률', signed(etf.ytdReturn)) +
+      row('3년 연평균', signed(etf.threeYearReturn)) +
+      row('5년 연평균', signed(etf.fiveYearReturn)) +
+      row('52주 고점 대비', signed(etf.drawdownFromHigh)) +
+      row('200일선 이격도', signed(etf.ma200Gap));
+    return `<div class="signal-block">
+      <div class="signal-block-head">
+        <span class="signal-block-title">🧺 ETF 개요 <span style="color:var(--muted);font-weight:400;font-size:10px">지수·자산 ETF 핵심 지표</span></span>
+      </div>
+      <div class="signal-indicators">${items}</div>
+      <div style="margin-top:8px;font-size:11px;color:var(--muted);line-height:1.6">💡 광범위 분산 지수 ETF는 개별 재무(PER·ROE)보다 <b>운용보수·추세·낙폭</b>이 핵심입니다. 장기 우상향 지수는 타이밍보다 <b>적립식(DCA)</b>이 정석이에요.</div>
+    </div>`;
+  })() : '';
+
   const lbF = scoreLabel(sig.fund_score);
   const fundBlock = `<div class="signal-block">
     <div class="signal-block-head">
@@ -1126,7 +1159,7 @@ function renderSignalCard(ticker) {
     const col = scoreColor(comp.score);
     return `<div class="signal-block" style="border:1px solid ${col};background:linear-gradient(135deg,var(--surface2),transparent)">
       <div class="signal-block-head">
-        <span class="signal-block-title">🎯 종합 진입 점수 <span style="color:var(--muted);font-weight:400;font-size:10px">차트·가치 합성</span></span>
+        <span class="signal-block-title">🎯 종합 진입 점수 <span style="color:var(--muted);font-weight:400;font-size:10px">${sig.is_etf ? '차트·추세 기반' : '차트·가치 합성'}</span></span>
         <span class="signal-block-score">
           <span class="signal-badge" style="margin-top:0;background:${col};color:#0b0e14;font-weight:700">${comp.verdict_emoji} ${comp.verdict_label}</span>
           <b style="color:${col};font-size:26px;margin-left:8px">${comp.score}</b><span style="color:var(--muted);font-size:11px">/100</span>
@@ -1134,8 +1167,9 @@ function renderSignalCard(ticker) {
       </div>
       <div style="display:flex;gap:10px;align-items:center;margin-top:8px;font-size:12px;color:var(--muted);flex-wrap:wrap">
         <span>📈 차트 <b style="color:${scoreColor(sig.tech_score)}">${sig.tech_score}</b></span>
-        <span style="opacity:.5">×</span>
-        <span>💰 가치 <b style="color:${scoreColor(sig.fund_score)}">${sig.fund_score}</b></span>
+        ${sig.is_etf
+          ? `<span style="opacity:.7">🧺 지수 ETF — 가치 점수 미적용</span>`
+          : `<span style="opacity:.5">×</span><span>💰 가치 <b style="color:${scoreColor(sig.fund_score)}">${sig.fund_score}</b></span>`}
         ${comp.confidence_label ? `<span style="margin-left:auto">신뢰도 <b>${comp.confidence_label}</b></span>` : ''}
       </div>
       <div style="margin-top:8px;font-size:12px;color:var(--text);line-height:1.6">💡 ${esc(comp.why)}</div>
@@ -1159,7 +1193,7 @@ function renderSignalCard(ticker) {
       <button class="secondary" style="font-size:12px;padding:6px 12px;width:100%" onclick="runBacktest('${ticker}')">📊 이 전략 5년 백테스트</button>
       <div id="bt-${ticker}" style="margin-top:8px"></div>
     </div>
-    ${fundBlock}
+    ${sig.is_etf ? etfBlock : fundBlock}
   </div>`;
 }
 

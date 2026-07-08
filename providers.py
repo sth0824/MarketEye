@@ -525,9 +525,55 @@ def _fetch_stock_yahoo(ticker):
             'floatShares': safe_val(info.get('floatShares')),
             'shortRatio': safe_val(info.get('shortRatio')),
 
+            # ETF/펀드 전용 (지수 ETF는 개별 재무 대신 이 지표들이 핵심)
+            'isEtf': _is_etf_type(info),
+            'etf': _etf_overview(info) if _is_etf_type(info) else None,
+
             'history': history,
     }
     return data
+
+
+def _is_etf_type(info):
+    """야후 quoteType으로 ETF·펀드류 여부 판정."""
+    return (info.get('quoteType') or '').upper() in ('ETF', 'MUTUALFUND', 'FUND')
+
+
+def _etf_overview(info):
+    """ETF/펀드 전용 개요 지표를 야후 info에서 추출(None 제외).
+    지수·자산 ETF는 개별 재무(ROE·매출·부채)가 없어 운용보수·순자산·분배율·기간수익률·
+    베타·이동평균이 핵심 판단 재료다. 단위는 프론트가 그대로 '%'만 붙이면 되도록
+    모두 '퍼센트 숫자'로 정규화한다(야후는 필드마다 비율/퍼센트가 뒤섞여 있음).
+      - netExpenseRatio: 이미 % (0.18 = 0.18%)          → 그대로
+      - annualReportExpenseRatio: 비율(0.0018)           → ×100
+      - yield: 비율(0.0041 = 0.41%)                       → ×100
+      - ytdReturn: 이미 % (20.18 = 20.18%)               → 그대로
+      - three/fiveYearAverageReturn: 비율(0.25 = 25%)    → ×100
+    """
+    g = lambda k: safe_val(info.get(k))
+    exp = g('netExpenseRatio')
+    if exp is None:
+        ar = g('annualReportExpenseRatio')
+        exp = ar * 100 if ar is not None else None
+    yld = g('yield')
+    r3 = g('threeYearAverageReturn')
+    r5 = g('fiveYearAverageReturn')
+    rnd = lambda v, n=2: round(v, n) if v is not None else None
+    out = {
+        'category': info.get('category') or None,
+        'fundFamily': info.get('fundFamily') or None,
+        'aum': g('totalAssets'),
+        'expenseRatio': rnd(exp),                                   # % (0.18)
+        'yield': rnd(yld * 100) if yld is not None else None,       # % (0.41)
+        'ytdReturn': rnd(g('ytdReturn')),                           # % (20.18)
+        'threeYearReturn': rnd(r3 * 100) if r3 is not None else None,   # % (25.37)
+        'fiveYearReturn': rnd(r5 * 100) if r5 is not None else None,    # % (15.16)
+        'beta': rnd(g('beta3Year') if g('beta3Year') is not None else g('beta')),
+        'ma50': rnd(g('fiftyDayAverage')),
+        'ma200': rnd(g('twoHundredDayAverage')),
+        'navPrice': rnd(g('navPrice')),
+    }
+    return {k: v for k, v in out.items() if v is not None}
 
 
 def _card_fundamentals(info):

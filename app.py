@@ -21,7 +21,7 @@ from infra import (
 # 외부 데이터 수집층(KRX·네이버·야후 조회)은 providers.py로 분리.
 from providers import (
     _search_krx, _is_korean, _yahoo_search, _search_etf_aliases,
-    _fetch_stock, _calc_per_pbr, _fetch_naver,
+    _fetch_stock, _calc_per_pbr, _fetch_naver, _is_etf_type, _etf_overview,
 )
 # 순수 신호 엔진은 signals.py로 분리 (동작 동일). app.py는 라우트·조립 담당.
 from signals import (
@@ -29,6 +29,7 @@ from signals import (
     _technical_signal,
     _fundamental_signal,
     _composite_signal,
+    _etf_composite,
 )
 
 app = Flask(__name__)
@@ -490,9 +491,26 @@ def signal(ticker):
         # 가치 점수 신뢰도: 5대 축 중 데이터가 있는 축의 가중 비율 (0~1)
         _pw = {'valuation': 0.28, 'profitability': 0.24, 'growth': 0.20, 'health': 0.16, 'cashflow': 0.12}
         fund_conf = sum(_pw[k] for k, v in fs['pillars'].items() if v is not None)
-        # 전문가식 종합 점수 (차트·가치를 관계·신뢰도·유동성까지 고려해 합성)
-        comp = _composite_signal(tech_score, fund_score, ts['regime'], ts['plan'].get('rr'),
-                                 fund_conf, liq_factor)
+        # ETF(지수·자산)면 개별 재무가 없어 '가치' 축이 성립하지 않는다. 종합을 차트·추세
+        # 중심으로 재구성(가치점수 중립 50으로 인한 오해 방지)하고, ETF 전용 개요를 덧붙인다.
+        is_etf = _is_etf_type(info)
+        etf = None
+        if is_etf:
+            etf = _etf_overview(info)
+            price_now = closes[-1] if closes else None
+            hi52 = safe_val(info.get('fiftyTwoWeekHigh'))
+            ma200v = etf.get('ma200')
+            if price_now:
+                etf['price'] = price_now
+                if hi52 and hi52 > 0:
+                    etf['drawdownFromHigh'] = round((price_now / hi52 - 1) * 100, 1)  # 고점 대비(음수%)
+                if ma200v and ma200v > 0:
+                    etf['ma200Gap'] = round((price_now / ma200v - 1) * 100, 1)        # 200일선 이격도%
+            comp = _etf_composite(tech_score, ts['regime'])
+        else:
+            # 전문가식 종합 점수 (차트·가치를 관계·신뢰도·유동성까지 고려해 합성)
+            comp = _composite_signal(tech_score, fund_score, ts['regime'], ts['plan'].get('rr'),
+                                     fund_conf, liq_factor)
         combined = comp['score']
 
         def lab(s):
@@ -516,6 +534,8 @@ def signal(ticker):
             'plan': ts['plan'],
             'buy_zone': ts.get('buy_zone'),   # 다수 기법 합의 추천 매수 구간(신규)
             'fundamentals': fs,
+            'is_etf': is_etf,                 # 지수·자산 ETF 여부 (프론트: 가치 블록 대신 ETF 개요)
+            'etf': etf,                       # ETF 전용 개요(운용보수·AUM·분배율·수익률·이격도 등)
         }
         _cache_set(('signal', ticker), data)
         return jsonify({'success': True, 'data': data})

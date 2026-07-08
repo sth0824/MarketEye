@@ -1024,3 +1024,32 @@ def _composite_signal(tech_score, fund_score, regime, rr, fund_conf=1.0, liq_fac
             'confidence': round(conf, 2), 'confidence_label': conf_label}
 
 
+def _etf_composite(tech_score, regime):
+    """지수·자산 ETF 전용 종합 판정. 광범위 분산 ETF는 개별기업 재무(가치 점수)가
+    성립하지 않으므로, 가치점수(데이터 없음 → 중립 50)와 기하평균해 종합을 끌어내리면
+    오해를 준다. 그래서 ETF는 차트·추세 점수만으로 종합을 구성한다(가치 축 배제).
+    _composite_signal과 동일한 반환 스키마를 유지해 프론트가 그대로 렌더한다."""
+    score = int(max(0, min(100, round(tech_score))))
+    if regime == 'strong_down':
+        score = min(score, 40)   # 안전 레일 유지 (떨어지는 칼날)
+    if score >= 72:
+        verdict, vlabel, vemoji = 'strong_buy', '추세 양호', '🟢'
+    elif score >= 60:
+        verdict, vlabel, vemoji = 'buy', '상승 추세', '🟢'
+    elif score >= 48:
+        verdict, vlabel, vemoji = 'watch', '중립·관망', '🟡'
+    else:
+        verdict, vlabel, vemoji = 'avoid', '약세·보류', '🔴'
+    why = {
+        'strong_up':   '강한 상승추세 — 지수 ETF는 추세 순응·적립식이 유리',
+        'up':          '상승추세 — 눌림목 분할·적립 접근',
+        'range':       '횡보 국면 — 분할·적립으로 평단 관리',
+        'down':        '하락추세 — 반등 확인 후 접근',
+        'strong_down': '강한 하락추세 — 낙폭 확대 주의(장기 적립이면 지속 가능)',
+    }.get(regime, '추세 기준 평가')
+    why += ' · 지수 ETF는 개별 재무(가치)가 없어 차트·추세 중심으로 평가'
+    return {'score': score, 'verdict': verdict, 'verdict_label': vlabel,
+            'verdict_emoji': vemoji, 'why': why,
+            'confidence': None, 'confidence_label': None, 'is_etf': True}
+
+
