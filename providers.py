@@ -13,6 +13,7 @@ import unicodedata
 import threading
 import concurrent.futures
 import requests
+import pandas as pd
 import yfinance as yf
 
 from infra import log, timed, set_tag, _tag, _cache_get, _cache_set, _cache_get_stale, yf_call, is_rate_limited
@@ -290,6 +291,58 @@ def _fetch_naver(code):
     out['marketCap'] = _naver_won(ti.get('marketValue'))
     _cache_set(('naver', code), out)
     return out
+
+
+# ── 네이버 일봉 (야후 일봉 폴백) ─────────────────────────────────────
+# 야후가 Render IP를 레이트리밋/차단하면 한국 종목 신호·백테스트가 일봉을 못 받아
+# 통째로 실패했다. 네이버 차트 데이터(fchart)로 같은 모양의 DataFrame을 만들어
+# 야후 history 자리에 그대로 끼운다. 응답은 XML 한 줄당 한 봉:
+#   <item data="20240102|78200|79800|78000|79600|17142847" />  (날짜|시|고|저|종|거래량)
+NAVER_DAILY_TTL = int(os.environ.get('NAVER_DAILY_TTL', '600'))
+_NAVER_BAR_RE = re.compile(r'data="(\d{8})\|([\d.]+)\|([\d.]+)\|([\d.]+)\|([\d.]+)\|(\d+)"')
+
+
+def _parse_naver_daily(text):
+    """fchart XML → Close/High/Low/Volume DataFrame(DatetimeIndex, 오름차순). 봉이 없으면 ValueError."""
+    dates, rows = [], []
+    for d, _o, h, l, c, v in _NAVER_BAR_RE.findall(text):
+        c = float(c)
+        if c <= 0:
+            continue
+        # 거래정지일 등은 고·저가가 0으로 올 수 있어 종가로 메운다(지표 계산 오염 방지).
+        h = float(h) or c
+        l = float(l) or c
+        dates.append(pd.Timestamp(d))
+        rows.append((c, max(h, c), min(l, c), float(v)))
+    if not rows:
+        raise ValueError('네이버 일봉 응답에 봉 데이터 없음')
+    df = pd.DataFrame(rows, columns=['Close', 'High', 'Low', 'Volume'], index=pd.DatetimeIndex(dates))
+    return df.sort_index()
+
+
+def _fetch_naver_daily(code, count=520):
+    """네이버 일봉 최근 count개 (야후 history와 같은 컬럼). NAVER_DAILY_TTL 캐시."""
+    key = ('naver_daily', code, count)
+    cached = _cache_get(key, NAVER_DAILY_TTL)
+    if cached is not None:
+        return cached
+    with timed(f'네이버 일봉({count}) {code}', warn_ms=2000, slow_ms=4000):
+        res = requests.get('https://fchart.stock.naver.com/sise.nhn',
+                           params={'symbol': code, 'timeframe': 'day',
+                                   'count': count, 'requestType': 0},
+                           headers=_NAVER_HEADERS, timeout=8)
+    res.raise_for_status()
+    df = _parse_naver_daily(res.text)
+    _cache_set(key, df)
+    return df
+
+
+def _monthly_history(df):
+    """일봉 DataFrame → 카드 미니차트용 월별 종가 [{'date': 'YYYY-MM', 'close': x}] (월 마지막 봉)."""
+    months = {}
+    for dt, c in zip(df.index, df['Close']):
+        months[dt.strftime('%Y-%m')] = round(float(c), 2)
+    return [{'date': m, 'close': c} for m, c in months.items()]
 
 
 def _yahoo_search(query):
@@ -644,6 +697,12 @@ def _fetch_stock(ticker):
             for k, v in nv.items():
                 if v is not None:
                     data[k] = v
+            if not data.get('history'):
+                # 야후 실패로 미니차트가 비면 네이버 일봉 1년치로 월별 종가를 채운다.
+                try:
+                    data['history'] = _monthly_history(_fetch_naver_daily(tk.split('.')[0], 260))
+                except Exception as he:
+                    log(f'네이버 일봉 {tk} 실패(미니차트 생략): {he}', 'WARN')
         except Exception as e:
             log(f'네이버 보강 {tk} 실패(야후값 폴백): {e}', 'WARN')
             # 야후도 실패해 골격뿐인데 네이버까지 실패하면 가격이 전혀 없다 → 예외 전파

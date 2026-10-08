@@ -4,6 +4,7 @@ import yfinance as yf
 import requests
 import traceback
 import os
+import re
 import time
 from datetime import datetime, time as dtime
 try:
@@ -20,7 +21,7 @@ from infra import (
 # 외부 데이터 수집층(KRX·네이버·야후 조회)은 providers.py로 분리.
 from providers import (
     _search_krx, _is_korean, _yahoo_search, _search_etf_aliases,
-    _fetch_stock, _calc_per_pbr, _fetch_naver, _is_etf_type, _etf_overview,
+    _fetch_stock, _calc_per_pbr, _fetch_naver, _fetch_naver_daily, _is_etf_type, _etf_overview,
 )
 # 순수 신호 엔진은 signals.py로 분리 (동작 동일). app.py는 라우트·조립 담당.
 from signals import (
@@ -73,6 +74,29 @@ def _stale_or_error(kind, key, e):
         log(f'{kind} {key} 조회 실패 → stale 캐시 반환: {e}', 'WARN')
         return jsonify({'success': True, 'data': stale, 'stale': True})
     return _error_response(f'{kind} {key}', e)
+
+
+def _is_kr(ticker):
+    return ticker.upper().endswith(('.KS', '.KQ'))
+
+
+def _naver_daily_fallback(ticker, count, err):
+    """한국 종목의 야후 일봉 실패 시 네이버 일봉으로 대체. 해외 종목이거나 네이버도
+    실패하면 None (호출부가 stale/원래 예외로 처리)."""
+    if not _is_kr(ticker):
+        return None
+    try:
+        hist = _fetch_naver_daily(ticker.split('.')[0], count)
+        log(f'{ticker} 야후 일봉 실패 → 네이버 일봉 폴백 ({len(hist)}봉): {err}', 'WARN')
+        return hist
+    except Exception as ne:
+        log(f'{ticker} 네이버 일봉 폴백도 실패: {ne}', 'WARN')
+        return None
+
+
+# 네이버 폴백으로 만든 sigbase는 info(펀더멘털)가 비거나 낡았으므로 짧게 캐시해
+# 야후가 회복되면 빨리 정상 base로 돌아오게 한다.
+NAVER_BASE_TTL = int(os.environ.get('NAVER_BASE_TTL', '300'))
 
 
 def _ohlcv(hist):
@@ -207,24 +231,35 @@ def _signal_base(ticker):
     (야후 2년 일봉 배열·주봉추세·info·야후 PER/PBR — 모두 장중에 바뀌지 않거나
     분기 단위로만 바뀜) 실시간 가격·네이버 오버레이·점수 계산은 캐싱하지 않고
     매 요청마다 새로 한다. 데이터 부족 시 None."""
-    cached = _cache_get(('sigbase', ticker), 1800)
+    stale = _cache_get_stale(('sigbase', ticker))
+    ttl = NAVER_BASE_TTL if (stale is not None and stale.get('src') == 'naver') else 1800
+    cached = _cache_get(('sigbase', ticker), ttl)
     if cached is not None:
         log(f'signal_base {ticker} 캐시 히트', 'DEBUG')
         return cached
 
     t = yf.Ticker(ticker)
+    src = 'yahoo'
     # 200일선·기울기 판정을 위해 2년치 일봉 확보 (signal의 핵심 비용)
     try:
         with timed(f'yf.history(2y) {ticker}'):
             hist = yf_call(lambda: t.history(period='2y', interval='1d'),
                            f'yf.history(2y) {ticker}')
     except Exception as e:
-        # 레이트리밋 등으로 일봉을 못 받으면 만료된 base라도 재사용 (신호 유지)
-        stale = _cache_get_stale(('sigbase', ticker))
-        if stale is not None:
-            log(f'signal_base {ticker} 조회 실패 → stale base 재사용: {e}', 'WARN')
-            return stale
-        raise
+        # 한국 종목은 네이버 일봉으로 대체(야후 차단돼도 신호 유지)
+        hist = _naver_daily_fallback(ticker, 520, e)
+        if hist is None:
+            # 레이트리밋 등으로 일봉을 못 받으면 만료된 base라도 재사용 (신호 유지)
+            if stale is not None:
+                log(f'signal_base {ticker} 조회 실패 → stale base 재사용: {e}', 'WARN')
+                return stale
+            raise
+        src = 'naver'
+    if src == 'yahoo' and len(hist) < 60:
+        # 야후는 차단 시 예외 대신 빈 표를 주기도 한다 → 한국 종목은 네이버로 보강
+        nh = _naver_daily_fallback(ticker, 520, f'야후 일봉 {len(hist)}봉')
+        if nh is not None and len(nh) > len(hist):
+            hist, src = nh, 'naver'
     if hist.empty or len(hist) < 60:
         log(f'signal_base {ticker} 데이터 부족 (rows={len(hist)})', 'WARN')
         return None
@@ -241,8 +276,17 @@ def _signal_base(ticker):
         pass
 
     # 펀더멘털 info + 야후 PER/PBR (분기 재무 기반, 장중 불변)
-    with timed(f'yf.info(signal) {ticker}'):
-        info = yf_call(lambda: t.info, f'yf.info(signal) {ticker}')
+    try:
+        with timed(f'yf.info(signal) {ticker}'):
+            info = yf_call(lambda: t.info, f'yf.info(signal) {ticker}')
+    except Exception as e:
+        if not _is_kr(ticker):
+            raise
+        # 한국 종목: 직전 base의 info를 재사용(없으면 빈 info). PER/PBR·시총·선행PER은
+        # 이후 네이버 실시간 오버레이가 채운다. 회복을 빨리 반영하도록 짧게 캐시.
+        info = dict(stale['info']) if stale is not None and isinstance(stale.get('info'), dict) else {}
+        log(f'signal_base {ticker} 야후 info 실패 → {"직전 info" if info else "빈 info"} 사용: {e}', 'WARN')
+        src = 'naver'
     try:
         fi = yf_call(lambda: t.fast_info, f'yf.fast_info(signal) {ticker}')
         if fi.last_price:
@@ -257,6 +301,7 @@ def _signal_base(ticker):
         'last_date': hist.index[-1].date().isoformat(),
         'weekly_up': weekly_up,
         'info': info, 'per': per, 'pbr': pbr,
+        'src': src,   # 'naver'면 폴백 base → NAVER_BASE_TTL로 짧게 캐시
     }
     _cache_set(('sigbase', ticker), base)
     return base
@@ -412,7 +457,7 @@ def signal(ticker):
         weekly_up = base['weekly_up']
         info = dict(base['info'])
         bars = (closes, highs, lows, vols)
-        if ticker.upper().endswith(('.KS', '.KQ')):
+        if _is_kr(ticker):
             per, pbr = _overlay_kr_realtime(ticker, base, bars, info, base['per'], base['pbr'])
         else:
             per, pbr = _overlay_us_realtime(ticker, base, bars, info, base['per'], base['pbr'])
@@ -512,6 +557,15 @@ def signal(ticker):
         return _error_response(f'signal {ticker}', e)
 
 
+def _period_bars(period):
+    """'5y'·'6mo' 같은 야후 기간 → 대략의 거래일 수(네이버 일봉 count용)."""
+    m = re.fullmatch(r'(\d+)(y|mo)', period or '')
+    if not m:
+        return 1300
+    k = int(m.group(1))
+    return k * 252 + 20 if m.group(2) == 'y' else k * 22 + 10
+
+
 @app.route('/api/backtest/<path:ticker>')
 def backtest(ticker):
     """실시간 신호와 '동일한' 기술 엔진(_technical_signal)을 과거 전 구간에 적용해
@@ -523,9 +577,19 @@ def backtest(ticker):
         return jsonify({'success': True, 'data': cached})
     try:
         t = yf.Ticker(ticker)
-        with timed(f'yf.history({BACKTEST_PERIOD},backtest) {ticker}'):
-            hist = yf_call(lambda: t.history(period=BACKTEST_PERIOD, interval='1d'),
-                           f'yf.history({BACKTEST_PERIOD},backtest) {ticker}')
+        try:
+            with timed(f'yf.history({BACKTEST_PERIOD},backtest) {ticker}'):
+                hist = yf_call(lambda: t.history(period=BACKTEST_PERIOD, interval='1d'),
+                               f'yf.history({BACKTEST_PERIOD},backtest) {ticker}')
+        except Exception as e:
+            hist = _naver_daily_fallback(ticker, _period_bars(BACKTEST_PERIOD), e)
+            if hist is None:
+                raise
+        if len(hist) < 120:
+            # 야후가 빈 표를 준 경우(차단 등) 한국 종목은 네이버 일봉으로 보강
+            nh = _naver_daily_fallback(ticker, _period_bars(BACKTEST_PERIOD), f'야후 일봉 {len(hist)}봉')
+            if nh is not None and len(nh) > len(hist):
+                hist = nh
         if hist.empty or len(hist) < 120:
             return jsonify({'success': False, 'error': '데이터 부족 (최소 120거래일 필요)'}), 422
 
