@@ -374,8 +374,8 @@ def _growth(cur, prev):
 
 
 def _naver_fundamentals_from(quarter, annual):
-    """분기·연간 행 → 야후 info 키(returnOnEquity·operatingMargins·profitMargins·debtToEquity·
-    quickRatio·revenueGrowth·earningsGrowth·totalRevenue). 분기(TTM·전년동기 대비) 우선,
+    """분기·연간 행 → 야후 info 키(returnOnEquity·returnOnAssets·operatingMargins·profitMargins·
+    debtToEquity·quickRatio·revenueGrowth·earningsGrowth·totalRevenue). 분기(TTM·전년동기 대비) 우선,
     부족하면 연간. 단위는 야후와 같게: 비율은 소수(0.12), 부채비율은 퍼센트 숫자(29.9)."""
     q, a = quarter or {}, annual or {}
     out = {}
@@ -428,6 +428,10 @@ def _naver_fundamentals_from(quarter, annual):
         out['returnOnEquity'] = roe / 100
     if debt is not None:
         out['debtToEquity'] = debt
+    if roe is not None and debt is not None and debt >= 0:
+        # 네이버엔 ROA 행이 없다 → 항등식으로 산출: 총자산 = 자본 × (1 + 부채/자본)이므로
+        # ROA = 순이익/총자산 = ROE ÷ (1 + 부채비율). (네이버 부채비율 = 부채총계/자본총계)
+        out['returnOnAssets'] = (roe / 100) / (1 + debt / 100)
     if quick is not None:
         out['quickRatio'] = quick / 100
     return {k: v for k, v in out.items() if v is not None}
