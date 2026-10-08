@@ -345,6 +345,129 @@ def _monthly_history(df):
     return [{'date': m, 'close': c} for m, c in months.items()]
 
 
+# ── 네이버 재무 (야후 펀더멘털 폴백) ────────────────────────────────
+# 야후가 서버 IP의 재무 상세(quoteSummary)를 막으면(401 Invalid Crumb) 한국 종목의
+# ROE·마진·부채·성장률이 비어 가치 점수가 PBR 하나로만 계산됐다. 네이버 모바일 재무
+# JSON(분기·연간)에서 야후 info와 같은 키·단위로 만들어 빈 값만 채운다.
+#   응답: financeInfo.trTitleList[{key,isConsensus}] (과거→최근), rowList[{title, columns{key:{value}}}]
+#   금액 단위는 억원, 비율은 퍼센트 숫자. isConsensus='Y'(전망치)는 쓰지 않는다.
+NAVER_FIN_TTL = int(os.environ.get('NAVER_FIN_TTL', '21600'))   # 재무는 분기 단위라 6시간
+
+
+def _naver_fin_rows(j):
+    """재무 JSON → {행 제목: [실적 기간 값(과거→최근)]}. 전망치(컨센서스) 기간은 제외."""
+    fi = (j or {}).get('financeInfo') or {}
+    keys = [t.get('key') for t in fi.get('trTitleList') or [] if t.get('isConsensus') == 'N']
+    rows = {}
+    for r in fi.get('rowList') or []:
+        cols = r.get('columns') or {}
+        rows[r.get('title')] = [_naver_num((cols.get(k) or {}).get('value')) for k in keys]
+    return rows
+
+
+def _last(xs):
+    return next((v for v in reversed(xs or []) if v is not None), None)
+
+
+def _growth(cur, prev):
+    return (cur / prev - 1) if (cur is not None and prev is not None and prev > 0) else None
+
+
+def _naver_fundamentals_from(quarter, annual):
+    """분기·연간 행 → 야후 info 키(returnOnEquity·operatingMargins·profitMargins·debtToEquity·
+    quickRatio·revenueGrowth·earningsGrowth·totalRevenue). 분기(TTM·전년동기 대비) 우선,
+    부족하면 연간. 단위는 야후와 같게: 비율은 소수(0.12), 부채비율은 퍼센트 숫자(29.9)."""
+    q, a = quarter or {}, annual or {}
+    out = {}
+
+    def ttm(title):
+        xs = (q.get(title) or [])[-4:]
+        return sum(xs) if len(xs) == 4 and all(v is not None for v in xs) else None
+
+    rev, op, ni = ttm('매출액'), ttm('영업이익'), ttm('당기순이익')
+    if rev and rev > 0:
+        out['totalRevenue'] = rev * 1e8
+        if op is not None:
+            out['operatingMargins'] = op / rev
+        if ni is not None:
+            out['profitMargins'] = ni / rev
+
+    def yoy(title):   # 최근 분기 vs 4분기 전(전년 동기) — 야후 revenueGrowth 정의와 같음
+        xs = q.get(title) or []
+        return _growth(xs[-1], xs[-5]) if len(xs) >= 5 else None
+
+    out['revenueGrowth'] = yoy('매출액')
+    out['earningsGrowth'] = yoy('지배주주순이익')
+    if out['earningsGrowth'] is None:
+        out['earningsGrowth'] = yoy('당기순이익')
+    roe, debt, quick = _last(q.get('ROE')), _last(q.get('부채비율')), _last(q.get('당좌비율'))
+
+    # 분기로 못 채운 항목은 최근 실적 연도로
+    def ann_yoy(title):
+        xs = [v for v in (a.get(title) or []) if v is not None]
+        return _growth(xs[-1], xs[-2]) if len(xs) >= 2 else None
+
+    if 'totalRevenue' not in out:
+        r = _last(a.get('매출액'))
+        if r and r > 0:
+            out['totalRevenue'] = r * 1e8
+    for key, title in (('operatingMargins', '영업이익률'), ('profitMargins', '순이익률')):
+        if key not in out and _last(a.get(title)) is not None:
+            out[key] = _last(a.get(title)) / 100
+    if out['revenueGrowth'] is None:
+        out['revenueGrowth'] = ann_yoy('매출액')
+    if out['earningsGrowth'] is None:
+        out['earningsGrowth'] = ann_yoy('지배주주순이익')
+        if out['earningsGrowth'] is None:
+            out['earningsGrowth'] = ann_yoy('당기순이익')
+    roe = roe if roe is not None else _last(a.get('ROE'))
+    debt = debt if debt is not None else _last(a.get('부채비율'))
+    quick = quick if quick is not None else _last(a.get('당좌비율'))
+
+    if roe is not None:
+        out['returnOnEquity'] = roe / 100
+    if debt is not None:
+        out['debtToEquity'] = debt
+    if quick is not None:
+        out['quickRatio'] = quick / 100
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _fetch_naver_fundamentals(code):
+    """네이버 분기·연간 재무 → 야후 info 형식 dict (NAVER_FIN_TTL 캐시). 실패 시 빈 dict."""
+    key = ('naver_fin', code)
+    cached = _cache_get(key, NAVER_FIN_TTL)
+    if cached is not None:
+        return cached
+
+    def _get(kind):
+        try:
+            with timed(f'네이버 재무({kind}) {code}', warn_ms=2000, slow_ms=4000):
+                r = requests.get(f'https://m.stock.naver.com/api/stock/{code}/finance/{kind}',
+                                 headers=_NAVER_HEADERS, timeout=5)
+            r.raise_for_status()
+            return _naver_fin_rows(r.json())
+        except Exception as e:
+            log(f'네이버 재무({kind}) {code} 실패: {e}', 'WARN')
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        fq, fa = ex.submit(_get, 'quarter'), ex.submit(_get, 'annual')
+        quarter, annual = fq.result(), fa.result()
+    if quarter is None and annual is None:
+        return {}   # 둘 다 실패 → 캐시하지 않고 다음 요청에서 재시도
+    out = _naver_fundamentals_from(quarter, annual)
+    _cache_set(key, out)
+    return out
+
+
+def _fill_missing(dst, src):
+    """dst에 값이 없는(None) 키만 src로 채운다(야후 값이 있으면 우선)."""
+    for k, v in src.items():
+        if safe_val(dst.get(k)) is None:
+            dst[k] = v
+
+
 def _yahoo_search(query):
     url = 'https://query1.finance.yahoo.com/v1/finance/search'
     params = {'q': query, 'lang': 'en-US', 'region': 'US',
@@ -697,6 +820,8 @@ def _fetch_stock(ticker):
             for k, v in nv.items():
                 if v is not None:
                     data[k] = v
+            # 야후 재무가 막혀 ROE·마진·부채·성장률이 비면 네이버 재무로 채운다.
+            _fill_missing(data, _card_fundamentals(_fetch_naver_fundamentals(tk.split('.')[0])))
             if not data.get('history'):
                 # 야후 실패로 미니차트가 비면 네이버 일봉 1년치로 월별 종가를 채운다.
                 try:

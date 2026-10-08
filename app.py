@@ -21,7 +21,7 @@ from infra import (
 # 외부 데이터 수집층(KRX·네이버·야후 조회)은 providers.py로 분리.
 from providers import (
     _search_krx, _is_korean, _yahoo_search, _search_etf_aliases,
-    _fetch_stock, _calc_per_pbr, _fetch_naver, _fetch_naver_daily, _is_etf_type, _etf_overview,
+    _fetch_stock, _calc_per_pbr, _fetch_naver, _fetch_naver_daily, _fetch_naver_fundamentals, _fill_missing, _is_etf_type, _etf_overview,
 )
 # 순수 신호 엔진은 signals.py로 분리 (동작 동일). app.py는 라우트·조립 담당.
 from signals import (
@@ -287,6 +287,9 @@ def _signal_base(ticker):
         info = dict(stale['info']) if stale is not None and isinstance(stale.get('info'), dict) else {}
         log(f'signal_base {ticker} 야후 info 실패 → {"직전 info" if info else "빈 info"} 사용: {e}', 'WARN')
         src = 'naver'
+    if _is_kr(ticker):
+        # 야후 재무가 막히면 가치 점수가 PBR 하나로만 계산된다 → 빈 재무 키만 네이버로 채움
+        _fill_missing(info, _fetch_naver_fundamentals(ticker.split('.')[0]))
     try:
         fi = yf_call(lambda: t.fast_info, f'yf.fast_info(signal) {ticker}')
         if fi.last_price:
