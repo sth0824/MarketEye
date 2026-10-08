@@ -351,8 +351,14 @@ let activeId = null;  // 현재 선택된 그룹 id
 let syncCode = localStorage.getItem('marketeye_sync_code') || ''; // 로그인(접속) 코드 — 자동 로그인용으로만 보관
 function genId() { return 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2,5); }
 function curGroup() { return groups.find(g => g.id === activeId) || groups[0]; }
+// 화면에 보일 티커. 즐겨찾기·빠른조회는 두 시장 종목이 섞여 담기므로 선택한 시장
+// (국내장/해외장) 종목만 보여준다. 실제 그룹은 추가 시점에 시장이 강제되므로 그대로.
+function viewTickers(g) {
+  if (!g) return [];
+  return isSpecialGroup(g.id) ? g.tickers.filter(t => tickerMarket(t) === selectedMarket) : g.tickers;
+}
 // 현재 그룹에서 데이터 로드가 끝난 티커들을 사용자가 정한 순서대로 반환
-function orderedTickers() { const g = curGroup(); return g ? g.tickers.filter(t => stocks[t]) : []; }
+function orderedTickers() { return viewTickers(curGroup()).filter(t => stocks[t]); }
 
 // ---- 국내장 / 해외장 (그룹의 상위 분류) ----
 // 상단에서 시장을 먼저 고르고, 그 시장에 속한 그룹만 그룹 바에 노출한다(폴더식).
@@ -448,6 +454,14 @@ async function addTicker(ticker) {
   // 현재 그룹에 추가하고 로딩 카드 표시
   g.tickers.push(ticker);
   stocks[ticker] = null;
+  if (isSpecialGroup(g.id) && tickerMarket(ticker) !== selectedMarket) {
+    // 즐겨찾기·빠른조회에 다른 시장 종목을 넣으면 화면에 안 보이므로 그 시장으로 전환.
+    selectedMarket = tickerMarket(ticker);
+    saveState();
+    renderGroupBar();
+    loadActiveGroup();
+    return;
+  }
   saveState();
   renderLoadingCard(ticker);
   fetchStock(ticker, true); // 방금 추가 → 잘못된 심볼이면 제거 허용
@@ -512,7 +526,7 @@ async function fetchStock(ticker, isNew = false) {
     showError(`${ticker}: ${msg}`);
     setLoadingBar(0);
     renderAll();
-    if (!curGroup().tickers.length) document.getElementById('empty-state').style.display = '';
+    if (!viewTickers(curGroup()).length) document.getElementById('empty-state').style.display = '';
   }
 }
 
@@ -581,12 +595,16 @@ function removeTicker(ticker) {
   delete stocks[ticker];
   saveState();
   renderAll();
-  if (!g.tickers.length) document.getElementById('empty-state').style.display = '';
+  if (!viewTickers(g).length) document.getElementById('empty-state').style.display = '';
 }
 
 function clearAll() {
-  if (curGroup().tickers.length && !confirm('현재 그룹의 모든 종목을 삭제할까요?')) return;
-  curGroup().tickers = [];
+  const g = curGroup();
+  if (!g) return;
+  const shown = viewTickers(g);
+  if (shown.length && !confirm('현재 그룹의 모든 종목을 삭제할까요?')) return;
+  // 즐겨찾기·빠른조회는 지금 보이는(선택 시장) 종목만 지운다 — 다른 시장 종목 보존.
+  g.tickers = g.tickers.filter(t => !shown.includes(t));
   stocks = {};
   saveState();
   renderAll();
@@ -719,6 +737,11 @@ async function pullSync(pushIfEmpty) {
     if (json.data && Array.isArray(json.data.groups) && json.data.groups.length) {
       groups = json.data.groups;
       activeId = groups.some(g => g.id === json.data.activeId) ? json.data.activeId : groups[0].id;
+    } else if (hadCache && groups.some(g => g.id !== QUICK_ID && (!isSpecialGroup(g.id) || g.tickers.length))) {
+      // 서버가 비어 있는데(복구된 DB·일시 오류 등) 이 기기엔 같은 코드의 그룹 스냅샷이
+      // 있다 → 기본 그룹으로 덮어써 관심종목을 날리지 말고, 로컬 스냅샷을 서버에 복원한다.
+      console.warn('[MarketEye] 서버 데이터 없음 → 로컬 그룹 스냅샷을 서버에 복원');
+      await pushSyncNow();
     } else {
       // 서버에 데이터가 없는 신규 코드 → 기본 그룹 생성 (국내장)
       groups = [{ id: genId(), name: '내 관심종목', tickers: [], market: 'kr' }];
@@ -730,7 +753,8 @@ async function pullSync(pushIfEmpty) {
     ensureQuick();
     migrateGroupMarkets();  // 구버전 그룹에 market 필드 채움
     // 저장된 선택 시장 복원 (기본 국내장)
-    selectedMarket = (json.data && json.data.selectedMarket === 'us') ? 'us' : 'kr';
+    // (서버가 비어 로컬 스냅샷을 복원한 경우엔 지금 선택된 시장을 유지)
+    if (json.data) selectedMarket = json.data.selectedMarket === 'us' ? 'us' : 'kr';
     if (!groups.some(g => g.id === activeId)) activeId = (groups.find(g => !isSpecialGroup(g.id)) || groups[0]).id;
     // 활성 그룹이 실제 그룹이면 그 시장에 맞춰 선택 시장을 정렬(활성 그룹이 안 보이는 일 방지).
     const _ag = groups.find(g => g.id === activeId);
@@ -842,7 +866,7 @@ function loadActiveGroup() {
   signals = {};
   _retryCount = {}; // 새 로드 → 재시도 예산 초기화
   const g = curGroup();
-  const tickers = g ? g.tickers.slice() : [];
+  const tickers = viewTickers(g).slice();
   document.getElementById('empty-state').style.display = tickers.length ? 'none' : '';
   tickers.forEach(t => { stocks[t] = null; });
   hydrateFromCache(tickers);   // 직전 값으로 즉시 채움 → 무한 '로딩 중' 방지
@@ -1327,16 +1351,15 @@ function renderGroupBar() {
   if (!bar) return;
   // 특수 그룹(즐겨찾기·빠른조회)은 두 시장 공통으로 항상 노출, 실제 그룹은 선택 시장만.
   const visible = groups.filter(g => isSpecialGroup(g.id) || groupMarket(g) === selectedMarket);
-  const totalReal = groups.filter(g => !isSpecialGroup(g.id)).length;  // 마지막 그룹 삭제 방지용(전체 기준)
   bar.innerHTML = visible.map(g => {
     const fav = g.id === FAV_ID;
     const special = isSpecialGroup(g.id);  // 즐겨찾기·빠른조회는 이름변경/삭제 불가
     const tip = fav ? '즐겨찾기 모음' : (g.id === QUICK_ID ? '검색해서 잠깐 보기 (저장 안 됨)' : '더블클릭하면 이름 변경');
     return `<div class="group-pill ${g.id === activeId ? 'active' : ''} ${fav ? 'fav-pill' : ''}" onclick="switchGroup('${g.id}')" ${special ? '' : `ondblclick="renameGroup('${g.id}')"`} title="${tip}">
        <span>${esc(g.name)}</span>
-       <span class="group-count">${g.tickers.length}</span>
+       <span class="group-count">${viewTickers(g).length}</span>
        ${special ? '' : `<button class="group-edit" onclick="event.stopPropagation();renameGroup('${g.id}')" title="이름 변경">✎</button>`}
-       ${(!special && totalReal > 1) ? `<button class="group-del" onclick="event.stopPropagation();deleteGroup('${g.id}')" title="그룹 삭제">✕</button>` : ''}
+       ${!special ? `<button class="group-del" onclick="event.stopPropagation();deleteGroup('${g.id}')" title="그룹 삭제">✕</button>` : ''}
      </div>`;
   }).join('') + `<button class="group-add" onclick="newGroup()">+ 새 그룹</button>`;
 }
@@ -1375,17 +1398,15 @@ function renameGroup(id) {
 
 function deleteGroup(id) {
   if (id === FAV_ID || id === QUICK_ID) { showError('이 그룹은 삭제할 수 없습니다'); return; }
-  if (groups.filter(x => x.id !== FAV_ID && x.id !== QUICK_ID).length <= 1) { showError('마지막 그룹은 삭제할 수 없습니다'); return; }
   const g = groups.find(x => x.id === id);
   if (!g) return;
   if (!confirm(`'${g.name}' 그룹을 삭제할까요?`)) return;
   groups = groups.filter(x => x.id !== id);
   if (activeId === id) {
-    // 같은 시장의 다른 그룹을 우선 선택, 없으면 아무 실제 그룹(그 시장으로 전환).
+    // 같은 시장의 다른 그룹을 우선 선택, 없으면 즐겨찾기(시장은 그대로 유지).
     const next = groups.find(x => !isSpecialGroup(x.id) && groupMarket(x) === selectedMarket)
-              || groups.find(x => !isSpecialGroup(x.id)) || groups[0];
-    activeId = next.id;
-    if (next && !isSpecialGroup(next.id)) selectedMarket = groupMarket(next);
+              || favGroup() || groups[0];
+    activeId = next ? next.id : null;
   }
   saveState();
   renderGroupBar();
@@ -1425,7 +1446,7 @@ function renderCards() {
   const c = document.getElementById('cards-container');
   c.innerHTML = '';
   const g = curGroup();
-  (g ? g.tickers : []).forEach(ticker => {
+  viewTickers(g).forEach(ticker => {
     const d = stocks[ticker];
     if (!d) { renderLoadingCard(ticker); return; }
     const card = document.createElement('div');

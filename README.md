@@ -52,7 +52,7 @@ Render 무료 웹서비스는 **15분간 외부 요청이 없으면 서버를 �
 - **동작 확인**: 리포의 `Actions → Keep Render awake` 탭에서 실행 이력·성공 여부 확인.
   즉시 한 번 깨우려면 `Run workflow` 버튼으로 수동 실행.
 - **콜드스타트 자체를 더 튼튼히**: Render 서비스의 Start Command 를
-  `gunicorn app:app --timeout 120 --workers 1 --threads 4` 로 두면(첫 요청이 야후
+  `gunicorn app:app --timeout 120 --workers 1 --threads 16` 로 두면(첫 요청이 야후
   응답을 기다리다 워커가 죽는 일 방지), Health Check Path 는 `/api/health` 로 둔다.
 
 - **Supabase 일시정지 방지**: Supabase 무료 플랜은 7일간 요청이 없으면 프로젝트를 멈춘다.
