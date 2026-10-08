@@ -523,21 +523,34 @@ const REFRESH_SEC = 30;
 let refreshTimer = null;
 let countdown = REFRESH_SEC;
 
+// 서버는 gunicorn 스레드 4개뿐인데 예전엔 30초마다 가격 7건을 '한꺼번에', 그것도
+// 직전 회차가 안 끝났어도 또 쐈다. 브라우저가 타임아웃으로 포기한 요청도 서버는 끝까지
+// 처리하므로 밀린 요청이 끝없이 쌓여 /sync·/health 까지 전부 타임아웃났다(2026-10 장애).
+// → 직전 회차가 진행 중이면 건너뛰고, 동시 요청 수를 PRICE_POOL로 제한한다.
+const PRICE_POOL = 2;
+let pricesInFlight = false;
+let groupLoadSeq = 0, groupLoading = false;   // 그룹 로드(주식·신호) 진행 중엔 가격 폴링 생략
+
 async function refreshPrices() {
   const tickers = orderedTickers();
-  if (!tickers.length) return;
+  if (!tickers.length || pricesInFlight || groupLoading) return;
+  pricesInFlight = true;
+  try { await _refreshPrices(tickers); } finally { pricesInFlight = false; }
+}
+
+async function _refreshPrices(tickers) {
 
   document.getElementById('last-updated').textContent = '새로고침 중...';
   document.getElementById('last-updated').style.color = 'var(--yellow)';
 
-  await Promise.all(tickers.map(async ticker => {
+  await runPool(tickers, async ticker => {
     try {
       // 경량 엔드포인트: 가격·등락률만 (재무지표·히스토리는 유지)
       const res = await apiFetch(`${API}/price/${ticker}`);
       const json = await res.json();
       if (json.success && stocks[ticker]) Object.assign(stocks[ticker], json.data);
     } catch(e) {}
-  }));
+  }, PRICE_POOL);
   persistCache();   // 갱신된 최신 가격도 로컬 캐시에 반영
 
   const now = new Date();
@@ -838,7 +851,10 @@ function loadActiveGroup() {
   // 시차 대신 '동시 요청 수'를 고정(풀)해 서버 부하를 낮춘다. 주식(가벼움) 먼저 최대
   // 3개 동시 → 모두 끝난 뒤 신호(무거움) 최대 2개 동시. fetchStock/Signal은 예외를
   // 자체 처리·백그라운드 재시도하므로 풀이 막히지 않는다(동작 의미는 기존과 동일).
+  const mySeq = ++groupLoadSeq;
+  groupLoading = true;
   (async () => {
+   try {
     const t0 = performance.now();
     console.log(`[MarketEye] ⏳ 그룹 로드 시작: ${tickers.length}종목 [${tickers.join(', ')}]`);
     await runPool(tickers, t => fetchStock(t), 3);
@@ -851,6 +867,9 @@ function loadActiveGroup() {
     if (okS < tickers.length || okG < tickers.length) {
       console.warn('[MarketEye] ⚠ 일부 로드 실패 — 반복되면 Render 서버 로그에서 "야후 …s 무응답/느림" 확인. 한국주는 네이버 폴백으로 시세는 떠야 정상.');
     }
+   } finally {
+    if (mySeq === groupLoadSeq) groupLoading = false;   // 더 최근 로드가 시작됐으면 그쪽이 해제
+   }
   })();
 }
 
