@@ -120,6 +120,44 @@ YF_CALL_TIMEOUT = float(os.environ.get('YF_CALL_TIMEOUT', '10'))
 _yf_lock = threading.Lock()
 _yf_last = [0.0]
 
+# ── 야후 서킷브레이커 ──────────────────────────────────────────────
+#   증상: 야후가 서버 IP를 막으면 신호 1건이 history·info·fast_info·분기재무…
+#   각각 하드 타임아웃(10초)을 꽉 채워 50초+ 걸린다. 이게 동시 요청 수만큼 쌓이면
+#   gunicorn 워커/스레드가 전부 묶여 야후와 무관한 /api/sync·/api/health 까지
+#   줄을 서서 프론트가 전부 타임아웃난다(2026-10 장애).
+#   → 짧은 창 안에 타임아웃이 연속되면 일정 시간 야후 호출을 즉시 실패시켜
+#     (TimeoutError — 기존 폴백 경로 그대로: stale base·네이버 등) 스레드를 바로 풀어준다.
+#   창이 지나면 다시 호출을 허용(half-open)하고, 또 막히면 다시 연다.
+YF_BREAKER_THRESHOLD = int(os.environ.get('YF_BREAKER_THRESHOLD', '2'))   # 0이면 비활성
+YF_BREAKER_WINDOW = float(os.environ.get('YF_BREAKER_WINDOW', '30'))      # 연속 타임아웃 집계 창(초)
+YF_BREAKER_COOLDOWN = float(os.environ.get('YF_BREAKER_COOLDOWN', '30'))  # 열린 뒤 즉시실패 유지(초)
+_yf_brk_lock = threading.Lock()
+_yf_brk = {'fails': [], 'open_until': 0.0}
+
+
+def _breaker_check(label):
+    if YF_BREAKER_THRESHOLD <= 0:
+        return
+    left = _yf_brk['open_until'] - time.time()
+    if left > 0:
+        raise TimeoutError(f'{label} 생략 — 야후 서킷브레이커 열림({left:.0f}s 남음, 폴백 전환)')
+
+
+def _breaker_record(timed_out):
+    if YF_BREAKER_THRESHOLD <= 0:
+        return
+    now = time.time()
+    with _yf_brk_lock:
+        if not timed_out:
+            _yf_brk['fails'].clear()
+            return
+        fails = [t for t in _yf_brk['fails'] if now - t < YF_BREAKER_WINDOW] + [now]
+        _yf_brk['fails'] = fails
+        if len(fails) >= YF_BREAKER_THRESHOLD and _yf_brk['open_until'] <= now:
+            _yf_brk['open_until'] = now + YF_BREAKER_COOLDOWN
+            log(f'야후 타임아웃 {len(fails)}회 연속 → 서킷브레이커 {YF_BREAKER_COOLDOWN:.0f}s 열림 '
+                f'(야후 호출 즉시 폴백)', 'WARN')
+
 
 def _run_with_timeout(fn, timeout, label):
     """fn()을 데몬 스레드에서 실행하고 timeout초 안에 못 끝나면 TimeoutError.
@@ -149,6 +187,7 @@ def yf_call(fn, label='yf', retries=None):
     retries = YF_RETRIES if retries is None else retries
     last_exc = None
     for attempt in range(retries + 1):
+        _breaker_check(label)
         if YF_MIN_INTERVAL > 0:
             # 진입 시점만 전역적으로 띄운다(실제 네트워크 대기까지 직렬화하진 않음).
             with _yf_lock:
@@ -160,6 +199,7 @@ def yf_call(fn, label='yf', retries=None):
         try:
             result = _run_with_timeout(fn, YF_CALL_TIMEOUT, label) if YF_CALL_TIMEOUT > 0 else fn()
             el = time.time() - t0
+            _breaker_record(False)
             if el > 2.0:   # 성공했지만 느린 야후 호출 — 병목 후보로 기록
                 log(f'{label} 야후 응답 {el:.1f}s (느림)', 'WARN')
             return result
@@ -169,6 +209,7 @@ def yf_call(fn, label='yf', retries=None):
             # 하드 타임아웃(=행)은 재시도하지 않는다: 재시도하면 행을 다시 쌓아
             # 총 대기가 timeout×(retries+1)로 불어나 프론트 타임아웃을 못 막는다.
             if isinstance(e, TimeoutError):
+                _breaker_record(True)
                 log(f'{label} 타임아웃 {el:.1f}s — 재시도 없이 폴백: {e}', 'WARN')
                 raise
             if is_rate_limited(e) and attempt < retries:
