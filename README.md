@@ -55,6 +55,11 @@ Render 무료 웹서비스는 **15분간 외부 요청이 없으면 서버를 �
   `gunicorn app:app --timeout 120 --workers 1 --threads 4` 로 두면(첫 요청이 야후
   응답을 기다리다 워커가 죽는 일 방지), Health Check Path 는 `/api/health` 로 둔다.
 
+- **Supabase 일시정지 방지**: Supabase 무료 플랜은 7일간 요청이 없으면 프로젝트를 멈춘다.
+  같은 워크플로가 하루 한 번 `/api/health/db`(DB 가벼운 조회)를 호출해 깨워 둔다.
+- **워크플로 자동 비활성화 방지**: GitHub는 60일간 커밋이 없으면 예약 워크플로를 끈다.
+  하루 한 번 워크플로가 스스로 enable API를 호출해 그 타이머를 리셋한다.
+
 > 참고: GitHub Actions 스케줄은 부하 시 지연될 수 있어(특히 정시 근처) 5분 주기로
 > 여유를 뒀습니다. 더 확실히 하려면 [cron-job.org](https://cron-job.org),
 > UptimeRobot 같은 외부 모니터로 `/api/health` 를 함께 핑해도 됩니다.

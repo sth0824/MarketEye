@@ -758,6 +758,28 @@ def health():
     return jsonify({'ok': True})
 
 
+# Supabase 무료 플랜은 7일간 요청이 없으면 프로젝트를 일시정지(pause)한다 → 동기화 실패.
+# keepalive 워크플로가 이 엔드포인트를 주기적으로 호출해 DB에 가벼운 조회를 보내
+# '활동'으로 잡히게 한다. /api/health 와 분리해 둔 이유: health 는 외부 의존 없이
+# 즉시 응답해야 Render 깨우기 핑이 Supabase 장애에 휘말리지 않는다.
+@app.route('/api/health/db')
+def health_db():
+    if not _sync_enabled():
+        return jsonify({'ok': False, 'error': '동기화 미설정'}), 503
+    try:
+        r = requests.get(
+            f'{SUPABASE_URL}/rest/v1/{SYNC_TABLE}',
+            headers=_sb_headers(),
+            params={'select': 'code', 'limit': '1'},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return jsonify({'ok': True})
+    except Exception as e:
+        log(f'health/db Supabase 조회 실패: {e}', 'WARN')
+        return jsonify({'ok': False, 'error': str(e)}), 502
+
+
 # 프론트엔드(index.html) 서빙 — API와 같은 서버에서 제공
 @app.route('/')
 def index():
