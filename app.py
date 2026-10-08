@@ -5,7 +5,6 @@ import requests
 import traceback
 import os
 import time
-import threading
 from datetime import datetime, time as dtime
 try:
     from zoneinfo import ZoneInfo   # 표준 라이브러리(3.9+). tzdata 패키지로 데이터 보장.
@@ -14,7 +13,7 @@ except Exception:                    # 극단적 폴백(사실상 도달 안 함
 
 # 공용 인프라(로깅·타이밍·TTL 캐시·JSON 방어막)는 infra.py로 분리.
 from infra import (
-    log, timed, set_tag, _tag, _req_seq,
+    log, timed, set_tag, _req_seq,
     _cache_get, _cache_set, _cache_get_stale, yf_call, is_rate_limited,
     SafeJSONProvider,
 )
@@ -45,7 +44,6 @@ def _req_start():
     # 태그 = '#순번 마지막경로조각' → 동시 요청 구분용 (예: '#7 010120.KS')
     set_tag(f'#{n} {request.path.rsplit("/", 1)[-1][:18]}')
     request._t0 = time.time()
-    request._rtag = _tag()
     log(f'요청 시작 {request.method} {request.path}', 'DEBUG')
 
 @app.after_request
@@ -58,6 +56,29 @@ def _req_end(response):
 
 # 외부 데이터 수집(KRX 종목·검색·한글명, 네이버 실시간 시세, 야후 종목 데이터)은
 # providers.py로 분리됨. KRX 목록 로드·갱신 스레드도 providers import 시 시작된다.
+
+def _error_response(label, e):
+    """실패 로그 + 에러 JSON. 레이트리밋이면 429, 그 외 500."""
+    log(f'{label} 실패: {e}', 'ERROR')
+    traceback.print_exc()
+    status = 429 if is_rate_limited(e) else 500
+    return jsonify({'success': False, 'error': str(e)}), status
+
+
+def _stale_or_error(kind, key, e):
+    """신규 조회 실패 시 만료된 캐시라도 있으면 그 값을 돌려준다(graceful degradation:
+    빈 화면·달러 표기 대신 직전 정상값). 없으면 에러 응답."""
+    stale = _cache_get_stale((kind, key))
+    if stale is not None:
+        log(f'{kind} {key} 조회 실패 → stale 캐시 반환: {e}', 'WARN')
+        return jsonify({'success': True, 'data': stale, 'stale': True})
+    return _error_response(f'{kind} {key}', e)
+
+
+def _ohlcv(hist):
+    """야후 history DataFrame → (closes, highs, lows, vols) float 리스트."""
+    return tuple([float(v) for v in hist[col].tolist()] for col in ('Close', 'High', 'Low', 'Volume'))
+
 
 @app.route('/api/search')
 def search_ticker():
@@ -118,16 +139,7 @@ def get_stock(ticker):
         _cache_set(('stock', key), data)
         return jsonify({'success': True, 'data': data})
     except Exception as e:
-        # 레이트리밋 등으로 신규 조회 실패 시, 만료된 캐시라도 있으면 그 값을 돌려준다.
-        # (빈 화면·달러 표기 대신 직전 정상값을 보여주는 graceful degradation)
-        stale = _cache_get_stale(('stock', key))
-        if stale is not None:
-            log(f'stock {key} 조회 실패 → stale 캐시 반환: {e}', 'WARN')
-            return jsonify({'success': True, 'data': stale, 'stale': True})
-        log(f'stock {key} 실패: {e}', 'ERROR')
-        traceback.print_exc()
-        status = 429 if is_rate_limited(e) else 500
-        return jsonify({'success': False, 'error': str(e)}), status
+        return _stale_or_error('stock', key, e)
 
 
 @app.route('/api/price/<ticker>')
@@ -159,48 +171,7 @@ def get_price(ticker):
         _cache_set(('price', key), data)
         return jsonify({'success': True, 'data': data})
     except Exception as e:
-        stale = _cache_get_stale(('price', key))
-        if stale is not None:
-            log(f'price {key} 조회 실패 → stale 캐시 반환: {e}', 'WARN')
-            return jsonify({'success': True, 'data': stale, 'stale': True})
-        log(f'price {key} 실패: {e}', 'ERROR')
-        traceback.print_exc()
-        status = 429 if is_rate_limited(e) else 500
-        return jsonify({'success': False, 'error': str(e)}), status
-
-
-@app.route('/api/batch')
-def get_batch():
-    """여러 종목을 병렬로 조회."""
-    tickers = request.args.get('tickers', '')
-    ticker_list = [t.strip() for t in tickers.split(',') if t.strip()]
-    results = {}
-    lock = threading.Lock()
-    parent_tag = _tag()   # 워커 스레드에 부모 요청 태그 전파
-
-    def work(ticker):
-        key = ticker.upper()
-        set_tag(f'{parent_tag}»{key}')   # 워커 로그도 부모 요청으로 추적 가능
-        cached = _cache_get(('stock', key), STOCK_TTL)
-        try:
-            if cached is not None:
-                data = cached
-            else:
-                with timed(f'batch 조회 {key}'):
-                    data = _fetch_stock(ticker)
-                _cache_set(('stock', key), data)
-            payload = {'success': True, 'data': data}
-        except Exception as e:
-            log(f'batch {key} 실패: {e}', 'ERROR')
-            payload = {'success': False, 'error': str(e)}
-        with lock:
-            results[key] = payload
-
-    log(f'batch {len(ticker_list)}종목 병렬조회 시작: {ticker_list}', 'DEBUG')
-    threads = [threading.Thread(target=work, args=(t,)) for t in ticker_list]
-    for th in threads: th.start()
-    for th in threads: th.join()
-    return jsonify(results)
+        return _stale_or_error('price', key, e)
 
 
 # ── 진입 시점 신호 분석 ─────────────────────────────────────
@@ -257,10 +228,7 @@ def _signal_base(ticker):
     if hist.empty or len(hist) < 60:
         log(f'signal_base {ticker} 데이터 부족 (rows={len(hist)})', 'WARN')
         return None
-    closes = [float(v) for v in hist['Close'].tolist()]
-    highs  = [float(v) for v in hist['High'].tolist()]
-    lows   = [float(v) for v in hist['Low'].tolist()]
-    vols   = [float(v) for v in hist['Volume'].tolist()]
+    closes, highs, lows, vols = _ohlcv(hist)
 
     # 주봉(상위 시간프레임) 추세 — 장중 거의 불변
     weekly_up = None
@@ -319,6 +287,110 @@ def _exchange_now(info, fi):
     return None
 
 
+def _replace_last_bar(closes, highs, lows, rt, dh, dl):
+    """마지막 일봉(오늘 봉)을 실시간가로 교체. 고가·저가는 기존 봉 범위를 넓히는 방향으로만."""
+    closes[-1] = rt
+    highs[-1] = max(highs[-1], dh or rt, rt)
+    lows[-1] = min(lows[-1], dl or rt, rt)
+
+
+def _apply_realtime_mcap(info, mcap):
+    """실시간 시총으로 시총 파생 밸류에이션(PSR·EV/EBITDA)을 최신화."""
+    info['marketCap'] = mcap
+    rev = safe_val(info.get('totalRevenue'))
+    if rev and rev > 0:
+        info['priceToSalesTrailing12Months'] = mcap / rev
+    ebitda = safe_val(info.get('ebitda'))
+    if ebitda and ebitda > 0:
+        ev = mcap + (safe_val(info.get('totalDebt')) or 0) - (safe_val(info.get('totalCash')) or 0)
+        info['enterpriseToEbitda'] = ev / ebitda
+
+
+def _overlay_kr_realtime(ticker, base, bars, info, per, pbr):
+    """한국 종목: 마지막 봉을 네이버 실시간으로 교체/추가하고 PER/PBR·시총을 최신화.
+    (야후 KRX 15~20분 지연 → 차트·기술점수·진입가·밸류에이션이 실시간 반영)
+    bars·info는 제자리 갱신, (per, pbr) 반환. 네이버 실패 시 야후값 그대로."""
+    closes, highs, lows, vols = bars
+    try:
+        with timed(f'네이버 실시간 {ticker}', warn_ms=2000, slow_ms=4000):
+            nv = _fetch_naver(ticker.split('.')[0])
+        rt = nv.get('price')
+        if rt:
+            dh, dl, vol = nv.get('dayHigh'), nv.get('dayLow'), nv.get('volume')
+            if nv.get('tradeDate') == base['last_date']:
+                # 야후에 이미 오늘 봉이 있으면(지연된 값) 실시간으로 갱신
+                _replace_last_bar(closes, highs, lows, rt, dh, dl)
+                if vol:
+                    vols[-1] = vol
+            else:
+                # 야후에 오늘 봉이 아직 없으면 실시간 봉을 추가
+                closes.append(rt); highs.append(dh or rt)
+                lows.append(dl or rt); vols.append(vol or 0.0)
+        if nv.get('per') is not None:
+            per = nv.get('per')
+        if nv.get('pbr') is not None:
+            pbr = nv.get('pbr')
+        if nv.get('marketCap') is not None:
+            _apply_realtime_mcap(info, nv.get('marketCap'))
+        if nv.get('forwardPer') is not None:
+            info['forwardPE'] = nv.get('forwardPer')
+    except Exception as e:
+        log(f'네이버 실시간 {ticker} 실패(야후값 폴백): {e}', 'WARN')
+    return per, pbr
+
+
+def _overlay_us_realtime(ticker, base, bars, info, per, pbr):
+    """해외 종목: 네이버 같은 폴백 소스가 없으므로 야후 fast_info 실시간가로 마지막 봉·
+    현재가·시총을 갱신한다(한국주 네이버 오버레이에 대응). sigbase의 일봉 마지막값은
+    장중 지연·30분 캐시라 그대로 쓰면 신호가 실시간이 아니었다.
+
+    ⚠️ 정합성: 캐시 일봉의 마지막 봉이 '이전 거래일'인 상태(개장 직전/직후 + 캐시가 아직
+    어제 것)에서 무조건 마지막 봉을 덮으면 어제 종가가 오늘가로 오염된다(한국주는 네이버
+    tradeDate로 이를 구분). 거래소 시간대 기준으로 ①오늘 봉 교체 ②새 봉 추가 ③(개장 전·
+    주말·휴장) 계열 보존 을 구분한다. 야후가 막히면 하드타임아웃 후 예외 → 캐시된 일봉값
+    그대로 사용(회귀 없음). bars·info는 제자리 갱신, (per, pbr) 반환."""
+    closes, highs, lows, vols = bars
+    try:
+        yft = yf.Ticker(ticker.upper())
+        with timed(f'야후 실시간 {ticker}', warn_ms=1500, slow_ms=3000):
+            fi = yf_call(lambda: yft.fast_info, f'yf.fast_info(signal-rt) {ticker}')
+        rt = safe_val(fi.last_price)
+        if not (rt and rt > 0):
+            return per, pbr
+        dh, dl = safe_val(fi.day_high), safe_val(fi.day_low)
+        exch_now = _exchange_now(info, fi)
+        today_ex = exch_now.date().isoformat() if exch_now else None
+        # 정규장이 이미 시작된 평일인지(개장 전/주말이면 '새 세션' 아님).
+        new_session = bool(exch_now and exch_now.weekday() < 5
+                           and exch_now.time() >= _US_MARKET_OPEN)
+
+        if today_ex is None or base['last_date'] == today_ex:
+            # ① 캐시 일봉에 이미 오늘 봉 있음(또는 시간대 확정 실패 시 기존 동작) → 교체
+            _replace_last_bar(closes, highs, lows, rt, dh, dl)
+        elif base['last_date'] < today_ex and new_session:
+            # ② 캐시가 어제 봉까지인데 오늘 정규장이 시작됨 → 새 봉 추가(어제 종가 보존)
+            closes.append(rt); highs.append(dh or rt); lows.append(dl or rt)
+            vols.append(safe_val(getattr(fi, 'last_volume', None)) or 0.0)
+        else:
+            # ③ 개장 전·주말·휴장: 어제 봉을 훼손하지 않고 점수 계열·밸류에이션 캐시값 유지
+            return per, pbr
+
+        info['currentPrice'] = rt
+        # 실시간가 기준으로 PER/PBR 재계산 (EPS·BPS는 분기 고정)
+        eps = safe_val(info.get('trailingEps'))
+        bps = safe_val(info.get('bookValue'))
+        if eps and eps > 0:
+            per = rt / eps
+        if bps and bps > 0:
+            pbr = rt / bps
+        mcap = safe_val(getattr(fi, 'market_cap', None))
+        if mcap and mcap > 0:
+            _apply_realtime_mcap(info, mcap)
+    except Exception as e:
+        log(f'야후 실시간 {ticker} 실패(캐시 일봉값 폴백): {e}', 'WARN')
+    return per, pbr
+
+
 @app.route('/api/signal/<path:ticker>')
 def signal(ticker):
     # 신호 계산 결과 캐시 (SIGNAL_TTL초). 짧게 잡아 장중 점수를 실시간에 가깝게 유지.
@@ -334,120 +406,17 @@ def signal(ticker):
             return jsonify({'success': False, 'error': '데이터 부족 (최소 60거래일 필요)'}), 422
 
         # 캐시된 배열·info는 매 요청마다 복사 후 실시간 값으로 오버레이한다.
-        # (결과는 캐싱하지 않으므로 종목에 들어갈 때마다 네이버 실시간이 반영됨)
+        # (결과는 캐싱하지 않으므로 종목에 들어갈 때마다 실시간 시세가 반영됨)
         closes = list(base['closes']); highs = list(base['highs'])
         lows = list(base['lows']); vols = list(base['vols'])
         weekly_up = base['weekly_up']
         info = dict(base['info'])
-        per, pbr = base['per'], base['pbr']
-        n = len(closes)
-
-        # 한국 종목: 마지막 봉을 네이버 실시간으로 교체/추가하고 PER/PBR·시총을 최신화.
-        # (야후 KRX 15~20분 지연 → 차트·기술점수·진입가·밸류에이션이 실시간 반영)
+        bars = (closes, highs, lows, vols)
         if ticker.upper().endswith(('.KS', '.KQ')):
-            try:
-                with timed(f'네이버 실시간 {ticker}', warn_ms=2000, slow_ms=4000):
-                    nv = _fetch_naver(ticker.split('.')[0])
-                rt = nv.get('price')
-                if rt:
-                    dh, dl, vol = nv.get('dayHigh'), nv.get('dayLow'), nv.get('volume')
-                    if nv.get('tradeDate') == base['last_date']:
-                        # 야후에 이미 오늘 봉이 있으면(지연된 값) 실시간으로 갱신
-                        closes[-1] = rt
-                        highs[-1] = max(highs[-1], dh or rt, rt)
-                        lows[-1] = min(lows[-1], dl or rt, rt)
-                        if vol:
-                            vols[-1] = vol
-                    else:
-                        # 야후에 오늘 봉이 아직 없으면 실시간 봉을 추가
-                        closes.append(rt); highs.append(dh or rt)
-                        lows.append(dl or rt); vols.append(vol or 0.0)
-                    n = len(closes)
-                if nv.get('per') is not None:
-                    per = nv.get('per')
-                if nv.get('pbr') is not None:
-                    pbr = nv.get('pbr')
-                # 네이버 실시간 시총으로 시총 파생 밸류에이션도 최신화 (PSR·EV/EBITDA)
-                nv_mcap, nv_fpe = nv.get('marketCap'), nv.get('forwardPer')
-                if nv_mcap is not None:
-                    info['marketCap'] = nv_mcap
-                    rev = safe_val(info.get('totalRevenue'))
-                    if rev and rev > 0:
-                        info['priceToSalesTrailing12Months'] = nv_mcap / rev
-                    ebitda = safe_val(info.get('ebitda'))
-                    if ebitda and ebitda > 0:
-                        ev = nv_mcap + (safe_val(info.get('totalDebt')) or 0) - (safe_val(info.get('totalCash')) or 0)
-                        info['enterpriseToEbitda'] = ev / ebitda
-                if nv_fpe is not None:
-                    info['forwardPE'] = nv_fpe
-            except Exception as e:
-                log(f'네이버 실시간 {ticker} 실패(야후값 폴백): {e}', 'WARN')
+            per, pbr = _overlay_kr_realtime(ticker, base, bars, info, base['per'], base['pbr'])
         else:
-            # 해외 종목: 네이버 같은 폴백 소스가 없으므로 야후 fast_info 실시간가로
-            # 마지막 봉·현재가·시총을 갱신한다(한국주 네이버 오버레이에 대응). sigbase의
-            # 일봉 마지막값은 장중 지연·30분 캐시라 그대로 쓰면 신호가 실시간이 아니었다.
-            #
-            # ⚠️ 정합성: 캐시 일봉의 마지막 봉이 '이전 거래일'인 상태(개장 직전/직후 +
-            # 캐시가 아직 어제 것)에서 무조건 closes[-1]=rt로 덮으면 어제 종가가 오늘가로
-            # 오염된다(한국주는 네이버 tradeDate로 이를 구분). 거래소 시간대 기준으로
-            # ①오늘 봉 교체 ②새 봉 추가 ③(개장 전·주말·휴장) 계열 보존 을 구분한다.
-            # 야후가 막히면 하드타임아웃 후 예외 → 캐시된 일봉값 그대로 사용(회귀 없음).
-            try:
-                yft = yf.Ticker(ticker.upper())
-                with timed(f'야후 실시간 {ticker}', warn_ms=1500, slow_ms=3000):
-                    fi = yf_call(lambda: yft.fast_info, f'yf.fast_info(signal-rt) {ticker}')
-                rt = safe_val(fi.last_price)
-                if rt and rt > 0:
-                    dh, dl = safe_val(fi.day_high), safe_val(fi.day_low)
-                    exch_now = _exchange_now(info, fi)
-                    today_ex = exch_now.date().isoformat() if exch_now else None
-                    # 정규장이 이미 시작된 평일인지(개장 전/주말이면 '새 세션' 아님).
-                    new_session = bool(exch_now and exch_now.weekday() < 5
-                                       and exch_now.time() >= _US_MARKET_OPEN)
-
-                    apply_rt = True  # 밸류에이션(per/pbr/시총)을 실시간가로 갱신할지
-                    if today_ex is None:
-                        # 시간대 확정 실패(사실상 도달 안 함) → 기존 동작(마지막 봉 교체)로 폴백
-                        closes[-1] = rt
-                        highs[-1] = max(highs[-1], dh or rt, rt)
-                        lows[-1] = min(lows[-1], dl or rt, rt)
-                    elif base['last_date'] == today_ex:
-                        # ① 캐시 일봉에 이미 오늘 봉 있음 → 실시간가로 교체
-                        closes[-1] = rt
-                        highs[-1] = max(highs[-1], dh or rt, rt)
-                        lows[-1] = min(lows[-1], dl or rt, rt)
-                    elif base['last_date'] < today_ex and new_session:
-                        # ② 캐시가 어제 봉까지인데 오늘 정규장이 시작됨 → 새 봉 추가(어제 종가 보존)
-                        closes.append(rt); highs.append(dh or rt); lows.append(dl or rt)
-                        vols.append(safe_val(getattr(fi, 'last_volume', None)) or 0.0)
-                        n = len(closes)
-                    else:
-                        # ③ 개장 전·주말·휴장: 새 세션이 아니므로 어제 봉을 훼손하지 않고
-                        #    점수 계열을 그대로 둔다(오염 방지). 밸류에이션도 캐시값 유지.
-                        apply_rt = False
-
-                    if apply_rt:
-                        info['currentPrice'] = rt
-                        # 실시간가 기준으로 PER/PBR 재계산 (EPS·BPS는 분기 고정)
-                        eps = safe_val(info.get('trailingEps'))
-                        bps = safe_val(info.get('bookValue'))
-                        if eps and eps > 0:
-                            per = rt / eps
-                        if bps and bps > 0:
-                            pbr = rt / bps
-                        # 실시간 시총으로 시총 파생 밸류에이션 최신화 (PSR·EV/EBITDA)
-                        mcap = safe_val(getattr(fi, 'market_cap', None))
-                        if mcap and mcap > 0:
-                            info['marketCap'] = mcap
-                            rev = safe_val(info.get('totalRevenue'))
-                            if rev and rev > 0:
-                                info['priceToSalesTrailing12Months'] = mcap / rev
-                            ebitda = safe_val(info.get('ebitda'))
-                            if ebitda and ebitda > 0:
-                                ev = mcap + (safe_val(info.get('totalDebt')) or 0) - (safe_val(info.get('totalCash')) or 0)
-                                info['enterpriseToEbitda'] = ev / ebitda
-            except Exception as e:
-                log(f'야후 실시간 {ticker} 실패(캐시 일봉값 폴백): {e}', 'WARN')
+            per, pbr = _overlay_us_realtime(ticker, base, bars, info, base['per'], base['pbr'])
+        n = len(closes)
 
         # 시장 대비 상대강도 (지수 종가는 1시간 캐시)
         rs_60 = None
@@ -540,10 +509,7 @@ def signal(ticker):
         _cache_set(('signal', ticker), data)
         return jsonify({'success': True, 'data': data})
     except Exception as e:
-        log(f'signal {ticker} 실패: {e}', 'ERROR')
-        traceback.print_exc()
-        status = 429 if is_rate_limited(e) else 500
-        return jsonify({'success': False, 'error': str(e)}), status
+        return _error_response(f'signal {ticker}', e)
 
 
 @app.route('/api/backtest/<path:ticker>')
@@ -563,10 +529,7 @@ def backtest(ticker):
         if hist.empty or len(hist) < 120:
             return jsonify({'success': False, 'error': '데이터 부족 (최소 120거래일 필요)'}), 422
 
-        closes = [float(v) for v in hist['Close'].tolist()]
-        highs  = [float(v) for v in hist['High'].tolist()]
-        lows   = [float(v) for v in hist['Low'].tolist()]
-        vols   = [float(v) for v in hist['Volume'].tolist()]
+        closes, highs, lows, vols = _ohlcv(hist)
         n = len(closes)
 
         BUY_TH, HOLD_MAX, START = 68, 20, 70   # 매수기준 / 최대보유(거래일) / 시작 인덱스

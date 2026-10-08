@@ -203,16 +203,6 @@ def _lin_reg_r2(closes, period=60):
     return {'r2': 1 - ss_res / ss_tot, 'slope_pct': slope / ybar * 100 if ybar else 0.0}
 
 
-def _anchored_vwap(highs, lows, closes, vols, anchor):
-    """앵커(보통 최근 스윙 저점) 이후의 거래량가중평균가(VWAP). 기관의 평균 매입단가
-    근사 → 되돌림 시 강력한 지지·매수 기준선. typical=(H+L+C)/3."""
-    num = den = 0.0
-    for i in range(max(0, anchor), len(closes)):
-        num += ((highs[i] + lows[i] + closes[i]) / 3) * vols[i]
-        den += vols[i]
-    return (num / den) if den else None
-
-
 def _volume_profile(closes, highs, lows, vols, lookback=120, bins=40):
     """거래량 프로파일. 최근 lookback봉을 가격 구간(bins)으로 나눠 각 구간의 누적
     거래량을 구하고 POC(최다거래 가격)·밸류에어리어(VAL~VAH: 거래량 70% 밀집구간)를

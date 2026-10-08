@@ -34,7 +34,6 @@ python3 app.py            # http://localhost:5001 에서 API 제공
 | `GET /api/search?q=` | 종목 검색 (KRX 로컬 + 야후 글로벌) |
 | `GET /api/stock/<ticker>` | 종목 전체 데이터 (재무·밸류에이션·히스토리) |
 | `GET /api/price/<ticker>` | 가격·등락률만 (자동 새로고침용 경량) |
-| `GET /api/batch?tickers=A,B` | 여러 종목 병렬 조회 |
 
 ## 배포 (Render 무료 플랜) — 서버가 잠들지 않게 유지
 

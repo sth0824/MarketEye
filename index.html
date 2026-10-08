@@ -26,8 +26,6 @@
   header.header-hidden { transform: translateY(-100%); }
   #refresh-info { font-size: 11px; color: var(--muted); white-space: nowrap; }
   #refresh-info span { color: var(--green); }
-  .refreshing { animation: pulse 1s infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
   header h1 { font-size: 18px; font-weight: 700; color: var(--blue); letter-spacing: -0.5px; }
   header h1 span { color: var(--text); }
 
@@ -38,7 +36,6 @@
   button { background: var(--accent); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; transition: opacity .2s; white-space: nowrap; }
   button:hover { opacity: .85; }
   button.secondary { background: var(--surface2); border: 1px solid var(--border); color: var(--text); font-weight: 400; }
-  button.danger { background: #da3633; }
 
   #suggestions { position: absolute; top: calc(100% + 4px); left: 0; right: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; z-index: 200; display: none; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
   .sug-item { display: flex; align-items: center; gap: 8px; padding: 9px 12px; cursor: pointer; transition: background .1s; }
@@ -140,9 +137,6 @@
   .signal-card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; }
   .signal-name { font-size: 16px; font-weight: 700; color: var(--blue); }
   .signal-ticker-label { font-size: 11px; color: var(--muted); margin-top: 2px; }
-  .signal-score-ring { text-align: center; }
-  .signal-score-num { font-size: 32px; font-weight: 800; }
-  .signal-score-label { font-size: 10px; color: var(--muted); }
   .signal-block { margin-bottom: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
   .signal-block:first-of-type { border-top: none; padding-top: 0; }
   .signal-block-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 8px; flex-wrap: wrap; }
@@ -418,9 +412,6 @@ function ensureQuick() {  // 즐겨찾기 바로 다음에 생성 (없을 때만
       { id: QUICK_ID, name: '🔍 빠른 조회', tickers: [] });
   }
 }
-
-const POPULAR =['AAPL','MSFT','GOOGL','AMZN','NVDA','TSLA','META','NFLX','ORCL','AMD',
-  '005930.KS','000660.KS','035420.KS','035720.KS','068270.KS','207940.KS'];
 
 // 한국 종목코드(숫자)를 KRX 검색으로 .KS/.KQ 정확히 해석
 async function resolveKrTicker(code) {
@@ -1157,7 +1148,6 @@ function renderSignalCard(ticker) {
   // 낙폭·이격도가 핵심 판단 재료다. (백엔드 sig.etf, 값은 모두 '퍼센트 숫자'로 정규화됨)
   const etf = sig.etf;
   const etfBlock = (sig.is_etf && etf) ? (() => {
-    const cur2 = (stocks[ticker] && stocks[ticker].currency) || 'USD';
     const row = (k, v) => (v == null || v === '') ? '' : indItem(k, v);
     const signed = (v, d = 1) => v == null ? null
       : `<span style="color:${v >= 0 ? 'var(--green)' : 'var(--red)'}">${v > 0 ? '+' : ''}${v.toFixed(d)}%</span>`;
@@ -1660,7 +1650,6 @@ function renderCompareTable() {
 }
 
 // ---- 차트 ----
-let barCharts = {};
 
 function renderCharts() {
   const tickers = orderedTickers();
