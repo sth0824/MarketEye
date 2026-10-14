@@ -303,20 +303,21 @@ _NAVER_BAR_RE = re.compile(r'data="(\d{8})\|([\d.]+)\|([\d.]+)\|([\d.]+)\|([\d.]
 
 
 def _parse_naver_daily(text):
-    """fchart XML → Close/High/Low/Volume DataFrame(DatetimeIndex, 오름차순). 봉이 없으면 ValueError."""
+    """fchart XML → Open/Close/High/Low/Volume DataFrame(DatetimeIndex, 오름차순). 봉이 없으면 ValueError."""
     dates, rows = [], []
-    for d, _o, h, l, c, v in _NAVER_BAR_RE.findall(text):
+    for d, o, h, l, c, v in _NAVER_BAR_RE.findall(text):
         c = float(c)
         if c <= 0:
             continue
         # 거래정지일 등은 고·저가가 0으로 올 수 있어 종가로 메운다(지표 계산 오염 방지).
         h = float(h) or c
         l = float(l) or c
+        o = float(o) or c
         dates.append(pd.Timestamp(d))
-        rows.append((c, max(h, c), min(l, c), float(v)))
+        rows.append((o, c, max(h, c, o), min(l, c, o), float(v)))
     if not rows:
         raise ValueError('네이버 일봉 응답에 봉 데이터 없음')
-    df = pd.DataFrame(rows, columns=['Close', 'High', 'Low', 'Volume'], index=pd.DatetimeIndex(dates))
+    df = pd.DataFrame(rows, columns=['Open', 'Close', 'High', 'Low', 'Volume'], index=pd.DatetimeIndex(dates))
     return df.sort_index()
 
 

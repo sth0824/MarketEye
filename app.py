@@ -24,6 +24,7 @@ from providers import (
     _fetch_stock, _calc_per_pbr, _fetch_naver, _fetch_naver_daily, _fetch_naver_fundamentals, _fill_missing, _fetch_ranking, RANK_SORTS, RANK_MARKETS, _is_etf_type, _etf_overview,
 )
 # 순수 신호 엔진은 signals.py로 분리 (동작 동일). app.py는 라우트·조립 담당.
+import paper
 from signals import (
     safe_val,
     _technical_signal,
@@ -789,36 +790,96 @@ def _sb_error(e):
     status = 504 if isinstance(e, TimeoutError) else 502
     return jsonify({'success': False, 'error': f'동기화 서버(Supabase) 응답 실패: {e}'}), status
 
-@app.route('/api/sync/<code>', methods=['GET'])
-def sync_get(code):
-    if not _sync_enabled():
-        return jsonify({'success': False, 'error': '동기화가 서버에 설정되지 않았습니다'}), 503
+def _sync_code(code):
     code = (code or '').strip()
+    if not _sync_enabled():
+        return None, (jsonify({'success': False, 'error': '동기화가 서버에 설정되지 않았습니다'}), 503)
     if not code:
-        return jsonify({'success': False, 'error': '코드가 비어 있습니다'}), 400
+        return None, (jsonify({'success': False, 'error': '코드가 비어 있습니다'}), 400)
+    return code, None
+
+
+def _sync_load(row_code):
     try:
-        r = _sb_request('GET', 'GET', params={'code': f'eq.{code}', 'select': 'data', 'limit': '1'})
+        r = _sb_request('GET', 'GET', params={'code': f'eq.{row_code}', 'select': 'data', 'limit': '1'})
         rows = r.json()
         return jsonify({'success': True, 'data': rows[0]['data'] if rows else None})
     except Exception as e:
         return _sb_error(e)
 
-@app.route('/api/sync/<code>', methods=['PUT'])
-def sync_put(code):
-    if not _sync_enabled():
-        return jsonify({'success': False, 'error': '동기화가 서버에 설정되지 않았습니다'}), 503
-    code = (code or '').strip()
-    if not code:
-        return jsonify({'success': False, 'error': '코드가 비어 있습니다'}), 400
-    payload = request.get_json(silent=True) or {}
-    data = payload.get('data')
+
+def _sync_save(row_code):
+    data = (request.get_json(silent=True) or {}).get('data')
     try:
         # code를 기준으로 upsert (있으면 갱신, 없으면 삽입)
         _sb_request('POST', 'PUT', headers={'Prefer': 'resolution=merge-duplicates'},
-                    json=[{'code': code, 'data': data}])
+                    json=[{'code': row_code, 'data': data}])
         return jsonify({'success': True})
     except Exception as e:
         return _sb_error(e)
+
+
+@app.route('/api/sync/<code>', methods=['GET', 'PUT'])
+def sync(code):
+    code, err = _sync_code(code)
+    if err:
+        return err
+    return _sync_load(code) if request.method == 'GET' else _sync_save(code)
+
+
+# 모의투자 계좌는 관심종목과 같은 테이블의 별도 행('<코드>::paper')에 저장한다.
+# 같은 행에 섞으면 구버전 화면(캐시된 index.html)이 그룹만 저장하면서 계좌를 지워버린다.
+@app.route('/api/paper/account/<code>', methods=['GET', 'PUT'])
+def paper_account(code):
+    code, err = _sync_code(code)
+    if err:
+        return err
+    row = f'{code}::paper'
+    return _sync_load(row) if request.method == 'GET' else _sync_save(row)
+
+
+def _parse_at(s):
+    """ISO 시각 문자열 → tz-aware datetime. 시간대가 없으면 한국시간으로 본다."""
+    dt = datetime.fromisoformat((s or '').replace('Z', '+00:00'))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo('Asia/Seoul'))
+    return dt
+
+
+@app.route('/api/paper/quote')
+def paper_quote():
+    """지정 시각(at)에 시장가 주문을 냈을 때의 체결가·체결시각·그 시점 차트 점수."""
+    ticker = (request.args.get('ticker') or '').strip().upper()
+    if not ticker:
+        return jsonify({'success': False, 'error': 'ticker가 필요합니다'}), 400
+    try:
+        at = _parse_at(request.args.get('at')) if request.args.get('at') else datetime.now(ZoneInfo('UTC'))
+    except ValueError:
+        return jsonify({'success': False, 'error': 'at은 ISO 시각이어야 합니다 (예: 2026-10-14T10:30+09:00)'}), 400
+    try:
+        with timed(f'모의투자 체결가 {ticker} @ {at.isoformat()}'):
+            data = paper.price_at(ticker, at)
+        return jsonify({'success': True, 'data': data})
+    except ValueError as e:
+        return jsonify({'success': False, 'error': str(e)}), 422
+    except Exception as e:
+        return _error_response(f'모의투자 체결가 {ticker}', e)
+
+
+@app.route('/api/paper/evaluate', methods=['POST'])
+def paper_evaluate():
+    """체결된 매수들의 현재 수익·지수 대비 초과수익·20거래일 수익·목표/손절 도달 여부."""
+    lots = (request.get_json(silent=True) or {}).get('lots') or []
+    lots = [l for l in lots if isinstance(l, dict) and l.get('id') and l.get('ticker')
+            and l.get('fill_date') and l.get('price')][:200]
+    if not lots:
+        return jsonify({'success': True, 'data': {}})
+    try:
+        with timed(f'모의투자 평가 {len(lots)}건'):
+            data = paper.evaluate(lots)
+        return jsonify({'success': True, 'data': data})
+    except Exception as e:
+        return _error_response('모의투자 평가', e)
 
 
 # keep-alive 핑/상태 점검용 — 외부 의존(yfinance·Supabase) 없이 즉시 응답한다.
