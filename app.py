@@ -733,14 +733,15 @@ def ranking():
     market = request.args.get('market', 'kr')
     sort = request.args.get('sort', 'value')
     if market not in RANK_MARKETS or sort not in RANK_SORTS:
-        return jsonify({'success': False, 'error': 'market=kr|us, sort=value|volume|up|down|cap'}), 400
-    key = f'{market}:{sort}'
+        return jsonify({'success': False, 'error': 'market=kr|us, sort=value|volume|up|down|cap, etf=exclude(선택)'}), 400
+    no_etf = request.args.get('etf') == 'exclude'
+    key = f'{market}:{sort}' + (':noetf' if no_etf else '')
     cached = _cache_get(('ranking', key), RANK_TTL)
     if cached is not None:
         return jsonify({'success': True, 'data': cached})
     try:
         with timed(f'랭킹 {key}', warn_ms=3000, slow_ms=6000):
-            data = _fetch_ranking(market, sort)
+            data = _fetch_ranking(market, sort, no_etf=no_etf)
         _cache_set(('ranking', key), data)
         return jsonify({'success': True, 'data': data})
     except Exception as e:

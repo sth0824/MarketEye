@@ -527,6 +527,7 @@ def _rank_row(st, market):
         'chart': st.get('stockMiniImageChart') or (st.get('imageCharts') or {}).get('mini'),
         'logo': st.get('itemLogoPngUrl'),
         'etf': (st.get('stockEndType') or '').lower() == 'etf',
+        'etn': (st.get('stockEndType') or '').lower() == 'etn',
         'currency': (st.get('currencyType') or {}).get('code') or ('KRW' if market == 'kr' else 'USD'),
     }
 
@@ -538,9 +539,10 @@ def _fetch_rank_list(market, venue, path, size):
     return [row for row in (_rank_row(st, market) for st in (r.json() or {}).get('stocks') or []) if row]
 
 
-def _fetch_ranking(market, sort, limit=30):
+def _fetch_ranking(market, sort, limit=30, no_etf=False):
     """국내/미국 전체 랭킹 상위 limit개. 정렬 경로가 없으면(4xx 등) 시가총액 상위 목록을
-    받아 같은 기준으로 재정렬해 근사한다(대형주 중심이지만 화면은 계속 뜬다)."""
+    받아 같은 기준으로 재정렬해 근사한다(대형주 중심이지만 화면은 계속 뜬다).
+    no_etf면 ETF를 빼고 상위 limit개를 채운다(거래대금 상위는 절반이 ETF라 넉넉히 받는다)."""
     path, key, desc = RANK_SORTS[sort]
     venues = RANK_MARKETS[market]
 
@@ -555,7 +557,7 @@ def _fetch_ranking(market, sort, limit=30):
                     errs.append(f'{v}: {e}')
         return rows, errs
 
-    rows, errs = collect(path, limit)
+    rows, errs = collect(path, 100 if no_etf else limit)
     approx = False
     if not rows and path != 'marketValue':
         log(f'랭킹 {market}/{path} 실패 → 시가총액 목록으로 근사: {errs}', 'WARN')
@@ -565,6 +567,8 @@ def _fetch_ranking(market, sort, limit=30):
         raise RuntimeError(f'랭킹 조회 실패: {"; ".join(errs)}')
     seen, uniq = set(), []
     for r in rows:
+        if no_etf and (r['etf'] or r['etn']):
+            continue
         if r['ticker'] not in seen:
             seen.add(r['ticker']); uniq.append(r)
     uniq.sort(key=lambda r: (r[key] is None, -(r[key] or 0) if desc else (r[key] or 0)))

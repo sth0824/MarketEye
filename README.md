@@ -35,7 +35,7 @@ python3 app.py            # http://localhost:5001 에서 API 제공
 | `GET /api/search?q=` | 종목 검색 (KRX 로컬 + 야후 글로벌) |
 | `GET /api/stock/<ticker>` | 종목 전체 데이터 (재무·밸류에이션·히스토리) |
 | `GET /api/price/<ticker>` | 가격·등락률만 (자동 새로고침용 경량) |
-| `GET /api/ranking?market=kr\|us&sort=value\|volume\|up\|down\|cap` | 실시간 랭킹 (네이버, 국내=코스피+코스닥·미국=나스닥+NYSE, 30초 캐시) |
+| `GET /api/ranking?market=kr\|us&sort=value\|volume\|up\|down\|cap[&etf=exclude]` | 실시간 랭킹 (네이버, 국내=코스피+코스닥·미국=나스닥+NYSE, 30초 캐시, `etf=exclude`면 ETF·ETN 빼고 상위 30) |
 | `GET /api/paper/quote?ticker=&at=<ISO>` | 모의투자 체결가 — 장중=그 시각 가격(실시간·분봉·일봉 보간), 장전=당일 시가, 장후·휴장=다음 거래일 시가, 미래=대기 + 그 시점 차트 점수 |
 | `POST /api/paper/evaluate` | 체결된 매수들의 현재 수익·지수 대비 초과수익·20거래일 수익·목표/손절 도달 |
 | `GET·PUT /api/paper/account/<code>` | 모의투자 계좌 저장 (Supabase `watchlists` 테이블의 `<코드>::paper` 행) |

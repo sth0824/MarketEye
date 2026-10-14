@@ -103,6 +103,8 @@
   .rank-chip { background: var(--surface2); border: 1px solid var(--border); color: var(--muted); padding: 6px 14px; border-radius: 20px; cursor: pointer; font-size: 13px; }
   .rank-chip:hover { color: var(--text); }
   .rank-chip.active { background: var(--text); color: var(--bg); border-color: var(--text); font-weight: 700; }
+  .rank-toggle { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; font-size: 13px; color: var(--muted); cursor: pointer; user-select: none; }
+  .rank-toggle input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
   .rank-list { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
   .rank-row { display: grid; grid-template-columns: 28px 36px minmax(0, 1fr) 80px auto 32px; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; border-bottom: 1px solid var(--border); }
   .rank-row:last-child { border-bottom: none; }
@@ -1891,10 +1893,17 @@ const RANK_SORTS = [
   { id: 'up', label: '상승' }, { id: 'down', label: '하락' }, { id: 'cap', label: '시가총액' },
 ];
 let rankSort = 'value';
-const rankData = {};      // 'kr:value' → { rows, approx, stale, at, error }
+// ETF 제외 여부는 이 기기에 기억한다(랭킹 보는 습관이라 동기화까지는 불필요).
+let rankNoEtf = (() => { try { return localStorage.getItem('marketeye_rank_noetf') === '1'; } catch (e) { return false; } })();
+const rankData = {};      // 'kr:value:all' → { rows, approx, stale, at, error }
 let rankLoading = null;
-function rankKey() { return `${selectedMarket}:${rankSort}`; }
+function rankKey() { return `${selectedMarket}:${rankSort}:${rankNoEtf ? 'noetf' : 'all'}`; }
 function setRankSort(id) { if (id !== rankSort) { rankSort = id; renderRanking(); } }
+function toggleRankEtf() {
+  rankNoEtf = !rankNoEtf;
+  try { localStorage.setItem('marketeye_rank_noetf', rankNoEtf ? '1' : '0'); } catch (e) {}
+  renderRanking();
+}
 
 async function fetchRanking(force) {
   const key = rankKey();
@@ -1902,8 +1911,8 @@ async function fetchRanking(force) {
   if (rankLoading === key || (!force && cur && !cur.error && Date.now() - cur.at < 25000)) return;
   rankLoading = key;
   try {
-    const [market, sort] = key.split(':');
-    const res = await apiFetch(`${API}/ranking?market=${market}&sort=${sort}`, {}, 20000);
+    const [market, sort, etf] = key.split(':');
+    const res = await apiFetch(`${API}/ranking?market=${market}&sort=${sort}${etf === 'noetf' ? '&etf=exclude' : ''}`, {}, 20000);
     const json = await res.json();
     if (!json.success) throw new Error(json.error || '랭킹을 불러오지 못했어요');
     rankData[key] = { ...json.data, stale: !!json.stale, at: Date.now() };
@@ -1939,12 +1948,13 @@ function drawRanking() {
   const d = rankData[rankKey()];
   const mLabel = selectedMarket === 'kr' ? '국내' : '미국';
   const chips = RANK_SORTS.map(o =>
-    `<button class="rank-chip ${o.id === rankSort ? 'active' : ''}" onclick="setRankSort('${o.id}')">${o.label}</button>`).join('');
+    `<button class="rank-chip ${o.id === rankSort ? 'active' : ''}" onclick="setRankSort('${o.id}')">${o.label}</button>`).join('')
+    + `<label class="rank-toggle" title="ETF·ETN을 빼고 개별 종목만 순위 매기기"><input type="checkbox" ${rankNoEtf ? 'checked' : ''} onchange="toggleRankEtf()"> ETF 제외</label>`;
   let meta = '';
   if (d && d.at) {
     const t = new Date(d.at);
     meta = `${mLabel} · ${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')} 기준`
-      + (d.stale ? ' · 직전 데이터' : '') + (d.approx ? ' · 시가총액 상위 기준 근사' : '');
+      + (rankNoEtf ? ' · ETF 제외' : '') + (d.stale ? ' · 직전 데이터' : '') + (d.approx ? ' · 시가총액 상위 기준 근사' : '');
   } else meta = mLabel;
   let body;
   if (d && d.rows && d.rows.length) {
