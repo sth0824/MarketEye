@@ -472,6 +472,104 @@ def _fill_missing(dst, src):
             dst[k] = v
 
 
+# ── 실시간 랭킹 (네이버 증권 목록) ─────────────────────────────────────
+# 국내: m.stock.naver.com/api/stocks/{정렬}/{KOSPI|KOSDAQ}, 해외: api.stock.naver.com/stock/
+# exchange/{NASDAQ|NYSE}/{정렬}. 응답 stocks[] 의 *Raw 필드(원·주 단위 숫자)를 쓴다.
+# 시장별 목록을 받아 합친 뒤 같은 기준으로 다시 정렬해 '국내 전체 / 미국 전체' 순위를 만든다.
+RANK_SORTS = {          # 화면 정렬 → (네이버 정렬 경로, 재정렬 키, 내림차순)
+    'value':  ('priceTop',    'tradingValue', True),    # 거래대금
+    'volume': ('quantTop',    'volume',       True),    # 거래량
+    'up':     ('up',          'changePct',    True),    # 상승률
+    'down':   ('down',        'changePct',    False),   # 하락률
+    'cap':    ('marketValue', 'marketCap',    True),    # 시가총액
+}
+RANK_MARKETS = {'kr': ('KOSPI', 'KOSDAQ'), 'us': ('NASDAQ', 'NYSE')}
+
+
+def _rank_url(market, venue, path, size):
+    if market == 'kr':
+        return f'https://m.stock.naver.com/api/stocks/{path}/{venue}?page=1&pageSize={size}'
+    return f'https://api.stock.naver.com/stock/exchange/{venue}/{path}?page=1&pageSize={size}'
+
+
+def _rank_ticker(st, market):
+    """네이버 종목 → 앱 티커(국내 005930.KS/.KQ, 해외 AAPL)."""
+    if market == 'kr':
+        code = st.get('itemCode') or ''
+        ex = ((st.get('stockExchangeType') or {}).get('code') or '').upper()
+        if ex not in ('KS', 'KQ'):
+            ex = 'KQ' if str(st.get('sosok')) == '1' else 'KS'
+        return f'{code}.{ex}' if code else None
+    # 해외: symbolCode(AAPL). 클래스주(BRK.B)는 야후 표기(BRK-B)로 맞춘다.
+    sym = st.get('symbolCode') or (st.get('reutersCode') or '').rsplit('.', 1)[0] or st.get('itemCode')
+    return sym.upper().replace('.', '-') if sym else None
+
+
+def _rank_row(st, market):
+    raw = lambda k: _naver_num(st.get(k + 'Raw')) if st.get(k + 'Raw') is not None else _naver_num(st.get(k))
+    ticker = _rank_ticker(st, market)
+    if not ticker:
+        return None
+    return {
+        'ticker': ticker,
+        'name': st.get('stockName') or st.get('stockNameEng') or ticker,
+        'price': raw('closePrice'),
+        'change': raw('compareToPreviousClosePrice'),
+        'changePct': _naver_num(st.get('fluctuationsRatio')),
+        'volume': raw('accumulatedTradingVolume'),
+        'tradingValue': raw('accumulatedTradingValue'),
+        # 국내 '2조 4,520억원' / 해외 '190억 USD'(해외 응답의 accumulatedTradingValue는 이미 표기 문자열)
+        'tradingValueText': (st.get('accumulatedTradingValueKrwHangeul') if market == 'kr'
+                             else st.get('accumulatedTradingValue')),
+        'marketCap': raw('marketValue'),
+        'marketCapText': st.get('marketValueHangeul'),
+        'chart': st.get('stockMiniImageChart') or (st.get('imageCharts') or {}).get('mini'),
+        'logo': st.get('itemLogoPngUrl'),
+        'etf': (st.get('stockEndType') or '').lower() == 'etf',
+        'currency': (st.get('currencyType') or {}).get('code') or ('KRW' if market == 'kr' else 'USD'),
+    }
+
+
+def _fetch_rank_list(market, venue, path, size):
+    with timed(f'네이버 랭킹 {venue}/{path}', warn_ms=2000, slow_ms=4000):
+        r = requests.get(_rank_url(market, venue, path, size), headers=_NAVER_HEADERS, timeout=5)
+    r.raise_for_status()
+    return [row for row in (_rank_row(st, market) for st in (r.json() or {}).get('stocks') or []) if row]
+
+
+def _fetch_ranking(market, sort, limit=30):
+    """국내/미국 전체 랭킹 상위 limit개. 정렬 경로가 없으면(4xx 등) 시가총액 상위 목록을
+    받아 같은 기준으로 재정렬해 근사한다(대형주 중심이지만 화면은 계속 뜬다)."""
+    path, key, desc = RANK_SORTS[sort]
+    venues = RANK_MARKETS[market]
+
+    def collect(p, size):
+        rows, errs = [], []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(venues)) as ex:
+            futs = {ex.submit(_fetch_rank_list, market, v, p, size): v for v in venues}
+            for f, v in futs.items():
+                try:
+                    rows += f.result()
+                except Exception as e:
+                    errs.append(f'{v}: {e}')
+        return rows, errs
+
+    rows, errs = collect(path, limit)
+    approx = False
+    if not rows and path != 'marketValue':
+        log(f'랭킹 {market}/{path} 실패 → 시가총액 목록으로 근사: {errs}', 'WARN')
+        rows, errs = collect('marketValue', 100)
+        approx = True
+    if not rows:
+        raise RuntimeError(f'랭킹 조회 실패: {"; ".join(errs)}')
+    seen, uniq = set(), []
+    for r in rows:
+        if r['ticker'] not in seen:
+            seen.add(r['ticker']); uniq.append(r)
+    uniq.sort(key=lambda r: (r[key] is None, -(r[key] or 0) if desc else (r[key] or 0)))
+    return {'rows': uniq[:limit], 'approx': approx}
+
+
 def _yahoo_search(query):
     url = 'https://query1.finance.yahoo.com/v1/finance/search'
     params = {'q': query, 'lang': 'en-US', 'region': 'US',

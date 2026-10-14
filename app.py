@@ -21,7 +21,7 @@ from infra import (
 # 외부 데이터 수집층(KRX·네이버·야후 조회)은 providers.py로 분리.
 from providers import (
     _search_krx, _is_korean, _yahoo_search, _search_etf_aliases,
-    _fetch_stock, _calc_per_pbr, _fetch_naver, _fetch_naver_daily, _fetch_naver_fundamentals, _fill_missing, _is_etf_type, _etf_overview,
+    _fetch_stock, _calc_per_pbr, _fetch_naver, _fetch_naver_daily, _fetch_naver_fundamentals, _fill_missing, _fetch_ranking, RANK_SORTS, RANK_MARKETS, _is_etf_type, _etf_overview,
 )
 # 순수 신호 엔진은 signals.py로 분리 (동작 동일). app.py는 라우트·조립 담당.
 from signals import (
@@ -720,6 +720,30 @@ def backtest(ticker):
         log(f'backtest {ticker} 실패: {e}', 'ERROR')
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# 실시간 랭킹(거래대금·거래량·상승·하락·시가총액) — 네이버 목록 기반. 짧게 캐시해
+# 여러 탭·자동 새로고침이 몰려도 네이버 호출은 RANK_TTL초에 한 번으로 묶는다.
+RANK_TTL = int(os.environ.get('RANK_TTL', '30'))
+
+
+@app.route('/api/ranking')
+def ranking():
+    market = request.args.get('market', 'kr')
+    sort = request.args.get('sort', 'value')
+    if market not in RANK_MARKETS or sort not in RANK_SORTS:
+        return jsonify({'success': False, 'error': 'market=kr|us, sort=value|volume|up|down|cap'}), 400
+    key = f'{market}:{sort}'
+    cached = _cache_get(('ranking', key), RANK_TTL)
+    if cached is not None:
+        return jsonify({'success': True, 'data': cached})
+    try:
+        with timed(f'랭킹 {key}', warn_ms=3000, slow_ms=6000):
+            data = _fetch_ranking(market, sort)
+        _cache_set(('ranking', key), data)
+        return jsonify({'success': True, 'data': data})
+    except Exception as e:
+        return _stale_or_error('ranking', key, e)
 
 
 # 개인 동기화 코드(code)별로 그룹 데이터를 Supabase 테이블에 저장한다.

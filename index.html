@@ -94,6 +94,37 @@
   .neutral { color: var(--muted); }
   .card-remove { position: absolute; top: 10px; right: 10px; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 16px; padding: 2px 6px; border-radius: 4px; }
   .card-remove:hover { background: var(--surface2); color: var(--red); }
+
+  /* ── 실시간 랭킹 ── */
+  .rank-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; }
+  .rank-head h2 { font-size: 18px; font-weight: 700; }
+  .rank-meta { font-size: 12px; color: var(--muted); }
+  .rank-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .rank-chip { background: var(--surface2); border: 1px solid var(--border); color: var(--muted); padding: 6px 14px; border-radius: 20px; cursor: pointer; font-size: 13px; }
+  .rank-chip:hover { color: var(--text); }
+  .rank-chip.active { background: var(--text); color: var(--bg); border-color: var(--text); font-weight: 700; }
+  .rank-list { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .rank-row { display: grid; grid-template-columns: 28px 36px minmax(0, 1fr) 80px auto 32px; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; border-bottom: 1px solid var(--border); }
+  .rank-row:last-child { border-bottom: none; }
+  .rank-row:hover { background: var(--surface2); }
+  .rank-no { font-weight: 700; text-align: center; color: var(--muted); }
+  .rank-row:nth-child(-n+3) .rank-no { color: var(--text); }
+  .rank-logo { width: 32px; height: 32px; border-radius: 50%; background: var(--surface2); object-fit: cover; }
+  .rank-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rank-name .rank-etf { font-size: 10px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; margin-left: 4px; vertical-align: middle; }
+  .rank-sub { font-size: 12px; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rank-spark { width: 80px; height: 32px; object-fit: contain; }
+  .rank-price { text-align: right; white-space: nowrap; }
+  .rank-price b { font-size: 15px; }
+  .rank-price div { font-size: 12px; margin-top: 2px; }
+  .rank-fav { background: none; border: none; color: var(--muted); font-size: 18px; cursor: pointer; padding: 4px; }
+  .rank-fav.on { color: var(--yellow); }
+  .rank-empty { padding: 32px; text-align: center; color: var(--muted); }
+  .rank-empty button { margin-top: 12px; }
+  @media (max-width: 600px) {
+    .rank-spark { display: none; }
+    .rank-row { grid-template-columns: 22px 30px minmax(0, 1fr) auto 28px; gap: 8px; padding: 10px; }
+  }
   .card-fav { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; padding: 0; line-height: 1; flex-shrink: 0; }
   .card-fav:hover { color: var(--yellow); }
   .card-fav.on { color: var(--yellow); }
@@ -196,6 +227,10 @@
 
     /* 그룹 바 스크롤 */
     #group-bar { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 4px; -webkit-overflow-scrolling: touch; }
+    /* 탭이 5개라 폰 폭을 넘는다 → 페이지 대신 탭 줄만 가로 스크롤 */
+    .tabs { overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+    .tabs::-webkit-scrollbar { display: none; }
+    .tab-btn { flex-shrink: 0; white-space: nowrap; padding: 8px 12px; margin-bottom: 0; }
     #group-bar::-webkit-scrollbar { display: none; }
     .group-pill, .group-add { flex-shrink: 0; white-space: nowrap; }
     .group-pill span:first-child { white-space: nowrap; }
@@ -256,6 +291,7 @@
     <button class="tab-btn" onclick="switchTab('compare')">비교 테이블</button>
     <button class="tab-btn" onclick="switchTab('charts')">차트</button>
     <button class="tab-btn" onclick="switchTab('signal')">📈 진입 신호</button>
+    <button class="tab-btn" onclick="switchTab('ranking')">🔥 실시간 랭킹</button>
   </div>
 
   <div id="tab-overview">
@@ -288,6 +324,10 @@
 
   <div id="tab-signal" style="display:none">
     <div id="signal-section"><p class="signal-loading">종목을 추가하면 진입 신호가 표시됩니다.</p></div>
+  </div>
+
+  <div id="tab-ranking" style="display:none">
+    <div id="ranking-section"></div>
   </div>
 </main>
 
@@ -575,7 +615,8 @@ function startRefreshLoop() {
     document.getElementById('refresh-countdown').textContent = countdown + 's';
     if (countdown <= 0) {
       countdown = REFRESH_SEC;
-      refreshPrices();
+      if (activeTab === 'ranking') fetchRanking(true);
+      else refreshPrices();
     }
   }, 1000);
 }
@@ -1409,6 +1450,7 @@ function renderAll() {
   else if (activeTab === 'compare') renderCompareTable();
   else if (activeTab === 'charts') renderCharts();
   else if (activeTab === 'signal') renderSignalTab();
+  else if (activeTab === 'ranking') renderRanking();
 }
 
 function renderLoadingCard(ticker) {
@@ -1752,14 +1794,133 @@ function renderCharts() {
 // ---- 탭 전환 ----
 function switchTab(tab) {
   activeTab = tab;
-  const TABS = ['overview','compare','charts','signal'];
+  const TABS = ['overview','compare','charts','signal','ranking'];
   TABS.forEach(t => {
     document.getElementById(`tab-${t}`).style.display = t === tab ? '' : 'none';
   });
   document.querySelectorAll('.tab-btn').forEach((btn, i) => {
     btn.classList.toggle('active', TABS[i] === tab);
   });
+  // 랭킹은 그룹과 무관(시장 전체) → 그룹 바를 숨긴다. 국내/미국은 시장 바로 전환.
+  document.getElementById('group-bar').style.display = tab === 'ranking' ? 'none' : '';
   renderAll();
+}
+
+// ---- 실시간 랭킹 (네이버 목록 기반, 서버 30초 캐시) ----
+// 국내/미국은 상단 시장 바(selectedMarket)를 따른다. 행을 누르면 빠른 조회로 열고,
+// ☆는 즐겨찾기 토글. 실패해도 직전 목록을 유지하고, 처음부터 실패면 '다시 시도' 카드.
+const RANK_SORTS = [
+  { id: 'value', label: '거래대금' }, { id: 'volume', label: '거래량' },
+  { id: 'up', label: '상승' }, { id: 'down', label: '하락' }, { id: 'cap', label: '시가총액' },
+];
+let rankSort = 'value';
+const rankData = {};      // 'kr:value' → { rows, approx, stale, at, error }
+let rankLoading = null;
+function rankKey() { return `${selectedMarket}:${rankSort}`; }
+function setRankSort(id) { if (id !== rankSort) { rankSort = id; renderRanking(); } }
+
+async function fetchRanking(force) {
+  const key = rankKey();
+  const cur = rankData[key];
+  if (rankLoading === key || (!force && cur && !cur.error && Date.now() - cur.at < 25000)) return;
+  rankLoading = key;
+  try {
+    const [market, sort] = key.split(':');
+    const res = await apiFetch(`${API}/ranking?market=${market}&sort=${sort}`, {}, 20000);
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error || '랭킹을 불러오지 못했어요');
+    rankData[key] = { ...json.data, stale: !!json.stale, at: Date.now() };
+  } catch (e) {
+    rankData[key] = { ...(rankData[key] || { rows: [], at: 0 }), error: e.message };
+  } finally {
+    if (rankLoading === key) rankLoading = null;
+  }
+  if (activeTab === 'ranking' && rankKey() === key) drawRanking();
+}
+
+function renderRanking() { drawRanking(); fetchRanking(false); }
+
+function _rankNum(v, cur) {
+  if (v == null) return '-';
+  return cur === 'KRW' ? Math.round(v).toLocaleString() : v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function _rankCount(n) {   // 거래량(주) → '66.5억주' / '1,032만주'
+  if (n == null) return '-';
+  if (n >= 1e8) return (n / 1e8).toFixed(1) + '억주';
+  if (n >= 1e4) return Math.round(n / 1e4).toLocaleString() + '만주';
+  return Math.round(n).toLocaleString() + '주';
+}
+function _rankSub(r) {
+  if (rankSort === 'volume') return `거래량 ${_rankCount(r.volume)}`;
+  if (rankSort === 'cap') return `시가총액 ${r.marketCapText || '-'}`;
+  return `거래대금 ${r.tradingValueText || '-'}`;
+}
+
+function drawRanking() {
+  const box = document.getElementById('ranking-section');
+  if (!box) return;
+  const d = rankData[rankKey()];
+  const mLabel = selectedMarket === 'kr' ? '국내' : '미국';
+  const chips = RANK_SORTS.map(o =>
+    `<button class="rank-chip ${o.id === rankSort ? 'active' : ''}" onclick="setRankSort('${o.id}')">${o.label}</button>`).join('');
+  let meta = '';
+  if (d && d.at) {
+    const t = new Date(d.at);
+    meta = `${mLabel} · ${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')} 기준`
+      + (d.stale ? ' · 직전 데이터' : '') + (d.approx ? ' · 시가총액 상위 기준 근사' : '');
+  } else meta = mLabel;
+  let body;
+  if (d && d.rows && d.rows.length) {
+    body = '<div class="rank-list">' + d.rows.map((r, i) => {
+      const cls = r.changePct > 0 ? 'up' : r.changePct < 0 ? 'down' : 'neutral';
+      const cur = r.currency === 'KRW' ? '' : '$';
+      // 부호는 통화기호 앞에: +$2.20 / -$2.40 / -6,000
+      const sgn = v => v > 0 ? '+' : v < 0 ? '-' : '';
+      const chg = r.change == null ? '-' : `${sgn(r.change)}${cur}${_rankNum(Math.abs(r.change), r.currency)}`;
+      const pct = r.changePct == null ? '-' : `${sgn(r.changePct)}${Math.abs(r.changePct).toFixed(2)}%`;
+      const fav = isFav(r.ticker);
+      const t = esc(r.ticker);
+      return `<div class="rank-row" onclick="openRankTicker('${t}')" title="${t} — 눌러서 상세 보기">
+        <div class="rank-no">${i + 1}</div>
+        ${r.logo ? `<img class="rank-logo" src="${esc(r.logo)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">` : '<div class="rank-logo"></div>'}
+        <div style="min-width:0">
+          <div class="rank-name">${esc(r.name)}${r.etf ? '<span class="rank-etf">ETF</span>' : ''}</div>
+          <div class="rank-sub">${esc(_rankSub(r))}</div>
+        </div>
+        ${r.chart ? `<img class="rank-spark" src="${esc(r.chart)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">` : '<div class="rank-spark"></div>'}
+        <div class="rank-price">
+          <b>${cur}${_rankNum(r.price, r.currency)}</b>
+          <div class="${cls}">${chg} (${pct})</div>
+        </div>
+        <button class="rank-fav ${fav ? 'on' : ''}" onclick="event.stopPropagation();toggleRankFav('${t}')" title="${fav ? '즐겨찾기 해제' : '즐겨찾기 추가'}">${fav ? '★' : '☆'}</button>
+      </div>`;
+    }).join('') + '</div>';
+  } else if (d && d.error) {
+    body = `<div class="rank-list rank-empty">랭킹을 불러오지 못했어요<br><span style="font-size:12px">${esc(d.error)}</span><br>
+      <button class="secondary" onclick="fetchRanking(true)">다시 시도</button></div>`;
+  } else {
+    body = '<div class="rank-list rank-empty">불러오는 중...</div>';
+  }
+  box.innerHTML = `<div class="rank-head"><h2>실시간 랭킹</h2><span class="rank-meta">${esc(meta)}</span></div>
+    <div class="rank-chips">${chips}</div>${body}`;
+}
+
+function toggleRankFav(t) {
+  ensureFav();
+  toggleFav(t);
+  drawRanking();
+}
+
+// 랭킹 종목을 빠른 조회(저장 안 되는 임시 그룹)로 열어 카드·신호를 본다.
+function openRankTicker(t) {
+  ensureQuick();
+  const q = groups.find(g => g.id === QUICK_ID);
+  if (!q.tickers.includes(t)) q.tickers.push(t);
+  activeId = QUICK_ID;
+  saveState();
+  renderGroupBar();
+  switchTab('overview');
+  loadActiveGroup();
 }
 
 // ---- 유틸 ----
