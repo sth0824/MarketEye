@@ -159,7 +159,7 @@ def _breaker_record(timed_out):
                 f'(야후 호출 즉시 폴백)', 'WARN')
 
 
-def _run_with_timeout(fn, timeout, label):
+def _run_with_timeout(fn, timeout, label, hint='야후 차단/레이트리밋 의심(폴백 전환)'):
     """fn()을 데몬 스레드에서 실행하고 timeout초 안에 못 끝나면 TimeoutError.
     호출당 스레드라 공유 풀 고갈이 없고, 야후가 requests든 curl_cffi든 무엇으로
     매달리든 wall-clock 상한이 보장된다(막힌 스레드는 데몬이라 종료를 안 막음)."""
@@ -173,7 +173,7 @@ def _run_with_timeout(fn, timeout, label):
     th.start()
     th.join(timeout)
     if th.is_alive():
-        raise TimeoutError(f'{label} {timeout:.0f}s 무응답 — 야후 차단/레이트리밋 의심(폴백 전환)')
+        raise TimeoutError(f'{label} {timeout:.0f}s 무응답 — {hint}')
     if 'e' in box:
         raise box['e']
     return box.get('v')

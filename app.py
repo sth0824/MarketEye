@@ -15,7 +15,7 @@ except Exception:                    # 극단적 폴백(사실상 도달 안 함
 # 공용 인프라(로깅·타이밍·TTL 캐시·JSON 방어막)는 infra.py로 분리.
 from infra import (
     log, timed, set_tag, _req_seq,
-    _cache_get, _cache_set, _cache_get_stale, yf_call, is_rate_limited,
+    _cache_get, _cache_set, _cache_get_stale, yf_call, is_rate_limited, _run_with_timeout,
     SafeJSONProvider,
 )
 # 외부 데이터 수집층(KRX·네이버·야후 조회)은 providers.py로 분리.
@@ -738,6 +738,33 @@ def _sb_headers():
 def _sync_enabled():
     return bool(SUPABASE_URL and SUPABASE_KEY)
 
+# Supabase 호출의 전체(wall-clock) 상한(초). requests의 timeout은 연결·읽기 단계별 제한일 뿐
+# DNS 조회나 느린 응답 전체는 막지 못해, 프로젝트가 일시정지되면 /api/sync가 75초+ 매달려
+# 프론트가 '동기화 실패'까지 한참 걸리고 서버 스레드도 묶였다 → 상한을 넘기면 즉시 실패.
+SB_TIMEOUT = float(os.environ.get('SB_TIMEOUT', '12'))
+
+
+def _sb_request(method, label, **kw):
+    """Supabase REST 호출(하드 타임아웃·실패 로그). 성공 시 Response, 실패 시 예외."""
+    headers = {**_sb_headers(), **kw.pop('headers', {})}
+    t0 = time.time()
+    try:
+        r = _run_with_timeout(
+            lambda: requests.request(method, f'{SUPABASE_URL}/rest/v1/{SYNC_TABLE}',
+                                     headers=headers, timeout=10, **kw),
+            SB_TIMEOUT, f'supabase {label}', hint='Supabase 일시정지·장애 의심')
+        r.raise_for_status()
+        return r
+    except Exception as e:
+        log(f'supabase {label} 실패 {time.time() - t0:.1f}s: {type(e).__name__}: {e} '
+            f'(반복되면 Supabase 대시보드에서 프로젝트 Paused 여부 확인)', 'WARN')
+        raise
+
+
+def _sb_error(e):
+    status = 504 if isinstance(e, TimeoutError) else 502
+    return jsonify({'success': False, 'error': f'동기화 서버(Supabase) 응답 실패: {e}'}), status
+
 @app.route('/api/sync/<code>', methods=['GET'])
 def sync_get(code):
     if not _sync_enabled():
@@ -746,17 +773,11 @@ def sync_get(code):
     if not code:
         return jsonify({'success': False, 'error': '코드가 비어 있습니다'}), 400
     try:
-        r = requests.get(
-            f'{SUPABASE_URL}/rest/v1/{SYNC_TABLE}',
-            headers=_sb_headers(),
-            params={'code': f'eq.{code}', 'select': 'data', 'limit': '1'},
-            timeout=10,
-        )
-        r.raise_for_status()
+        r = _sb_request('GET', 'GET', params={'code': f'eq.{code}', 'select': 'data', 'limit': '1'})
         rows = r.json()
         return jsonify({'success': True, 'data': rows[0]['data'] if rows else None})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return _sb_error(e)
 
 @app.route('/api/sync/<code>', methods=['PUT'])
 def sync_put(code):
@@ -769,16 +790,11 @@ def sync_put(code):
     data = payload.get('data')
     try:
         # code를 기준으로 upsert (있으면 갱신, 없으면 삽입)
-        r = requests.post(
-            f'{SUPABASE_URL}/rest/v1/{SYNC_TABLE}',
-            headers={**_sb_headers(), 'Prefer': 'resolution=merge-duplicates'},
-            json=[{'code': code, 'data': data}],
-            timeout=10,
-        )
-        r.raise_for_status()
+        _sb_request('POST', 'PUT', headers={'Prefer': 'resolution=merge-duplicates'},
+                    json=[{'code': code, 'data': data}])
         return jsonify({'success': True})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return _sb_error(e)
 
 
 # keep-alive 핑/상태 점검용 — 외부 의존(yfinance·Supabase) 없이 즉시 응답한다.
@@ -797,17 +813,10 @@ def health_db():
     if not _sync_enabled():
         return jsonify({'ok': False, 'error': '동기화 미설정'}), 503
     try:
-        r = requests.get(
-            f'{SUPABASE_URL}/rest/v1/{SYNC_TABLE}',
-            headers=_sb_headers(),
-            params={'select': 'code', 'limit': '1'},
-            timeout=10,
-        )
-        r.raise_for_status()
+        _sb_request('GET', 'health', params={'select': 'code', 'limit': '1'})
         return jsonify({'ok': True})
     except Exception as e:
-        log(f'health/db Supabase 조회 실패: {e}', 'WARN')
-        return jsonify({'ok': False, 'error': str(e)}), 502
+        return jsonify({'ok': False, 'error': str(e)}), 504 if isinstance(e, TimeoutError) else 502
 
 
 # 프론트엔드(index.html) 서빙 — API와 같은 서버에서 제공
