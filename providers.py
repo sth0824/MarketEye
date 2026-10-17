@@ -539,10 +539,14 @@ def _fetch_rank_list(market, venue, path, size):
     return [row for row in (_rank_row(st, market) for st in (r.json() or {}).get('stocks') or []) if row]
 
 
-def _fetch_ranking(market, sort, limit=30, no_etf=False):
+RANK_LIMIT = int(os.environ.get('RANK_LIMIT', '100'))
+
+
+def _fetch_ranking(market, sort, limit=RANK_LIMIT, no_etf=False):
     """국내/미국 전체 랭킹 상위 limit개. 정렬 경로가 없으면(4xx 등) 시가총액 상위 목록을
     받아 같은 기준으로 재정렬해 근사한다(대형주 중심이지만 화면은 계속 뜬다).
-    no_etf면 ETF를 빼고 상위 limit개를 채운다(거래대금 상위는 절반이 ETF라 넉넉히 받는다)."""
+    no_etf면 ETF를 빼고 남은 것 중 상위 limit개(거래대금 상위는 ETF가 많아 limit보다 적을 수 있음).
+    시장별로 한 페이지(최대 100개)씩 받아 합친다. 큰 페이지가 거부되면 30개로 한 번 더 시도."""
     path, key, desc = RANK_SORTS[sort]
     venues = RANK_MARKETS[market]
 
@@ -557,7 +561,11 @@ def _fetch_ranking(market, sort, limit=30, no_etf=False):
                     errs.append(f'{v}: {e}')
         return rows, errs
 
-    rows, errs = collect(path, 100 if no_etf else limit)
+    size = min(100, max(limit, 100 if no_etf else limit))
+    rows, errs = collect(path, size)
+    if not rows and size > 30:
+        log(f'랭킹 {market}/{path} {size}개 요청 실패 → 30개로 재시도: {errs}', 'WARN')
+        rows, errs = collect(path, 30)
     approx = False
     if not rows and path != 'marketValue':
         log(f'랭킹 {market}/{path} 실패 → 시가총액 목록으로 근사: {errs}', 'WARN')

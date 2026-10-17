@@ -127,6 +127,32 @@
     .rank-spark { display: none; }
     .rank-row { grid-template-columns: 22px 30px minmax(0, 1fr) auto 28px; gap: 8px; padding: 10px; }
   }
+  /* 랭킹 옆 상세 패널 — 데스크톱은 화면을 좌우로 나누고, 모바일은 아래에서 올라오는 시트 */
+  #side-panel { position: fixed; top: 0; right: 0; bottom: 0; width: min(480px, 42vw); background: var(--bg); border-left: 1px solid var(--border); z-index: 150; display: none; flex-direction: column; box-shadow: -8px 0 24px rgba(0,0,0,.35); }
+  body.panel-open #side-panel { display: flex; }
+  body.panel-open main, body.panel-open header { margin-right: min(480px, 42vw); }
+  .sp-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--surface); }
+  .sp-head .rank-logo { flex-shrink: 0; }
+  .sp-title { flex: 1; min-width: 0; }
+  .sp-title b { font-size: 16px; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sp-title span { font-size: 12px; color: var(--muted); }
+  .sp-btn { background: none; border: 1px solid var(--border); color: var(--text); padding: 4px 10px; font-size: 14px; font-weight: 400; border-radius: 6px; flex-shrink: 0; }
+  .sp-btn.on { color: var(--yellow); }
+  .sp-close { font-size: 18px; line-height: 1; padding: 4px 10px; }
+  .sp-nav { display: flex; gap: 6px; padding: 8px 14px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); align-items: center; }
+  .sp-nav button { font-size: 12px; padding: 4px 10px; }
+  .sp-nav .sp-pos { flex: 1; text-align: center; }
+  #sp-body { flex: 1; overflow-y: auto; padding: 14px; }
+  #sp-body .signal-card { border: none; padding: 0; background: none; }
+  .sp-msg { padding: 40px 10px; text-align: center; color: var(--muted); line-height: 1.7; }
+  .rank-row.sel { background: var(--surface2); box-shadow: inset 3px 0 0 var(--accent); }
+  #panel-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 140; }
+  @media (max-width: 900px) {
+    #side-panel { top: auto; left: 0; width: auto; height: 86vh; border-left: none; border-top: 1px solid var(--border); border-radius: 14px 14px 0 0; box-shadow: 0 -8px 24px rgba(0,0,0,.45); }
+    body.panel-open main, body.panel-open header { margin-right: 0; }
+    body.panel-open #panel-backdrop { display: block; }   /* 시트 위 어두운 부분을 누르면 닫힘 */
+    .sp-head { border-radius: 14px 14px 0 0; }
+  }
   /* 모의투자 */
   .pp-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
   .pp-head h2 { font-size: 18px; font-weight: 700; }
@@ -403,6 +429,8 @@
   </div>
 </main>
 
+<div id="panel-backdrop" onclick="closeRankPanel()"></div>
+<aside id="side-panel" aria-label="종목 상세"></aside>
 <div id="error-toast"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -1095,9 +1123,11 @@ function renderSignalTab() {
   }).join('')}</div>`;
 }
 
-function renderSignalCard(ticker) {
-  const sig = signals[ticker];
-  const name = (stocks[ticker] && stocks[ticker].name) || ticker;
+// opt: 랭킹 옆 패널처럼 현재 그룹 밖 종목을 그릴 때 { sig, name, currency, btId }로 덮어쓴다.
+function renderSignalCard(ticker, opt = {}) {
+  const sig = opt.sig || signals[ticker];
+  const name = opt.name || (stocks[ticker] && stocks[ticker].name) || ticker;
+  const btId = opt.btId || `bt-${ticker}`;
   if (!sig) {
     return `<div class="signal-card">
       <div class="signal-name">${esc(name)}</div>
@@ -1190,7 +1220,7 @@ function renderSignalCard(ticker) {
 
   // 매매 플랜 (ATR 기반 손절·목표·손익비) — 진입만큼 중요한 청산/리스크
   const plan = sig.plan || {};
-  const cur = (stocks[ticker] && stocks[ticker].currency) || 'USD';
+  const cur = opt.currency || (stocks[ticker] && stocks[ticker].currency) || 'USD';
   const rrColor = plan.rr >= 2 ? 'var(--green)' : plan.rr >= 1 ? 'var(--yellow)' : 'var(--red)';
   const planHtml = (plan.stop != null && plan.target != null)
     ? `<div style="margin-top:12px;padding:10px;background:var(--surface2);border-radius:8px;font-size:12px">
@@ -1340,10 +1370,10 @@ function renderSignalCard(ticker) {
     ${reasonsHtml}
     <div style="margin-top:12px">
       <div style="display:flex;gap:6px">
-        <button class="secondary" style="font-size:12px;padding:6px 12px;flex:1" onclick="runBacktest('${ticker}')">📊 이 전략 5년 백테스트</button>
+        <button class="secondary" style="font-size:12px;padding:6px 12px;flex:1" onclick="runBacktest('${ticker}', '${btId}')">📊 이 전략 5년 백테스트</button>
         <button class="secondary" style="font-size:12px;padding:6px 12px;flex:1" onclick="openPaperOrder('${ticker}')">💼 모의투자 주문</button>
       </div>
-      <div id="bt-${ticker}" style="margin-top:8px"></div>
+      <div id="${btId}" style="margin-top:8px"></div>
     </div>
     ${sig.is_etf ? etfBlock : fundBlock}
   </div>`;
@@ -1387,8 +1417,8 @@ function bucketHtml(d) {
 }
 
 // 백테스트: 동일 매수 규칙을 과거 장기(기본 5년)에 적용한 성과를 카드 안에 표시
-async function runBacktest(ticker) {
-  const box = document.getElementById('bt-' + ticker);
+async function runBacktest(ticker, boxId) {
+  const box = document.getElementById(boxId || 'bt-' + ticker);
   if (!box) return;
   box.innerHTML = '<span style="color:var(--muted);font-size:12px">백테스트 계산 중… (수 초 소요)</span>';
   try {
@@ -1873,6 +1903,7 @@ function renderCharts() {
 // ---- 탭 전환 ----
 function switchTab(tab) {
   activeTab = tab;
+  if (tab !== 'ranking') closeRankPanel();   // 패널은 랭킹 전용
   const TABS = ['overview','compare','charts','signal','ranking','paper'];
   TABS.forEach(t => {
     document.getElementById(`tab-${t}`).style.display = t === tab ? '' : 'none';
@@ -1921,7 +1952,7 @@ async function fetchRanking(force) {
   } finally {
     if (rankLoading === key) rankLoading = null;
   }
-  if (activeTab === 'ranking' && rankKey() === key) drawRanking();
+  if (activeTab === 'ranking' && rankKey() === key) { drawRanking(); drawRankPanelHead(); }
 }
 
 function renderRanking() { drawRanking(); fetchRanking(false); }
@@ -1967,7 +1998,7 @@ function drawRanking() {
       const pct = r.changePct == null ? '-' : `${sgn(r.changePct)}${Math.abs(r.changePct).toFixed(2)}%`;
       const fav = isFav(r.ticker);
       const t = esc(r.ticker);
-      return `<div class="rank-row" onclick="openRankTicker('${t}')" title="${t} — 눌러서 상세 보기">
+      return `<div class="rank-row ${rankPanel && rankPanel.ticker === r.ticker ? 'sel' : ''}" onclick="openRankPanel('${t}')" title="${t} — 눌러서 옆에서 진입 신호 보기">
         <div class="rank-no">${i + 1}</div>
         ${r.logo ? `<img class="rank-logo" src="${esc(r.logo)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">` : '<div class="rank-logo"></div>'}
         <div style="min-width:0">
@@ -1996,7 +2027,118 @@ function toggleRankFav(t) {
   ensureFav();
   toggleFav(t);
   drawRanking();
+  if (rankPanel && rankPanel.ticker === t) drawRankPanelHead();
 }
+
+// ---- 랭킹 옆 상세 패널 ----
+// 행을 누르면 탭 이동 없이 옆(모바일은 아래 시트)에 진입 신호 카드를 띄운다. ✕·Esc로 닫고,
+// ▲▼(또는 키보드 ↑↓)로 다음 종목을 바로 넘겨 본다. 신호는 종목별로 1분간 재사용.
+let rankPanel = null;                 // { ticker }
+const panelSig = {};                  // ticker → { data, at, error, loading }
+function rankPanelRows() { const d = rankData[rankKey()]; return (d && d.rows) || []; }
+function openRankPanel(t) {
+  rankPanel = { ticker: t, row: rankPanelRows().find(r => r.ticker === t) };
+  document.body.classList.add('panel-open');
+  drawRanking();
+  drawRankPanel();
+  loadPanelSignal(t);
+  const row = document.querySelector('.rank-row.sel');
+  if (row && window.innerWidth > 900) row.scrollIntoView({ block: 'nearest' });
+}
+function closeRankPanel() {
+  if (!rankPanel) return;
+  rankPanel = null;
+  document.body.classList.remove('panel-open');
+  if (activeTab === 'ranking') drawRanking();
+}
+function stepRankPanel(dir) {
+  const rows = rankPanelRows();
+  const i = rows.findIndex(r => r.ticker === (rankPanel && rankPanel.ticker));
+  const n = rows[i + dir];
+  if (n) openRankPanel(n.ticker);
+}
+async function loadPanelSignal(t, force) {
+  const c = panelSig[t];
+  if (!force && c && (c.loading || (c.data && Date.now() - c.at < 60000))) return;
+  if (!force && !c && signals[t]) { panelSig[t] = { data: signals[t], at: Date.now() }; drawRankPanelBody(); return; }
+  panelSig[t] = { ...(c || {}), loading: true, error: '' };
+  drawRankPanelBody();
+  try {
+    const res = await apiFetch(`${API}/signal/${encodeURIComponent(t)}`, {}, SIGNAL_TIMEOUT_MS);
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error || '신호를 불러오지 못했어요');
+    panelSig[t] = { data: json.data, at: Date.now() };
+  } catch (e) {
+    panelSig[t] = { ...(panelSig[t] || {}), loading: false, error: e.message };
+  }
+  if (rankPanel && rankPanel.ticker === t) drawRankPanelBody();
+}
+function rankPanelRow() {   // 정렬·시장을 바꿔 목록에서 빠져도 열 때의 행 정보로 머리말 유지
+  const rows = rankPanelRows();
+  const i = rows.findIndex(r => r.ticker === rankPanel.ticker);
+  if (i >= 0) rankPanel.row = rows[i];
+  return { rows, i, r: rankPanel.row || {} };
+}
+// 패널 뼈대(처음 열 때만) → 머리말(시세·순위, 랭킹 갱신 때마다) / 본문(신호, 받아올 때만)을 따로 그린다.
+// 본문을 매번 다시 그리면 펼쳐 둔 백테스트 결과·스크롤 위치가 30초마다 날아간다.
+function drawRankPanel() {
+  const box = document.getElementById('side-panel');
+  if (!box || !rankPanel) return;
+  if (!document.getElementById('sp-body')) box.innerHTML = '<div id="sp-top"></div><div id="sp-body"></div>';
+  drawRankPanelHead();
+  drawRankPanelBody();
+}
+function drawRankPanelHead() {
+  const top = document.getElementById('sp-top');
+  if (!top || !rankPanel) return;
+  const t = rankPanel.ticker;
+  const { rows, i, r } = rankPanelRow();
+  const cur = r.currency === 'KRW' ? '' : '$';
+  const sgn = v => v > 0 ? '+' : v < 0 ? '-' : '';
+  const pct = r.changePct == null ? '' : ` <span class="${r.changePct > 0 ? 'up' : r.changePct < 0 ? 'down' : 'neutral'}">${sgn(r.changePct)}${Math.abs(r.changePct).toFixed(2)}%</span>`;
+  const fav = isFav(t);
+  top.innerHTML = `<div class="sp-head">
+      ${r.logo ? `<img class="rank-logo" src="${esc(r.logo)}" alt="" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">` : ''}
+      <div class="sp-title"><b>${esc(r.name || t)}</b><span>${esc(t)}${r.price != null ? ` · ${cur}${_rankNum(r.price, r.currency)}` : ''}${pct}</span></div>
+      <button class="sp-btn ${fav ? 'on' : ''}" onclick="toggleRankFav('${esc(t)}')" title="${fav ? '즐겨찾기 해제' : '즐겨찾기 추가'}">${fav ? '★' : '☆'}</button>
+      <button class="sp-btn sp-close" onclick="closeRankPanel()" title="닫기 (Esc)" aria-label="닫기">✕</button>
+    </div>
+    <div class="sp-nav">
+      <button class="secondary" onclick="stepRankPanel(-1)" ${i <= 0 ? 'disabled' : ''}>▲ 이전</button>
+      <span class="sp-pos">${i >= 0 ? `${i + 1}위 / ${rows.length}` : '현재 목록에 없음'}</span>
+      <button class="secondary" onclick="stepRankPanel(1)" ${i < 0 || i >= rows.length - 1 ? 'disabled' : ''}>다음 ▼</button>
+      <button class="secondary" onclick="openRankTicker('${esc(t)}')" title="개요 탭 카드로 크게 보기">카드로 보기</button>
+    </div>`;
+}
+function drawRankPanelBody() {
+  const el = document.getElementById('sp-body');
+  if (!el || !rankPanel) return;
+  const t = rankPanel.ticker, r = rankPanel.row || {};
+  const c = panelSig[t] || {};
+  let body;
+  if (c.data) {
+    try {
+      body = renderSignalCard(t, { sig: c.data, name: r.name || t, currency: r.currency || (tickerMarket(t) === 'kr' ? 'KRW' : 'USD'), btId: 'bt-panel' });
+    } catch (e) { body = `<div class="sp-msg" style="color:var(--red)">표시 중 오류: ${esc(e.message)}</div>`; }
+    if (c.loading) body = '<div class="pp-hint" style="text-align:right">최신 신호 확인 중...</div>' + body;
+  } else if (c.error) {
+    body = `<div class="sp-msg">진입 신호를 불러오지 못했어요<br><span style="font-size:12px">${esc(c.error)}</span><br>
+      <button class="secondary" style="margin-top:12px" onclick="loadPanelSignal('${esc(t)}', true)">다시 시도</button></div>`;
+  } else {
+    body = '<div class="sp-msg">진입 신호 분석 중...<br><span style="font-size:12px">처음 보는 종목은 서버가 일봉·재무를 받아오느라 몇 초~수십 초 걸릴 수 있어요</span></div>';
+  }
+  const keep = el.dataset.t === t;
+  const y = el.scrollTop;
+  el.dataset.t = t;
+  el.innerHTML = body;
+  el.scrollTop = keep ? y : 0;   // 같은 종목 갱신이면 읽던 위치 유지, 다른 종목이면 맨 위
+}
+document.addEventListener('keydown', e => {
+  if (!rankPanel || /^(INPUT|TEXTAREA|SELECT)$/.test((e.target && e.target.tagName) || '')) return;
+  if (e.key === 'Escape') closeRankPanel();
+  else if (e.key === 'ArrowDown') { e.preventDefault(); stepRankPanel(1); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); stepRankPanel(-1); }
+});
 
 // 랭킹 종목을 빠른 조회(저장 안 되는 임시 그룹)로 열어 카드·신호를 본다.
 function openRankTicker(t) {
