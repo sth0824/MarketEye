@@ -10,7 +10,7 @@
 ## 프로젝트 개요
 - 국내·해외 주식 비교 대시보드. yfinance + KRX 종목 데이터 기반.
 - `app.py` — Flask 백엔드 (yfinance 조회, KRX 검색, TTL 캐시, Supabase 동기화)
-- `index.html` — 단일 파일 프론트엔드 (Chart.js, 다크 테마)
+- `index.html` — 단일 파일 프론트엔드 (Chart.js, 기기 설정 따라 라이트·다크 테마 — 색은 `:root` 변수로만 지정)
 - `signals.py` — 순수 신호 엔진(차트·펀더멘털·매수존), `infra.py` — 로깅·캐시·yf_call, `providers.py` — 수집층
 - `krx_stocks.json` — KRX 종목 폴백 번들
 

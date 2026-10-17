@@ -3,6 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f6f8fa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#161b22" media="(prefers-color-scheme: dark)">
 <title>MarketEye — 기업 비교 대시보드</title>
 <style>
   :root {
@@ -18,6 +21,38 @@
     --yellow: #d29922;
     --purple: #bc8cff;
     --accent: #1f6feb;
+    --on-accent: #fff;          /* 강조색 배경 위 글자 */
+    --on-solid: #0b0e14;        /* 초록·노랑·빨강 꽉 찬 배지 위 글자 */
+    --on-yellow: #1a1a1a;
+    --chip: rgba(255,255,255,.12);
+    --chip-strong: rgba(255,255,255,.25);
+    --shadow: rgba(0,0,0,.4);
+    --backdrop: rgba(0,0,0,.45);
+    color-scheme: dark;
+  }
+  /* 기기 설정이 라이트 모드면 밝은 팔레트 (GitHub 라이트 톤). 다크가 기본값. */
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f8fa;
+      --surface: #ffffff;
+      --surface2: #eef1f4;
+      --border: #d0d7de;
+      --text: #1f2328;
+      --muted: #59636e;
+      --green: #1a7f37;
+      --red: #cf222e;
+      --blue: #0969da;
+      --yellow: #9a6700;
+      --purple: #8250df;
+      --accent: #0969da;
+      --on-solid: #ffffff;
+      --on-yellow: #ffffff;
+      --chip: rgba(0,0,0,.06);
+      --chip-strong: rgba(255,255,255,.3);
+      --shadow: rgba(31,35,40,.15);
+      --backdrop: rgba(31,35,40,.35);
+      color-scheme: light;
+    }
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
@@ -33,11 +68,11 @@
   #ticker-input { background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-size: 14px; width: 100%; outline: none; transition: border-color .2s; }
   #ticker-input:focus { border-color: var(--accent); }
   #ticker-input::placeholder { color: var(--muted); }
-  button { background: var(--accent); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; transition: opacity .2s; white-space: nowrap; }
+  button { background: var(--accent); color: var(--on-accent); border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; transition: opacity .2s; white-space: nowrap; }
   button:hover { opacity: .85; }
   button.secondary { background: var(--surface2); border: 1px solid var(--border); color: var(--text); font-weight: 400; }
 
-  #suggestions { position: absolute; top: calc(100% + 4px); left: 0; right: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; z-index: 200; display: none; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+  #suggestions { position: absolute; top: calc(100% + 4px); left: 0; right: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; z-index: 200; display: none; overflow: hidden; box-shadow: 0 8px 24px var(--shadow); }
   .sug-item { display: flex; align-items: center; gap: 8px; padding: 9px 12px; cursor: pointer; transition: background .1s; }
   .sug-item:hover, .sug-selected { background: var(--surface2); }
   .sug-dim { opacity: .4; cursor: default; }
@@ -59,16 +94,16 @@
   #market-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
   .market-pill { display: inline-flex; align-items: center; gap: 7px; background: var(--surface); border: 1px solid var(--border); color: var(--muted); padding: 8px 18px; border-radius: 10px; cursor: pointer; font-size: 14px; font-weight: 600; user-select: none; transition: all .15s; }
   .market-pill:hover { border-color: var(--accent); color: var(--text); }
-  .market-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .market-pill.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
   .market-pill .group-count { font-weight: 400; }
 
   /* 그룹(워치리스트) 바 */
   #group-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; }
   .group-pill { display: inline-flex; align-items: center; gap: 6px; background: var(--surface); border: 1px solid var(--border); color: var(--muted); padding: 6px 10px 6px 14px; border-radius: 20px; cursor: pointer; font-size: 13px; user-select: none; transition: all .15s; }
   .group-pill:hover { border-color: var(--accent); color: var(--text); }
-  .group-pill.active { background: var(--accent); border-color: var(--accent); color: #fff; }
-  .group-count { font-size: 11px; background: rgba(255,255,255,.12); border-radius: 10px; padding: 1px 7px; }
-  .group-pill.active .group-count { background: rgba(255,255,255,.25); }
+  .group-pill.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  .group-count { font-size: 11px; background: var(--chip); border-radius: 10px; padding: 1px 7px; }
+  .group-pill.active .group-count { background: var(--chip-strong); }
   .group-edit { background: none; border: none; color: inherit; cursor: pointer; font-size: 12px; opacity: .55; padding: 0 2px; line-height: 1; }
   .group-edit:hover { opacity: 1; }
   .group-del { background: none; border: none; color: inherit; cursor: pointer; font-size: 12px; opacity: .55; padding: 0 2px; line-height: 1; }
@@ -128,7 +163,7 @@
     .rank-row { grid-template-columns: 22px 30px minmax(0, 1fr) auto 28px; gap: 8px; padding: 10px; }
   }
   /* 랭킹 옆 상세 패널 — 데스크톱은 화면을 좌우로 나누고, 모바일은 아래에서 올라오는 시트 */
-  #side-panel { position: fixed; top: 0; right: 0; bottom: 0; width: min(480px, 42vw); background: var(--bg); border-left: 1px solid var(--border); z-index: 150; display: none; flex-direction: column; box-shadow: -8px 0 24px rgba(0,0,0,.35); }
+  #side-panel { position: fixed; top: 0; right: 0; bottom: 0; width: min(480px, 42vw); background: var(--bg); border-left: 1px solid var(--border); z-index: 150; display: none; flex-direction: column; box-shadow: -8px 0 24px var(--shadow); }
   body.panel-open #side-panel { display: flex; }
   body.panel-open main, body.panel-open header { margin-right: min(480px, 42vw); }
   .sp-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--surface); }
@@ -146,9 +181,9 @@
   #sp-body .signal-card { border: none; padding: 0; background: none; }
   .sp-msg { padding: 40px 10px; text-align: center; color: var(--muted); line-height: 1.7; }
   .rank-row.sel { background: var(--surface2); box-shadow: inset 3px 0 0 var(--accent); }
-  #panel-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 140; }
+  #panel-backdrop { display: none; position: fixed; inset: 0; background: var(--backdrop); z-index: 140; }
   @media (max-width: 900px) {
-    #side-panel { top: auto; left: 0; width: auto; height: 86vh; border-left: none; border-top: 1px solid var(--border); border-radius: 14px 14px 0 0; box-shadow: 0 -8px 24px rgba(0,0,0,.45); }
+    #side-panel { top: auto; left: 0; width: auto; height: 86vh; border-left: none; border-top: 1px solid var(--border); border-radius: 14px 14px 0 0; box-shadow: 0 -8px 24px var(--shadow); }
     body.panel-open main, body.panel-open header { margin-right: 0; }
     body.panel-open #panel-backdrop { display: block; }   /* 시트 위 어두운 부분을 누르면 닫힘 */
     .sp-head { border-radius: 14px 14px 0 0; }
@@ -169,17 +204,17 @@
   .pp-title .rank-meta { font-weight: 400; }
   .pp-side { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 10px; }
   .pp-side button { background: var(--surface2); border: 1px solid var(--border); color: var(--muted); font-weight: 600; }
-  .pp-side button.on-buy { background: var(--red); border-color: var(--red); color: #fff; }
-  .pp-side button.on-sell { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .pp-side button.on-buy { background: var(--red); border-color: var(--red); color: var(--on-accent); }
+  .pp-side button.on-sell { background: var(--blue); border-color: var(--blue); color: var(--on-accent); }
   .pp-field { margin-bottom: 10px; }
   .pp-field > label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-  .pp-field input[type=text], .pp-field input[type=number], .pp-field input[type=datetime-local] { width: 100%; background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 14px; outline: none; color-scheme: dark; }
+  .pp-field input[type=text], .pp-field input[type=number], .pp-field input[type=datetime-local] { width: 100%; background: var(--surface2); border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 6px; font-size: 14px; outline: none; }
   .pp-field input:focus { border-color: var(--accent); }
   .pp-row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .pp-when { display: flex; gap: 14px; margin-bottom: 6px; font-size: 13px; }
   .pp-when label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
   .pp-hint { font-size: 11px; color: var(--muted); margin-top: 4px; line-height: 1.5; }
-  .pp-sug { position: absolute; top: calc(100% + 2px); left: 0; right: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; z-index: 50; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+  .pp-sug { position: absolute; top: calc(100% + 2px); left: 0; right: 0; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; z-index: 50; overflow: hidden; box-shadow: 0 8px 24px var(--shadow); }
   .pp-sug:empty { display: none; }
   .pp-preview { margin-top: 10px; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 13px; line-height: 1.7; }
   .pp-preview:empty { display: none; }
@@ -221,8 +256,8 @@
   .card-fav { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; padding: 0; line-height: 1; flex-shrink: 0; }
   .card-fav:hover { color: var(--yellow); }
   .card-fav.on { color: var(--yellow); }
-  .group-pill.fav-pill { border-color: rgba(210,153,34,.5); }
-  .group-pill.fav-pill.active { background: var(--yellow); border-color: var(--yellow); color: #1a1a1a; }
+  .group-pill.fav-pill { border-color: color-mix(in srgb, var(--yellow) 50%, transparent); }
+  .group-pill.fav-pill.active { background: var(--yellow); border-color: var(--yellow); color: var(--on-yellow); }
   .card-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .metric { background: var(--surface2); border-radius: 6px; padding: 8px; }
   .metric-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
@@ -251,9 +286,9 @@
 
   /* 신호 배지 */
   .signal-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 12px; margin-top: 10px; }
-  .signal-badge.buy  { background: rgba(63,185,80,.18); color: var(--green); border: 1px solid rgba(63,185,80,.4); }
-  .signal-badge.wait { background: rgba(210,153,34,.18); color: var(--yellow); border: 1px solid rgba(210,153,34,.4); }
-  .signal-badge.warn { background: rgba(248,81,73,.18); color: var(--red); border: 1px solid rgba(248,81,73,.4); }
+  .signal-badge.buy  { background: color-mix(in srgb, var(--green) 16%, transparent); color: var(--green); border: 1px solid color-mix(in srgb, var(--green) 40%, transparent); }
+  .signal-badge.wait { background: color-mix(in srgb, var(--yellow) 16%, transparent); color: var(--yellow); border: 1px solid color-mix(in srgb, var(--yellow) 40%, transparent); }
+  .signal-badge.warn { background: color-mix(in srgb, var(--red) 16%, transparent); color: var(--red); border: 1px solid color-mix(in srgb, var(--red) 40%, transparent); }
 
   /* 신호 탭 */
   .signal-section-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px,1fr)); gap: 16px; }
@@ -284,7 +319,7 @@
   #empty-state p { font-size: 14px; margin-bottom: 24px; }
   .ticker-chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
   .ticker-chip { background: var(--surface2); border: 1px solid var(--border); color: var(--blue); padding: 6px 14px; border-radius: 20px; cursor: pointer; font-size: 13px; transition: all .2s; }
-  .ticker-chip:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .ticker-chip:hover { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
 
   #error-toast { position: fixed; bottom: 24px; right: 24px; background: #da3633; color: #fff; padding: 12px 20px; border-radius: 8px; font-size: 14px; z-index: 999; display: none; max-width: 300px; }
 
@@ -439,6 +474,18 @@
 const _isLocal = location.protocol === 'file:'
   || ['localhost', '127.0.0.1', ''].includes(location.hostname);
 const API = _isLocal ? 'http://localhost:5001/api' : '/api';
+
+// ── 라이트/다크 테마 (기기 설정 prefers-color-scheme을 따른다) ──
+// CSS는 :root 변수로 자동 전환되지만 Chart.js 캔버스는 그릴 때 색을 박아 넣으므로,
+// 그 시점의 변수값을 읽고 기기 설정이 바뀌면 다시 그린다.
+const _themeMq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: light)') : null;
+function isLightTheme() { return !!(_themeMq && _themeMq.matches); }
+function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+if (_themeMq) {
+  const onTheme = () => { try { renderAll(); } catch (e) {} };
+  if (_themeMq.addEventListener) _themeMq.addEventListener('change', onTheme);
+  else if (_themeMq.addListener) _themeMq.addListener(onTheme);   // 구형 사파리
+}
 
 // ── 디버그 fetch 래퍼 (타임아웃 30s + 단계별 콘솔 로그) ──────────
 // Render 무료 플랜은 미사용 시 인스턴스를 내려, 첫 요청(콜드 스타트)이 최대 ~60초
@@ -1340,7 +1387,7 @@ function renderSignalCard(ticker, opt = {}) {
       <div class="signal-block-head">
         <span class="signal-block-title">🎯 종합 진입 점수 <span style="color:var(--muted);font-weight:400;font-size:10px">${sig.is_etf ? '차트·추세 기반' : '차트·가치 합성'}</span></span>
         <span class="signal-block-score">
-          <span class="signal-badge" style="margin-top:0;background:${col};color:#0b0e14;font-weight:700">${comp.verdict_emoji} ${comp.verdict_label}</span>
+          <span class="signal-badge" style="margin-top:0;background:${col};color:var(--on-solid);font-weight:700">${comp.verdict_emoji} ${comp.verdict_label}</span>
           <b style="color:${col};font-size:26px;margin-left:8px">${comp.score}</b><span style="color:var(--muted);font-size:11px">/100</span>
         </span>
       </div>
@@ -1693,7 +1740,7 @@ function drawMiniChart(ticker, history) {
     const labels = history.map(h => h.date);
     const startPrice = prices[0];
     const endPrice = prices[prices.length-1];
-    const color = endPrice >= startPrice ? '#3fb950' : '#f85149';
+    const color = endPrice >= startPrice ? cssVar('--green') : cssVar('--red');
     new Chart(ctx, {
       type: 'line',
       data: {
@@ -1805,6 +1852,8 @@ function renderCompareTable() {
 function renderCharts() {
   const tickers = orderedTickers();
   const section = document.getElementById('charts-section');
+  // 다시 그리기 전에 기존 차트 해제(안 하면 인스턴스가 쌓이고, 연달아 그릴 때 'Canvas is already in use' 에러)
+  if (window.Chart) section.querySelectorAll('canvas').forEach(c => { const ch = Chart.getChart(c); if (ch) ch.destroy(); });
   section.innerHTML = '';
   if (!tickers.length) { section.innerHTML = '<p style="color:var(--muted)">기업을 추가하면 차트가 표시됩니다.</p>'; return; }
 
@@ -1819,7 +1868,10 @@ function renderCharts() {
     { title: '부채/자기자본', key: 'debtToEquity', unit: '' },
   ];
 
-  const COLORS = ['#58a6ff','#3fb950','#d29922','#bc8cff','#f85149','#79c0ff','#56d364','#e3b341'];
+  // 차트 계열색: 라이트 배경에선 옅은 색이 안 보여 테마별로 따로 둔다(호출 시점에 선택).
+  const COLORS_DARK = ['#58a6ff','#3fb950','#d29922','#bc8cff','#f85149','#79c0ff','#56d364','#e3b341'];
+  const COLORS_LIGHT = ['#0969da','#1a7f37','#9a6700','#8250df','#cf222e','#1b7c83','#bf3989','#953800'];
+  const COLORS = isLightTheme() ? COLORS_LIGHT : COLORS_DARK;
 
   BAR_METRICS.forEach((m, idx) => {
     const card = document.createElement('div');
@@ -1829,8 +1881,9 @@ function renderCharts() {
     section.appendChild(card);
 
     setTimeout(() => {
-      const canvas = document.getElementById(canvasId);
-      if (!canvas) return;
+      // id로 다시 찾으면 그사이 새로 그려진 같은 id 캔버스를 잡아 중복 생성된다 → 내 카드의 캔버스만
+      const canvas = card.querySelector('canvas');
+      if (!canvas || !canvas.isConnected || Chart.getChart(canvas)) return;
       const labels = tickers.map(t => stocks[t].name || t);
       const data = tickers.map(t => {
         const v = stocks[t][m.key];
@@ -1852,8 +1905,8 @@ function renderCharts() {
           responsive: true,
           plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => `${ctx.parsed.y}${m.unit}` } } },
           scales: {
-            x: { ticks: { color: '#8b949e' }, grid: { color: '#30363d' } },
-            y: { ticks: { color: '#8b949e' }, grid: { color: '#30363d' } }
+            x: { ticks: { color: cssVar('--muted') }, grid: { color: cssVar('--border') } },
+            y: { ticks: { color: cssVar('--muted') }, grid: { color: cssVar('--border') } }
           }
         }
       });
@@ -1868,8 +1921,8 @@ function renderCharts() {
   section.appendChild(lineCard);
 
   setTimeout(() => {
-    const canvas = document.getElementById('chart-history');
-    if (!canvas) return;
+    const canvas = lineCard.querySelector('canvas');
+    if (!canvas || !canvas.isConnected || Chart.getChart(canvas)) return;
     const allDates = [...new Set(tickers.flatMap(t => (stocks[t].history||[]).map(h=>h.date)))].sort();
     const datasets = tickers.map((t, i) => {
       const hist = stocks[t].history || [];
@@ -1890,10 +1943,10 @@ function renderCharts() {
       data: { labels: allDates, datasets },
       options: {
         responsive: true,
-        plugins: { legend: { labels: { color: '#e6edf3' } } },
+        plugins: { legend: { labels: { color: cssVar('--text') } } },
         scales: {
-          x: { ticks: { color: '#8b949e', maxRotation: 0 }, grid: { color: '#30363d' } },
-          y: { ticks: { color: '#8b949e', callback: v => v+'%' }, grid: { color: '#30363d' } }
+          x: { ticks: { color: cssVar('--muted'), maxRotation: 0 }, grid: { color: cssVar('--border') } },
+          y: { ticks: { color: cssVar('--muted'), callback: v => v+'%' }, grid: { color: cssVar('--border') } }
         }
       }
     });
