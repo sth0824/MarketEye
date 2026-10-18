@@ -3,6 +3,7 @@ from flask_cors import CORS
 import yfinance as yf
 import requests
 import traceback
+import concurrent.futures
 import os
 import re
 import time
@@ -14,7 +15,7 @@ except Exception:                    # 극단적 폴백(사실상 도달 안 함
 
 # 공용 인프라(로깅·타이밍·TTL 캐시·JSON 방어막)는 infra.py로 분리.
 from infra import (
-    log, timed, set_tag, _req_seq,
+    log, timed, set_tag, _tag, _req_seq,
     _cache_get, _cache_set, _cache_get_stale, yf_call, is_rate_limited, _run_with_timeout,
     SafeJSONProvider,
 )
@@ -746,6 +747,83 @@ def ranking():
         return jsonify({'success': True, 'data': data})
     except Exception as e:
         return _stale_or_error('ranking', key, e)
+
+
+# ── 랭킹 매수존 일괄 조회 ─────────────────────────────────────────
+# 랭킹 100종목마다 /api/signal(야후 info·재무까지)을 돌리면 서버가 버티지 못한다. 추천 매수존은
+# 가격·거래량 일봉만으로 정해지므로(_technical_signal 안의 _buy_zone) 일봉만 받아 같은 엔진으로
+# 계산한다. 일봉 우선순위: 이미 계산된 신호 base(패널과 동일 데이터) → 한국=네이버 일봉 → 해외=야후.
+ZONE_BARS_TTL = int(os.environ.get('ZONE_BARS_TTL', '1800'))
+ZONE_BATCH_MAX = 12
+_SESSION_OPEN = {'kr': (dtime(9, 0), 'Asia/Seoul'), 'us': (dtime(9, 30), 'America/New_York')}
+
+
+def _zone_bars(ticker):
+    """(closes, highs, lows, vols, last_date) — 실패 시 예외."""
+    base = _cache_get_stale(('sigbase', ticker))
+    if base is not None:
+        return (list(base['closes']), list(base['highs']), list(base['lows']), list(base['vols']),
+                base['last_date'])
+    cached = _cache_get(('zbars', ticker), ZONE_BARS_TTL)
+    if cached is None:
+        hist = None
+        if _is_kr(ticker):   # 한국은 네이버 먼저(야후 차단에 무관·빠름), 실패하면 야후
+            try:
+                hist = _fetch_naver_daily(ticker.split('.')[0], 520)
+            except Exception as e:
+                log(f'매수존 {ticker} 네이버 일봉 실패 → 야후: {e}', 'WARN')
+        if hist is None:
+            hist = yf_call(lambda: yf.Ticker(ticker).history(period='2y', interval='1d'),
+                           f'yf.history(2y,zone) {ticker}')
+        if hist is None or len(hist) < 60:
+            raise ValueError(f'일봉 부족 ({0 if hist is None else len(hist)}봉)')
+        cached = (*_ohlcv(hist), hist.index[-1].date().isoformat())
+        _cache_set(('zbars', ticker), cached)
+    closes, highs, lows, vols, last = cached
+    return list(closes), list(highs), list(lows), list(vols), last
+
+
+def _zone_for(ticker, price):
+    closes, highs, lows, vols, last = _zone_bars(ticker)
+    if price and price > 0:
+        # 랭킹의 실시간가로 오늘 봉을 반영(신호 오버레이와 같은 원칙: 오늘 봉이면 교체, 장중 새 날이면 추가)
+        open_t, tzname = _SESSION_OPEN['kr' if _is_kr(ticker) else 'us']
+        now = _exchange_now({'exchangeTimezoneName': tzname}, None)
+        today = now.date().isoformat() if now else None
+        if today is None or last == today:
+            _replace_last_bar(closes, highs, lows, price, None, None)
+        elif last < today and now.weekday() < 5 and now.time() >= open_t:
+            closes.append(price); highs.append(price); lows.append(price); vols.append(0.0)
+    ts = _technical_signal(closes, highs, lows, vols)
+    bz = ts.get('buy_zone')
+    out = {'regime': ts['regime'], 'regime_label': ts['regime_label'], 'tech_score': ts['tech_score']}
+    if bz:
+        out.update({k: bz[k] for k in ('low', 'high', 'entry', 'strength_label', 'caution')})
+    return out
+
+
+@app.route('/api/zones', methods=['POST'])
+def zones():
+    """랭킹 종목들의 추천 매수존 구간. body: {items: [{ticker, price}]} (최대 ZONE_BATCH_MAX개).
+    → {ticker: {low, high, entry, strength_label, caution, regime_label, tech_score} | {error}}.
+    매수존 '안/근접' 판정은 프론트가 실시간 가격으로 한다(구간은 일봉 기준이라 자주 안 바뀜)."""
+    items = (request.get_json(silent=True) or {}).get('items') or []
+    items = [i for i in items if isinstance(i, dict) and i.get('ticker')][:ZONE_BATCH_MAX]
+    parent = _tag()
+
+    def run(it):
+        set_tag(parent)
+        t = str(it['ticker']).upper()
+        try:
+            return t, _zone_for(t, float(it.get('price') or 0))
+        except Exception as e:
+            log(f'매수존 {t} 실패: {e}', 'WARN')
+            return t, {'error': str(e)}
+
+    with timed(f'랭킹 매수존 {len(items)}종목', warn_ms=5000, slow_ms=12000):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            data = dict(ex.map(run, items))
+    return jsonify({'success': True, 'data': data})
 
 
 # 개인 동기화 코드(code)별로 그룹 데이터를 Supabase 테이블에 저장한다.

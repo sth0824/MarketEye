@@ -140,6 +140,15 @@
   .rank-chip.active { background: var(--text); color: var(--bg); border-color: var(--text); font-weight: 700; }
   .rank-toggle { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; font-size: 13px; color: var(--muted); cursor: pointer; user-select: none; }
   .rank-toggle input { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
+  .rank-toggle + .rank-toggle { margin-left: 4px; }
+  /* 추천 매수존 배지 (랭킹 행) */
+  .zb { display: inline-block; font-size: 11px; font-weight: 600; padding: 0 6px; border-radius: 8px; margin-right: 6px; border: 1px solid transparent; vertical-align: 1px; }
+  .zb-in { color: var(--green); background: color-mix(in srgb, var(--green) 14%, transparent); border-color: color-mix(in srgb, var(--green) 40%, transparent); }
+  .zb-warn { color: var(--yellow); background: color-mix(in srgb, var(--yellow) 14%, transparent); border-color: color-mix(in srgb, var(--yellow) 40%, transparent); }
+  .zb-near { color: var(--blue); background: color-mix(in srgb, var(--blue) 12%, transparent); border-color: color-mix(in srgb, var(--blue) 35%, transparent); }
+  .zb-below { color: var(--red); background: color-mix(in srgb, var(--red) 10%, transparent); }
+  .zb-muted { color: var(--muted); font-weight: 400; border-color: var(--border); }
+  .rank-zone-note { padding: 10px 14px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--border); }
   .rank-list { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
   .rank-row { display: grid; grid-template-columns: 28px 36px minmax(0, 1fr) 80px auto 32px; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer; border-bottom: 1px solid var(--border); }
   .rank-row:last-child { border-bottom: none; }
@@ -1989,6 +1998,65 @@ function toggleRankEtf() {
   renderRanking();
 }
 
+// ---- 랭킹 추천 매수존 ----
+// 구간(low~high)은 일봉 기준이라 자주 안 바뀌어 15분 재사용하고, '안/근접' 판정은 랭킹의
+// 실시간 가격으로 매번 다시 한다. 10종목씩 2갈래로 받아 채워지는 대로 그린다(서버 부하 고정).
+let rankZoneOnly = (() => { try { return localStorage.getItem('marketeye_rank_zone') === '1'; } catch (e) { return false; } })();
+const rankZones = {};                 // ticker → { low, high, entry, strength_label, caution, regime_label, at } | { error, at }
+const rankZoneBusy = new Set();
+const ZONE_TTL_MS = 15 * 60 * 1000, ZONE_NEAR_PCT = 3;
+function toggleRankZone() {
+  rankZoneOnly = !rankZoneOnly;
+  try { localStorage.setItem('marketeye_rank_zone', rankZoneOnly ? '1' : '0'); } catch (e) {}
+  drawRanking();
+}
+function zoneStatus(r) {
+  const z = rankZones[r.ticker], p = r.price;
+  if (!z) return null;                                   // 아직 계산 전
+  if (z.error) return { key: 'na', text: '' };
+  if (z.low == null || !p) return { key: 'none', text: '매수존 없음' };
+  if (p >= z.low && p <= z.high) return { key: 'in', text: z.caution ? '매수존 안 · 하락추세' : '매수존 안', warn: !!z.caution };
+  if (p < z.low) return { key: 'below', text: '매수존 아래(이탈)' };
+  const gap = (p / z.high - 1) * 100;
+  if (gap <= ZONE_NEAR_PCT) return { key: 'near', text: `근접 ${gap.toFixed(1)}% 위` };
+  return { key: 'above', text: `존까지 -${(gap / (1 + gap / 100)).toFixed(1)}%` };
+}
+function zoneBadge(r) {
+  const z = zoneStatus(r);
+  if (!z) return '<span class="zb zb-muted">매수존 …</span>';
+  if (z.key === 'na') return '';
+  const cls = z.key === 'in' ? (z.warn ? 'zb-warn' : 'zb-in') : z.key === 'near' ? 'zb-near' : z.key === 'below' ? 'zb-below' : 'zb-muted';
+  const zr = rankZones[r.ticker];
+  const tip = zr && zr.low != null ? `추천 매수존 ${_rankNum(zr.low, r.currency)} ~ ${_rankNum(zr.high, r.currency)} (${zr.strength_label || ''}${zr.caution ? ' · 하락추세 주의' : ''})` : '';
+  return `<span class="zb ${cls}" title="${esc(tip)}">${esc(z.text)}</span>`;
+}
+async function fetchRankZones() {
+  const rows = (rankData[rankKey()] || {}).rows || [];
+  const now = Date.now();
+  const need = rows.filter(r => !rankZoneBusy.has(r.ticker)
+    && (!rankZones[r.ticker] || now - rankZones[r.ticker].at > (rankZones[r.ticker].error ? 120000 : ZONE_TTL_MS)));
+  if (!need.length) return;
+  need.forEach(r => rankZoneBusy.add(r.ticker));
+  const chunks = [];
+  for (let i = 0; i < need.length; i += 10) chunks.push(need.slice(i, i + 10));
+  await runPool(chunks, async chunk => {
+    try {
+      const res = await apiFetch(`${API}/zones`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: chunk.map(r => ({ ticker: r.ticker, price: r.price })) }),
+      }, 30000);
+      const json = await res.json();
+      if (!json.success) throw new Error(json.error || '매수존 조회 실패');
+      chunk.forEach(r => { rankZones[r.ticker] = { ...(json.data[r.ticker] || { error: '응답 없음' }), at: Date.now() }; });
+    } catch (e) {
+      chunk.forEach(r => { rankZones[r.ticker] = { error: e.message, at: Date.now() }; });
+    } finally {
+      chunk.forEach(r => rankZoneBusy.delete(r.ticker));
+    }
+    if (activeTab === 'ranking') drawRanking();
+  }, 2);
+}
+
 async function fetchRanking(force) {
   const key = rankKey();
   const cur = rankData[key];
@@ -2005,10 +2073,10 @@ async function fetchRanking(force) {
   } finally {
     if (rankLoading === key) rankLoading = null;
   }
-  if (activeTab === 'ranking' && rankKey() === key) { drawRanking(); drawRankPanelHead(); }
+  if (activeTab === 'ranking' && rankKey() === key) { drawRanking(); drawRankPanelHead(); fetchRankZones(); }
 }
 
-function renderRanking() { drawRanking(); fetchRanking(false); }
+function renderRanking() { drawRanking(); fetchRanking(false); fetchRankZones(); }
 
 function _rankNum(v, cur) {
   if (v == null) return '-';
@@ -2033,7 +2101,8 @@ function drawRanking() {
   const mLabel = selectedMarket === 'kr' ? '국내' : '미국';
   const chips = RANK_SORTS.map(o =>
     `<button class="rank-chip ${o.id === rankSort ? 'active' : ''}" onclick="setRankSort('${o.id}')">${o.label}</button>`).join('')
-    + `<label class="rank-toggle" title="ETF·ETN을 빼고 개별 종목만 순위 매기기"><input type="checkbox" ${rankNoEtf ? 'checked' : ''} onchange="toggleRankEtf()"> ETF 제외</label>`;
+    + `<label class="rank-toggle" title="ETF·ETN을 빼고 개별 종목만 순위 매기기"><input type="checkbox" ${rankNoEtf ? 'checked' : ''} onchange="toggleRankEtf()"> ETF 제외</label>`
+    + `<label class="rank-toggle" title="현재가가 추천 매수존 안이거나 3% 이내 위에 있는 종목만"><input type="checkbox" ${rankZoneOnly ? 'checked' : ''} onchange="toggleRankZone()"> 매수존 근처만</label>`;
   let meta = '';
   if (d && d.at) {
     const t = new Date(d.at);
@@ -2042,7 +2111,16 @@ function drawRanking() {
   } else meta = mLabel;
   let body;
   if (d && d.rows && d.rows.length) {
-    body = '<div class="rank-list">' + d.rows.map((r, i) => {
+    // 순위 번호는 원래 순위 그대로 두고, '매수존 근처만'이면 해당 행만 남긴다
+    const all = d.rows.map((r, i) => ({ r, i, z: zoneStatus(r) }));
+    const ready = all.filter(x => x.z).length;
+    const nIn = all.filter(x => x.z && x.z.key === 'in').length, nNear = all.filter(x => x.z && x.z.key === 'near').length;
+    meta += ` · 매수존 안 ${nIn} · 근접 ${nNear}` + (ready < all.length ? ` (계산 중 ${ready}/${all.length})` : '');
+    const shown = rankZoneOnly ? all.filter(x => x.z && (x.z.key === 'in' || x.z.key === 'near')) : all;
+    const note = rankZoneOnly && !shown.length
+      ? `<div class="rank-empty">${ready < all.length ? '매수존 계산 중...' : '지금 매수존 근처인 종목이 없어요'}</div>`
+      : (rankZoneOnly && ready < all.length ? `<div class="rank-zone-note">매수존 계산 중 ${ready}/${all.length} — 끝나는 대로 더 나타나요</div>` : '');
+    body = '<div class="rank-list">' + note + shown.map(({ r, i }) => {
       const cls = r.changePct > 0 ? 'up' : r.changePct < 0 ? 'down' : 'neutral';
       const cur = r.currency === 'KRW' ? '' : '$';
       // 부호는 통화기호 앞에: +$2.20 / -$2.40 / -6,000
@@ -2056,7 +2134,7 @@ function drawRanking() {
         ${r.logo ? `<img class="rank-logo" src="${esc(r.logo)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">` : '<div class="rank-logo"></div>'}
         <div style="min-width:0">
           <div class="rank-name">${esc(r.name)}${r.etf ? '<span class="rank-etf">ETF</span>' : ''}</div>
-          <div class="rank-sub">${esc(_rankSub(r))}</div>
+          <div class="rank-sub">${zoneBadge(r)}${esc(_rankSub(r))}</div>
         </div>
         ${r.chart ? `<img class="rank-spark" src="${esc(r.chart)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.visibility='hidden'">` : '<div class="rank-spark"></div>'}
         <div class="rank-price">
@@ -2121,6 +2199,10 @@ async function loadPanelSignal(t, force) {
     const json = await res.json();
     if (!json.success) throw new Error(json.error || '신호를 불러오지 못했어요');
     panelSig[t] = { data: json.data, at: Date.now() };
+    const bz = json.data.buy_zone;
+    rankZones[t] = bz ? { low: bz.low, high: bz.high, entry: bz.entry, strength_label: bz.strength_label, caution: bz.caution, at: Date.now() }
+      : { low: null, at: Date.now() };
+    if (activeTab === 'ranking') drawRanking();
   } catch (e) {
     panelSig[t] = { ...(panelSig[t] || {}), loading: false, error: e.message };
   }
