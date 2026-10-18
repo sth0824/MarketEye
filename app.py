@@ -29,6 +29,7 @@ import paper
 from signals import (
     safe_val,
     _technical_signal,
+    _buy_zone,
     _fundamental_signal,
     _composite_signal,
     _etf_composite,
@@ -571,6 +572,78 @@ def _period_bars(period):
     return k * 252 + 20 if m.group(2) == 'y' else k * 22 + 10
 
 
+ZONE_STEP = 2   # 매수존 검증 표본 간격(거래일). 매일 계산하면 Render 0.1 CPU에서 느려 2일마다.
+ZONE_STATES = [   # (키, 표시 이름) — 프론트 표 순서
+    ('in_pull', '매수존 안 · 눌림 진입'), ('in_flat', '매수존 안 · 횡보'), ('in_down', '매수존 안 · 하락추세'),
+    ('near', '근접(바로 위)'), ('above', '매수존 위(멀리)'), ('below', '매수존 아래(이탈)'), ('none', '매수존 없음'),
+]
+
+
+def _zone_state(bz, closes, highs, k):
+    """그날 종가가 매수존에 대해 어떤 상태인지. 랭킹 배지와 같은 판정 + 매수존 안을 세분:
+    눌림 진입 = 최근 10봉 안에 매수존 위(근접 기준 이상)에 있다가 내려온 경우(지지 시험),
+    횡보 = 계속 그 근처에서 맴도는 경우(매수존이 가격 바로 밑 이평·VWAP라 겹친 것일 수 있음)."""
+    if not bz:
+        return 'none'
+    p = closes[k]
+    if p < bz['low']:
+        return 'below'
+    if p <= bz['high']:
+        if bz['caution']:
+            return 'in_down'
+        recent = max(highs[max(0, k - 10):k] or [p])
+        return 'in_pull' if recent >= bz['high'] * (1 + bz['near_pct'] / 100) else 'in_flat'
+    return 'near' if (p / bz['high'] - 1) * 100 <= bz['near_pct'] else 'above'
+
+
+def _zone_validation(closes, highs, lows, vols, day_sig, start, hold, base_fwd):
+    """추천 매수존을 과거 매 ZONE_STEP일마다 그날까지의 데이터로만 다시 계산해(미래 미사용)
+    상태별 미래 hold일 수익을 집계한다. '매수존 안에서 사면 아무 날이나 산 것(기준선)보다
+    나았나'가 핵심. 점수·매매 시뮬레이션에는 영향 없음."""
+    t0 = time.time()
+    n = len(closes)
+    acc = {k: [] for k, _ in ZONE_STATES}
+    for k in range(start, n - hold, ZONE_STEP):
+        sg = day_sig[k]
+        ind, atr = sg['indicators'], sg['plan']['atr']
+        s0 = max(0, k + 1 - 260)   # _buy_zone은 최근 1년만 보므로 그만큼만 넘겨 복사 비용 절감
+        try:
+            bz = _buy_zone(closes[s0:k + 1], highs[s0:k + 1], lows[s0:k + 1], vols[s0:k + 1],
+                           ind['ma20'], ind['ma60'], ind['ma120'], ind['bb_mid'], ind['bb_lower'],
+                           closes[k], atr=atr, regime=sg['regime'])
+        except Exception:
+            bz = None
+        if closes[k]:
+            acc[_zone_state(bz, closes, highs, k)].append((closes[k + hold] / closes[k] - 1) * 100)
+    rows = []
+    for key, label in ZONE_STATES:
+        v = acc[key]
+        avg = round(sum(v) / len(v), 2) if v else None
+        rows.append({'key': key, 'label': label, 'n': len(v), 'avg_fwd': avg,
+                     'excess': round(avg - base_fwd, 2) if (avg is not None and base_fwd is not None) else None,
+                     'win_rate': round(sum(1 for x in v if x > 0) / len(v) * 100, 1) if v else None})
+    # 판정: 하락추세가 아닌 '매수존 안' 전체가 기준선을 '통계적으로' 넘었는가.
+    #  20일 수익을 2일마다 재므로 표본끼리 대부분 겹친다 → 실질 독립 표본 ≈ n·STEP/hold.
+    #  초과수익이 표준오차의 2배를 넘어야 better/worse(무작위 차트로 점검: 단순 ±0.5%p 기준은
+    #  아무 신호 없는 종목의 80%를 better/worse로 오판했다).
+    good = acc['in_pull'] + acc['in_flat']
+    ex = se = None
+    if good and base_fwd is not None:
+        ex = sum(good) / len(good) - base_fwd
+        if len(good) > 1:
+            m = sum(good) / len(good)
+            sd = (sum((x - m) ** 2 for x in good) / (len(good) - 1)) ** 0.5
+            se = sd / max(1.0, len(good) * ZONE_STEP / hold) ** 0.5
+    if len(good) < 30 or ex is None or not se:
+        verdict = 'insufficient'
+    else:
+        verdict = 'better' if ex > 2 * se else ('worse' if ex < -2 * se else 'neutral')
+    log(f'매수존 검증 {int((time.time() - t0) * 1000)}ms (표본 {sum(len(v) for v in acc.values())})',
+        'WARN' if time.time() - t0 > 3.0 else 'INFO')
+    return {'rows': rows, 'in_n': len(good), 'in_excess': round(ex, 2) if ex is not None else None,
+            'in_se': round(se, 2) if se else None, 'verdict': verdict, 'step': ZONE_STEP}
+
+
 @app.route('/api/backtest/<path:ticker>')
 def backtest(ticker):
     """실시간 신호와 '동일한' 기술 엔진(_technical_signal)을 과거 전 구간에 적용해
@@ -668,6 +741,8 @@ def backtest(ticker):
         monotonic = (round(sum(1 for a, b in zip(avgs, avgs[1:]) if b >= a) / (len(avgs) - 1), 2)
                      if len(avgs) >= 2 else None)
 
+        zone = _zone_validation(closes, highs, lows, vols, day_sig, START, HOLD_MAX, base_fwd)
+
         total = len(trades)
         rets = [tr['ret'] for tr in trades]
         wins = [r for r in rets if r > 0]
@@ -710,6 +785,7 @@ def backtest(ticker):
                        'period': BACKTEST_PERIOD, 'cost_pct': COST_PCT},
             'score_buckets': score_buckets,   # 점수 구간별 미래 20일 수익·기준선초과·승률
             'monotonic': monotonic,           # 인접 구간 우상향 비율 (1.0=완전 단조)
+            'zone': zone,                     # 추천 매수존 상태별 미래 20일 수익 실증(점수·매매와 별개)
             'note': (f'왕복 매매비용 {COST_PCT}% 반영(수수료·세금·슬리피지 가정). '
                      '기준선=무작위 시점에 사서 20일 보유한 평균수익 — 각 점수구간이 이 기준선을 '
                      '넘어야(excess>0) 점수에 변별력이 있는 것. 거래 30건 미만은 표본 부족(참고용). '
@@ -798,7 +874,7 @@ def _zone_for(ticker, price):
     bz = ts.get('buy_zone')
     out = {'regime': ts['regime'], 'regime_label': ts['regime_label'], 'tech_score': ts['tech_score']}
     if bz:
-        out.update({k: bz[k] for k in ('low', 'high', 'entry', 'strength_label', 'caution')})
+        out.update({k: bz[k] for k in ('low', 'high', 'entry', 'strength_label', 'caution', 'near_pct')})
     return out
 
 

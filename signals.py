@@ -255,6 +255,9 @@ def _anchored_vwap_bands(highs, lows, closes, vols, anchor):
     return {'vwap': vw, 'lower': vw - sd, 'upper': vw + sd}
 
 
+ZONE_LOOKBACK = 260
+
+
 def _buy_zone(closes, highs, lows, vols, ma20, ma60, ma120, bb_mid, bb_lower, price,
               atr=None, regime='range'):
     """퀀트식 추천 매수 구간(confluence zone).
@@ -266,11 +269,20 @@ def _buy_zone(closes, highs, lows, vols, ma20, ma60, ma120, bb_mid, bb_lower, pr
       · Anchored VWAP ±σ — 기관 평균 매입단가
       · 피보나치 되돌림(피벗 임펄스 기반) — 38.2/50/61.8
       · 이동평균 20/60/120 — 장기선일수록 강한 눌림목
-      · 볼린저 하단/중심 · 피벗 스윙 지지
+      · 볼린저 하단 · 피벗 스윙 지지
+    (볼린저 '중심'은 20일 평균 = MA20과 같은 값이라 별도 기법으로 세지 않는다.)
+    군집은 폭 상한(ATR×1.5, 현재가 1~4%)이 있는 창으로 묶는다 — 인접 간격만 보면 선들이
+    사슬처럼 이어져 수십 % 폭의 '구간'이 되고, 넓을수록 기법이 많이 들어와 이기는 편향이 있었다.
     추세 국면을 반영: 하락추세면 '낙하칼 위험'으로 표기(맹목 추천 방지). 반환 dict/None."""
     n = len(closes)
     if n < 30:
         return None
+    # 지지 후보·터치는 최근 1년(ZONE_LOOKBACK봉)에서만 찾는다. 몇 년 전 저점은 현재 지지로서
+    # 의미가 약하고, 매일 다시 계산하는 백테스트 검증(/api/backtest)이 느려진다.
+    if n > ZONE_LOOKBACK:
+        closes, highs, lows, vols = (closes[-ZONE_LOOKBACK:], highs[-ZONE_LOOKBACK:],
+                                     lows[-ZONE_LOOKBACK:], vols[-ZONE_LOOKBACK:])
+        n = ZONE_LOOKBACK
     # 변동성 비례 허용오차(군집·터치 판정): 저변동은 촘촘히, 고변동은 넉넉히(0.6~2.0%)
     tol_abs = min(max(0.6 * atr, 0.006 * price), 0.02 * price) if atr else 0.012 * price
 
@@ -327,8 +339,8 @@ def _buy_zone(closes, highs, lows, vols, ma20, ma60, ma120, bb_mid, bb_lower, pr
     # 4) 이동평균 눌림목 (장기선일수록 강한 지지)
     add(ma20, 0.9, 'MA20'); add(ma60, 1.1, 'MA60'); add(ma120, 1.2, 'MA120')
 
-    # 5) 볼린저 하단·중심
-    add(bb_lower, 0.7, 'BB하단'); add(bb_mid, 0.5, 'BB중심')
+    # 5) 볼린저 하단 (중심선 = MA20이라 중복 집계하지 않음; bb_mid 인자는 호환용으로 유지)
+    add(bb_lower, 0.7, 'BB하단')
 
     # 6) 피벗 스윙 지지선
     for _, lp in pl:
@@ -337,38 +349,39 @@ def _buy_zone(closes, highs, lows, vols, ma20, ma60, ma120, bb_mid, bb_lower, pr
     if not cands:
         return None
 
-    # ATR 비례 오차로 군집화
+    # 폭 상한이 있는 창으로 군집화: 각 후보를 하단으로 삼아 [p, p+max_w] 안의 후보를 한 구간으로
+    # 보고, 강도 최대(동률이면 더 좁은) 구간을 고른다. 폭이 상한을 넘을 수 없어 '넓어서 이기는'
+    # 편향이 사라지고, 같은 강도면 더 촘촘히 겹친 구간이 이긴다.
+    max_w = min(max(1.5 * atr, 0.01 * price), 0.04 * price) if atr else 0.025 * price
     cands.sort(key=lambda c: c['price'])
-    clusters, cur = [], [cands[0]]
-    for c in cands[1:]:
-        if c['price'] - cur[-1]['price'] <= tol_abs:
-            cur.append(c)
-        else:
-            clusters.append(cur); cur = [c]
-    clusters.append(cur)
-
-    # 클러스터 강도 = 서로 다른 기법의 가중합(같은 기법 중복은 최고값 1회만)
     best = None
-    for cl in clusters:
+    for i, c0 in enumerate(cands):
+        cl = [c for c in cands[i:] if c['price'] - c0['price'] <= max_w]
+        # 강도 = 서로 다른 기법의 가중합(같은 기법 중복은 최고값 1회만)
         seen = {}
         for c in cl:
             seen[c['label']] = max(seen.get(c['label'], 0), c['w'])
         strength = sum(seen.values())
         wsum = sum(c['w'] for c in cl)
-        center = sum(c['price'] * c['w'] for c in cl) / wsum
-        info = {'center': center, 'low': min(c['price'] for c in cl),
-                'high': max(c['price'] for c in cl), 'strength': strength,
+        info = {'center': sum(c['price'] * c['w'] for c in cl) / wsum,
+                'low': cl[0]['price'], 'high': cl[-1]['price'], 'strength': strength,
                 'methods': sorted(seen.keys(), key=lambda k: -seen[k])}
-        if best is None or strength > best['strength']:
+        width = info['high'] - info['low']
+        if (best is None or strength > best['strength'] + 1e-9
+                or (abs(strength - best['strength']) <= 1e-9 and width < best['high'] - best['low'])):
             best = info
 
     if best is None or best['strength'] < 1.0:
         return None
 
     nd = 0 if price >= 500 else 2
-    # 라벨은 '겹친 서로 다른 기법 수'로 판정(가중합보다 해석이 명확). 5+ 강함/3~4 보통/그 외 약함
+    # 라벨은 '겹친 서로 다른 기법 수'. 기법 후보가 현재가 근처에 몰려 있어 아무 패턴 없는 무작위
+    # 차트에서도 5개+가 58% 겹친다(2026-10 측정) → 우연 수준을 넘는 7+만 강함(우연 시 상위 ~26%),
+    # 5~6 보통, 4 이하 약함.
     nm = len(best['methods'])
-    label = '강함' if nm >= 5 else ('보통' if nm >= 3 else '약함')
+    label = '강함' if nm >= 7 else ('보통' if nm >= 5 else '약함')
+    # '근접' 판정 기준(표시 전용): 하루 변동폭(ATR) 1개, 현재가 1.5~4%로 제한
+    near_pct = round(min(max(atr / price * 100, 1.5), 4.0), 1) if atr else 3.0
     is_down = regime in ('down', 'strong_down')
     if is_down:
         note = '하락추세 — 지지 매수는 낙하칼 위험, 반등 확인 후 진입'
@@ -385,6 +398,7 @@ def _buy_zone(closes, highs, lows, vols, ma20, ma60, ma120, bb_mid, bb_lower, pr
         'methods': best['methods'],
         'dist_pct': round((best['center'] / price - 1) * 100, 1),   # 현재가 대비(음수=아래)
         'in_zone': best['low'] <= price <= best['high'],
+        'near_pct': near_pct,
         'caution': is_down,
         'note': note,
         'fib': fib,

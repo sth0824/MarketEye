@@ -301,7 +301,7 @@
 
   /* 신호 탭 */
   .signal-section-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px,1fr)); gap: 16px; }
-  .signal-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+  .signal-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; position: relative; }
   .signal-card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 14px; }
   .signal-name { font-size: 16px; font-weight: 700; color: var(--blue); }
   .signal-ticker-label { font-size: 11px; color: var(--muted); margin-top: 2px; }
@@ -581,20 +581,26 @@ function ensureFav() {  // 즐겨찾기 그룹이 없으면 맨 앞에 생성
   }
 }
 function isFav(t) { const f = favGroup(); return !!(f && f.tickers.includes(t)); }
+// 카드 ☆ 버튼 (개요·진입 신호 카드 공용). data-fav로 찾아 한 번에 갱신한다.
+function favBtnHtml(t) {
+  const on = isFav(t);
+  return `<button class="card-fav ${on ? 'on' : ''}" data-fav="${esc(t)}" onclick="toggleFav('${esc(t)}')" title="${on ? '즐겨찾기 해제' : '즐겨찾기 추가'}">${on ? '★' : '☆'}</button>`;
+}
 function toggleFav(t) {
   const f = favGroup(); if (!f) return;
   const i = f.tickers.indexOf(t);
   if (i >= 0) f.tickers.splice(i, 1); else f.tickers.push(t);
   saveState();
   renderGroupBar();
-  const btn = document.getElementById('fav-' + t);
-  if (btn) {
-    const on = isFav(t);
+  const on = isFav(t);
+  document.querySelectorAll('.card-fav[data-fav]').forEach(btn => {
+    if (btn.dataset.fav !== t) return;
     btn.textContent = on ? '★' : '☆';
     btn.classList.toggle('on', on);
     btn.title = on ? '즐겨찾기 해제' : '즐겨찾기 추가';
-  }
-  if (curGroup() && curGroup().id === FAV_ID) renderCards();  // 즐겨찾기 보는 중이면 갱신
+  });
+  // 즐겨찾기 그룹을 보는 중이면 해제한 종목이 빠지도록 다시 그림(개요·진입 신호 모두)
+  if (curGroup() && curGroup().id === FAV_ID && (activeTab === 'overview' || activeTab === 'signal')) renderAll();
 }
 
 // ---- 빠른 조회(저장·동기화 안 되는 임시 그룹) ----
@@ -1184,9 +1190,15 @@ function renderSignalCard(ticker, opt = {}) {
   const sig = opt.sig || signals[ticker];
   const name = opt.name || (stocks[ticker] && stocks[ticker].name) || ticker;
   const btId = opt.btId || `bt-${ticker}`;
+  // 그룹 카드면 개요 카드처럼 ☆·✕ (랭킹 옆 패널은 머리말에 ☆가 있고 그룹 소속이 아님)
+  const inGroup = !opt.sig;
+  const removeBtn = inGroup ? `<button class="card-remove" onclick="removeTicker('${esc(ticker)}')" title="현재 그룹에서 제거">✕</button>` : '';
+  const nameHtml = inGroup
+    ? `<div style="display:flex;align-items:center;gap:6px;min-width:0">${favBtnHtml(ticker)}<div class="signal-name">${esc(name)}</div></div>`
+    : `<div class="signal-name">${esc(name)}</div>`;
   if (!sig) {
-    return `<div class="signal-card">
-      <div class="signal-name">${esc(name)}</div>
+    return `<div class="signal-card">${removeBtn}
+      ${nameHtml}
       <div class="signal-ticker-label">${esc(ticker)}</div>
       <div class="signal-loading" style="padding:20px 0">분석 중...</div>
     </div>`;
@@ -1411,10 +1423,10 @@ function renderSignalCard(ticker, opt = {}) {
     </div>`;
   })() : '';
 
-  return `<div class="signal-card">
-    <div class="signal-card-header">
-      <div>
-        <div class="signal-name">${esc(name)}</div>
+  return `<div class="signal-card">${removeBtn}
+    <div class="signal-card-header" ${inGroup ? 'style="padding-right:26px"' : ''}>
+      <div style="min-width:0">
+        ${nameHtml}
         <div class="signal-ticker-label">${esc(ticker)}</div>
       </div>
       <span class="signal-badge" style="margin-top:0;background:transparent;border:1px solid ${rg.color};color:${rg.color}">${rg.emoji} ${esc(sig.regime_label || '')}</span>
@@ -1429,7 +1441,7 @@ function renderSignalCard(ticker, opt = {}) {
         <button class="secondary" style="font-size:12px;padding:6px 12px;flex:1" onclick="runBacktest('${ticker}', '${btId}')">📊 이 전략 5년 백테스트</button>
         <button class="secondary" style="font-size:12px;padding:6px 12px;flex:1" onclick="openPaperOrder('${ticker}')">💼 모의투자 주문</button>
       </div>
-      <div id="${btId}" style="margin-top:8px"></div>
+      <div id="${btId}" style="margin-top:8px">${btView[btId] || ''}</div>
     </div>
     ${sig.is_etf ? etfBlock : fundBlock}
   </div>`;
@@ -1472,11 +1484,38 @@ function bucketHtml(d) {
   </div>`;
 }
 
+// 추천 매수존 실증: 상태별 미래 20일 수익을 '기준선(아무 날이나 매수)'과 비교한다.
+function zoneValidationHtml(d) {
+  const z = d.zone;
+  if (!z || !z.rows) return '';
+  const V = {
+    better: ['var(--green)', `✅ 매수존 안에서 산 경우가 기준선보다 ${z.in_excess >= 0 ? '+' : ''}${z.in_excess}%p 나았어요`],
+    neutral: ['var(--yellow)', `➖ 기준선과 의미 있는 차이가 없어요(${z.in_excess >= 0 ? '+' : ''}${z.in_excess}%p, 오차 ±${z.in_se != null ? (2 * z.in_se).toFixed(1) : '?'}%p 안) — 이 종목에선 참고용`],
+    worse: ['var(--red)', `⚠️ 기준선보다 ${z.in_excess}%p 못했어요 — 이 종목엔 매수존이 안 맞음`],
+    insufficient: ['var(--muted)', `표본 부족(매수존 안 ${z.in_n}회, 30회 미만) — 판단 보류`],
+  }[z.verdict] || ['var(--muted)', ''];
+  const f = v => v == null ? '-' : `<span style="color:${v >= 0 ? 'var(--green)' : 'var(--red)'}">${v >= 0 ? '+' : ''}${v}%</span>`;
+  const rows = z.rows.filter(r => r.n).map(r => `<tr><td style="text-align:left;padding:2px 4px">${esc(r.label)}</td>
+      <td style="padding:2px 4px">${r.n}</td><td style="padding:2px 4px">${f(r.avg_fwd)}</td>
+      <td style="padding:2px 4px">${f(r.excess)}</td><td style="padding:2px 4px">${r.win_rate}%</td></tr>`).join('');
+  return `<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
+    <div style="font-weight:700;margin-bottom:4px">🛒 추천 매수존 실증 <span style="color:var(--muted);font-weight:400;font-size:10px">${z.step}거래일마다 그날까지 데이터로 재계산 · 20일 뒤 수익</span></div>
+    <div style="color:${V[0]};margin-bottom:6px">${V[1]}</div>
+    <table style="width:100%;border-collapse:collapse;text-align:right;font-size:11px">
+      <tr style="color:var(--muted)"><th style="text-align:left;font-weight:400;padding:2px 4px">상태</th><th style="font-weight:400">표본</th><th style="font-weight:400">평균</th><th style="font-weight:400">기준선 대비</th><th style="font-weight:400">승률</th></tr>
+      ${rows}
+    </table>
+  </div>`;
+}
+
 // 백테스트: 동일 매수 규칙을 과거 장기(기본 5년)에 적용한 성과를 카드 안에 표시
+const btView = {};   // 백테스트 결과 칸 id → 마지막으로 그린 HTML
 async function runBacktest(ticker, boxId) {
-  const box = document.getElementById(boxId || 'bt-' + ticker);
-  if (!box) return;
-  box.innerHTML = '<span style="color:var(--muted);font-size:12px">백테스트 계산 중… (수 초 소요)</span>';
+  const id = boxId || 'bt-' + ticker;
+  if (!document.getElementById(id)) return;
+  // 결과를 기억해 둔다 — 다른 종목 신호가 도착해 진입 신호 탭이 다시 그려져도 결과가 남도록
+  const show = html => { btView[id] = html; const el = document.getElementById(id); if (el) el.innerHTML = html; };
+  show('<span style="color:var(--muted);font-size:12px">백테스트 계산 중… (수 초 소요)</span>');
   try {
     const res = await apiFetch(`${API}/backtest/${encodeURIComponent(ticker)}`);
     const json = await res.json();
@@ -1490,7 +1529,7 @@ async function runBacktest(ticker, boxId) {
     const oosTxt = hasOos
       ? `<span style="color:${oosOk ? 'var(--green)' : 'var(--yellow)'}">${oos.first >= 0 ? '+' : ''}${oos.first}% / ${oos.second >= 0 ? '+' : ''}${oos.second}%</span>`
       : '-';
-    box.innerHTML = `
+    show(`
       <div style="padding:10px;background:var(--surface2);border-radius:8px;font-size:12px">
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 12px">
           <div>거래 횟수 <b>${d.trades}</b>${relWarn}</div>
@@ -1504,10 +1543,11 @@ async function runBacktest(ticker, boxId) {
           <div style="grid-column:1/3">청산 🎯${d.exits.target} 🛑${d.exits.stop} ⏰${d.exits.time}</div>
         </div>
         ${bucketHtml(d)}
+        ${zoneValidationHtml(d)}
         <div style="margin-top:8px;color:var(--muted);font-size:10px;line-height:1.5">${esc(d.note)}</div>
-      </div>`;
+      </div>`);
   } catch (e) {
-    box.innerHTML = `<span style="color:var(--red);font-size:12px">백테스트 실패: ${esc(e.message)}</span>`;
+    show(`<span style="color:var(--red);font-size:12px">백테스트 실패: ${esc(e.message)}</span>`);
   }
 }
 
@@ -1662,7 +1702,7 @@ function renderCards() {
       <div class="card-header">
         <div style="min-width:0">
           <div style="display:flex;align-items:center;gap:6px">
-            <button id="fav-${ticker}" class="card-fav ${isFav(ticker) ? 'on' : ''}" onclick="toggleFav('${ticker}')" title="${isFav(ticker) ? '즐겨찾기 해제' : '즐겨찾기 추가'}">${isFav(ticker) ? '★' : '☆'}</button>
+            ${favBtnHtml(ticker)}
             <div class="card-ticker">${esc(d.name)}</div>
           </div>
           <div class="card-name">${esc(ticker)}</div>
@@ -2004,7 +2044,7 @@ function toggleRankEtf() {
 let rankZoneOnly = (() => { try { return localStorage.getItem('marketeye_rank_zone') === '1'; } catch (e) { return false; } })();
 const rankZones = {};                 // ticker → { low, high, entry, strength_label, caution, regime_label, at } | { error, at }
 const rankZoneBusy = new Set();
-const ZONE_TTL_MS = 15 * 60 * 1000, ZONE_NEAR_PCT = 3;
+const ZONE_TTL_MS = 15 * 60 * 1000, ZONE_NEAR_PCT = 3;   // near_pct(서버, ATR 비례)가 없을 때만 쓰는 기본값
 function toggleRankZone() {
   rankZoneOnly = !rankZoneOnly;
   try { localStorage.setItem('marketeye_rank_zone', rankZoneOnly ? '1' : '0'); } catch (e) {}
@@ -2018,7 +2058,7 @@ function zoneStatus(r) {
   if (p >= z.low && p <= z.high) return { key: 'in', text: z.caution ? '매수존 안 · 하락추세' : '매수존 안', warn: !!z.caution };
   if (p < z.low) return { key: 'below', text: '매수존 아래(이탈)' };
   const gap = (p / z.high - 1) * 100;
-  if (gap <= ZONE_NEAR_PCT) return { key: 'near', text: `근접 ${gap.toFixed(1)}% 위` };
+  if (gap <= (z.near_pct || ZONE_NEAR_PCT)) return { key: 'near', text: `근접 ${gap.toFixed(1)}% 위` };
   return { key: 'above', text: `존까지 -${(gap / (1 + gap / 100)).toFixed(1)}%` };
 }
 function zoneBadge(r) {
@@ -2102,7 +2142,7 @@ function drawRanking() {
   const chips = RANK_SORTS.map(o =>
     `<button class="rank-chip ${o.id === rankSort ? 'active' : ''}" onclick="setRankSort('${o.id}')">${o.label}</button>`).join('')
     + `<label class="rank-toggle" title="ETF·ETN을 빼고 개별 종목만 순위 매기기"><input type="checkbox" ${rankNoEtf ? 'checked' : ''} onchange="toggleRankEtf()"> ETF 제외</label>`
-    + `<label class="rank-toggle" title="현재가가 추천 매수존 안이거나 3% 이내 위에 있는 종목만"><input type="checkbox" ${rankZoneOnly ? 'checked' : ''} onchange="toggleRankZone()"> 매수존 근처만</label>`;
+    + `<label class="rank-toggle" title="현재가가 추천 매수존 안이거나 바로 위(하루 변동폭 이내)에 있는 종목만"><input type="checkbox" ${rankZoneOnly ? 'checked' : ''} onchange="toggleRankZone()"> 매수존 근처만</label>`;
   let meta = '';
   if (d && d.at) {
     const t = new Date(d.at);
@@ -2200,7 +2240,7 @@ async function loadPanelSignal(t, force) {
     if (!json.success) throw new Error(json.error || '신호를 불러오지 못했어요');
     panelSig[t] = { data: json.data, at: Date.now() };
     const bz = json.data.buy_zone;
-    rankZones[t] = bz ? { low: bz.low, high: bz.high, entry: bz.entry, strength_label: bz.strength_label, caution: bz.caution, at: Date.now() }
+    rankZones[t] = bz ? { low: bz.low, high: bz.high, entry: bz.entry, strength_label: bz.strength_label, caution: bz.caution, near_pct: bz.near_pct, at: Date.now() }
       : { low: null, at: Date.now() };
     if (activeTab === 'ranking') drawRanking();
   } catch (e) {
@@ -2253,7 +2293,7 @@ function drawRankPanelBody() {
   let body;
   if (c.data) {
     try {
-      body = renderSignalCard(t, { sig: c.data, name: r.name || t, currency: r.currency || (tickerMarket(t) === 'kr' ? 'KRW' : 'USD'), btId: 'bt-panel' });
+      body = renderSignalCard(t, { sig: c.data, name: r.name || t, currency: r.currency || (tickerMarket(t) === 'kr' ? 'KRW' : 'USD'), btId: `bt-panel-${t}` });
     } catch (e) { body = `<div class="sp-msg" style="color:var(--red)">표시 중 오류: ${esc(e.message)}</div>`; }
     if (c.loading) body = '<div class="pp-hint" style="text-align:right">최신 신호 확인 중...</div>' + body;
   } else if (c.error) {
